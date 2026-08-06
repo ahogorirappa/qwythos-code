@@ -275,6 +275,9 @@ export class Agent {
 
       if (ev.type === 'content') {
         contentAll += ev.text;
+        // 別のアプリの中で動いているときは、そちらの画面にも流す。
+        // 出来上がるまで黙っていると、相手の画面は止まって見える。
+        this.config.onContentDelta?.(ev.text);
 
         if (holdDecision === 'unknown') {
           const head = contentAll.trimStart();
@@ -397,6 +400,24 @@ export class Agent {
     }
 
     toolHeader(tool.name, summarizeArgs(tool.name, call.args));
+
+    // 別のアプリの中で動いているときは、道具の実体はそちらにある。
+    //
+    // ここで自分で実行してはいけない。相手には相手の作法（権限・記録・確認）があり、
+    // こちらが先に手を出すと、その作法を通らない経路ができてしまう。
+    // 確認も持ち主の仕事なので、こちらでは聞かない。判断材料は相手のほうが持っている。
+    if (this.config.hostTools) {
+      const res = await this.config.hostTools({
+        name: tool.name,
+        args: call.args || {},
+        display: summarizeArgs(tool.name, call.args)
+      });
+      toolResultLine(res.display || (res.isError ? 'できませんでした' : 'done'), Boolean(res.isError));
+      return {
+        output: truncateOutput(String(res.output ?? ''), this.config.maxToolChars),
+        denied: false
+      };
+    }
 
     // 成立しない操作は、確認を出す前にここで弾いてモデルに理由を返す
     if (typeof tool.validate === 'function') {

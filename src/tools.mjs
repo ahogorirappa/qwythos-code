@@ -950,6 +950,9 @@ const todoWrite = {
 
     ctx.todos = todos;
     renderTodos(todos);
+    // 別のアプリの中で動いているときは、そちらの画面にも渡す。
+    // 何をどこまでやるつもりなのかは、待っている人がいちばん知りたいこと。
+    ctx.config.onTodos?.(todos);
 
     const done = todos.filter((t) => t.status === 'completed').length;
     const next = todos.find((t) => t.status === 'in_progress') || todos.find((t) => t.status === 'pending');
@@ -1113,6 +1116,25 @@ const spawnAgent = {
  * 見せてしまうと、モデルが呼んで失敗し、その理由を考えるのに往復を1回使う。
  */
 export function activeTools(config = {}) {
+  // 別のアプリの中で動いているときは、そのアプリが持っている道具だけを見せる。
+  //
+  // 呼べない道具を見せない、という考え方は同じ。
+  // 違うのは「呼べるかどうか」を決めるのが、こちらではなく相手だという点。
+  // 相手が read_file しか持っていないのに write_file を見せれば、
+  // モデルは書こうとして断られ、その理由を考えるのに往復を1回使う。
+  // やることリストと調べものの委譲は、外に手を出さない道具なので相手の実装が要らない。
+  // ここが持ち込める中身でもある（相手は輪と一緒にこの2つも手に入る）。
+  if (Array.isArray(config.hostToolNames)) {
+    const allowed = new Set([...config.hostToolNames, ...INTERNAL_TOOLS]);
+    if (config.isSubagent) {
+      // 任された側の扱いは、ここでも本体のときと同じにする。
+      // 片方だけ違うと、同じ言葉で頼んだのに動きが変わる。
+      allowed.delete('spawn_agent');
+      allowed.delete('todo_write');
+    }
+    return TOOLS.filter((tool) => allowed.has(tool.name));
+  }
+
   // 計画モードでは、書き換える道具そのものを渡さない。
   // 「使わないでください」と頼むのではなく、無いことにする。
   const list = config.planMode
@@ -1150,6 +1172,15 @@ export const TOOLS = [
   readFile, writeFile, editFile, listDir, searchFiles, runCommand,
   webSearch, webFetch, browseTool, todoWrite, browserLoginTool, findSymbol, spawnAgent
 ];
+
+/**
+ * 外に手を出さない道具。
+ *
+ * 別のアプリの中で動くとき、実体を相手に頼まなくてよいのはこの2つだけ。
+ * やることリストは会話の中の覚え書きで、調べものの委譲は qwc をもう1つ動かすだけ。
+ * どちらもファイルにもネットにも触れないので、相手の作法を通す必要がない。
+ */
+export const INTERNAL_TOOLS = ['todo_write', 'spawn_agent'];
 
 export const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));
 

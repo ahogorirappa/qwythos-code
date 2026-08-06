@@ -20,7 +20,8 @@ import {
   INSTALL_HELP as BROWSER_HELP
 } from '../src/browser.mjs';
 import { newSessionId, saveSession, listSessions, loadSession, latestSessionForRoot } from '../src/session.mjs';
-import { c, line, out, banner, info, warn, error, success, renderTodos } from '../src/ui.mjs';
+import { c, line, out, banner, info, warn, error, success, renderTodos, sendDisplayToStderr } from '../src/ui.mjs';
+import { serve, requestTool, emit, ready, turnEnd } from '../src/embed.mjs';
 
 const VERSION = '0.1.0';
 
@@ -47,6 +48,7 @@ function parseArgs(argv) {
       case '--allow-outside': opts.overrides.allowOutsideRoot = true; break;
       case '--no-net': opts.overrides.net = false; break;
       case '--plan': opts.overrides.planMode = true; break;
+      case '--embed': opts.embed = true; break;
       case '--cwd': opts.cwd = next(); break;
       case '--resume': opts.resume = argv[i + 1] && !argv[i + 1].startsWith('-') ? next() : 'last'; break;
       case '--sessions': opts.listSessions = true; break;
@@ -185,6 +187,64 @@ function ask(question) {
   });
 }
 
+// ── 別のアプリの中で動くときの本体 ──────────────────────────
+//
+// 相手から届く hello で、こちらの道具立てが決まる。
+// 相手が持っていない道具はモデルに見せない（呼べない道具を見せない、はここでも同じ）。
+async function runEmbedded({ config, root }) {
+  let agent = null;
+  let workRoot = root;
+
+  await serve({
+    onHello(message) {
+      // 作業フォルダは相手が決める。あちらの利用者が選んだ場所がすべて。
+      if (typeof message.root === 'string' && message.root) {
+        workRoot = path.resolve(message.root);
+        try {
+          process.chdir(workRoot);
+        } catch {
+          emit.error(`指定されたフォルダに移動できません: ${workRoot}`);
+        }
+      }
+      if (typeof message.model === 'string' && message.model) config.model = message.model;
+
+      // 道具の実体は相手にある。呼び出しはそちらへ回す。
+      config.hostToolNames = Array.isArray(message.tools) ? message.tools : [];
+      config.hostTools = requestTool;
+      // 確認は持ち主の仕事。こちらで聞くと、同じことを二度聞かれることになる。
+      config.autoApprove = true;
+      config.onContentDelta = (text) => emit.text(text);
+      config.onTodos = (todos) => emit.todos(todos);
+
+      agent = new Agent({ config, root: workRoot, permissions: null, onSave: () => {} });
+      ready(activeTools(config).map((t) => t.name));
+    },
+
+    async onUser(message) {
+      if (!agent) {
+        emit.error('先に hello を送ってください。');
+        turnEnd('');
+        return;
+      }
+      const result = await agent.runTurn(String(message.text ?? ''));
+      // 最後にモデルが言ったことを、そのまま返す
+      let answer = '';
+      for (let i = agent.messages.length - 1; i >= 0; i--) {
+        const m = agent.messages[i];
+        if (m.role === 'assistant' && typeof m.content === 'string' && m.content.trim()) {
+          answer = m.content.trim();
+          break;
+        }
+      }
+      turnEnd(answer, result?.interrupted);
+    },
+
+    onInterrupt() {
+      agent?.interrupt();
+    }
+  });
+}
+
 // ── 本体 ────────────────────────────────────────────────────
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -201,6 +261,11 @@ async function main() {
     line();
     return;
   }
+
+  // 別のアプリの中でエンジンとして動くときは、標準出力を JSON のやりとりに使う。
+  // 色つきの表示が混ざると相手が読めなくなるので、いちばん先に行き先を変える
+  // （ここから下では、つなぎ先の確認やモデルの選び直しが info/error を出しうる）。
+  if (opts.embed) sendDisplayToStderr();
 
   const config = { ...loadConfig(), ...opts.overrides };
   const root = path.resolve(opts.cwd || process.cwd());
@@ -269,7 +334,17 @@ async function main() {
     process.exit(1);
   }
 
-  const isInteractive = !opts.prompt;
+  // ── 別のアプリの中でエンジンとして動く ──────────────────────
+  //
+  // 道具の実体は相手が持っている。こちらは輪だけを回して、
+  // 「これを実行してほしい」と頼み、結果を受け取って次の一手を考える。
+  // 相手の作法（権限・記録・確認）に手を出さないので、あちらの約束は壊れない。
+  if (opts.embed) {
+    await runEmbedded({ config, root });
+    return;
+  }
+
+  const isInteractive = !opts.prompt && !opts.embed;
   if (isInteractive) createReadline();
 
   const permissions = new PermissionManager(config, ask);

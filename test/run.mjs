@@ -420,6 +420,28 @@ console.log('\n調べものを任せる');
   check('計画モードにはそのままの説明文', planPrompt.includes('PLAN MODE') && !planPrompt.includes('research assistant'));
 }
 
+// ── 別のアプリの中で動く ────────────────────────────────────
+console.log('\n別のアプリの中で動く');
+{
+  // 道具の実体は相手が持つ。相手が持っている名前だけをモデルに見せる。
+  const host = activeTools({ hostToolNames: ['read_file', 'list_dir'] }).map((t) => t.name);
+  check('相手が持つ道具は渡す', host.includes('read_file') && host.includes('list_dir'));
+  check('相手が持たない道具は渡さない', !host.includes('write_file') && !host.includes('run_command'));
+
+  // やることリストと調べものの委譲は外に手を出さないので、相手の実装が要らない。
+  // ここが持ち込める中身でもある（相手は輪と一緒にこの2つも手に入る）。
+  check('外に触れない道具は付いていく', host.includes('todo_write') && host.includes('spawn_agent'));
+
+  const sub = activeTools({ hostToolNames: ['read_file'], isSubagent: true }).map((t) => t.name);
+  check('任された側には入れ子を渡さない', !sub.includes('spawn_agent'));
+  check('任された側の扱いは本体のときと同じ', !sub.includes('todo_write'));
+  check('任された側でも相手の道具は使える', sub.includes('read_file'));
+
+  // ネットの鍵やブラウザの有無で勝手に増えない（増えたら相手が実装していない道具が混ざる）
+  const withNet = activeTools({ hostToolNames: ['read_file'], net: true, browserReady: true }).map((t) => t.name);
+  check('相手の一覧にないものは足さない', !withNet.includes('web_fetch') && !withNet.includes('browse'));
+}
+
 // ── ログイン済みブラウザ ────────────────────────────────────
 console.log('\nブラウザ（ログインが要るページ用）');
 {

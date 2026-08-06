@@ -30,7 +30,7 @@ export const c = {
 export const supportsAnsi = useColor;
 
 export function clearLine() {
-  if (useColor) process.stdout.write('\r\x1b[2K');
+  if (useColor) target.write('\r\x1b[2K');
 }
 
 // 出力の左に付ける印。
@@ -44,18 +44,30 @@ export function setOutputPrefix(prefix = '') {
   outputPrefix = prefix;
 }
 
+// 表示の行き先。
+//
+// 別のアプリの中でエンジンとして動くとき、標準出力は JSON のやりとりに使う。
+// 色つきの表示が1文字でも混ざると、相手はその行を読めなくなる。
+// かといって捨ててしまうと、うまく動かないときに何も分からない。
+// そこで**標準エラーに寄せる**。相手は読み飛ばしてもよいし、記録に取ってもよい。
+let target = process.stdout;
+
+export function sendDisplayToStderr() {
+  target = process.stderr;
+}
+
 export function out(s = '') {
-  process.stdout.write(outputPrefix && s ? outputPrefix + s : s);
+  target.write(outputPrefix && s ? outputPrefix + s : s);
 }
 
 export function line(s = '') {
-  if (!outputPrefix) return void process.stdout.write(`${s}\n`);
+  if (!outputPrefix) return void target.write(`${s}\n`);
   // 複数行でも、行ごとに印を付ける
   const body = String(s)
     .split('\n')
     .map((l) => outputPrefix + l)
     .join('\n');
-  process.stdout.write(`${body}\n`);
+  target.write(`${body}\n`);
 }
 
 export function termWidth() {
