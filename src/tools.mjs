@@ -1,0 +1,1092 @@
+// エージェントが使える道具（ツール）一式。
+// 小さいモデルでも迷わないように、数を絞ってある（手元6個＋ネット2個）。
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { resolveSafe, displayPath, isIgnored, isProbablyBinary, statSafe } from './paths.mjs';
+import { renderDiff, truncateForDisplay, renderTodos, c } from './ui.mjs';
+import { search as webSearchApi, fetchPage, loadApiKey, KEY_HELP } from './web.mjs';
+import { browse, openForLogin, finishLogin, INSTALL_HELP as BROWSER_HELP } from './browser.mjs';
+import { isSafeCommand } from './permissions.mjs';
+import { findDefinition, findReferences, findHover, anyServerAvailable } from './lsp.mjs';
+
+// 長すぎる出力は真ん中を省いて前後を残す
+export function truncateOutput(text, max) {
+  if (text.length <= max) return text;
+  const headLen = Math.floor(max * 0.6);
+  const tailLen = max - headLen;
+  const omitted = text.length - max;
+  return `${text.slice(0, headLen)}\n\n…[${omitted} 文字を省略しました]…\n\n${text.slice(-tailLen)}`;
+}
+
+// 見つからなかったパスに近いものを探して教える。
+// 小さいモデルはパスを取り違えやすいので、正解の候補を返して自力で直させる。
+function suggestPaths(target, ctx, limit = 6) {
+  const wanted = path.basename(String(target || '')).toLowerCase();
+  if (!wanted) return '';
+  const hits = [];
+  let visited = 0;
+
+  const walk = (dir, depth) => {
+    if (depth > 4 || hits.length >= limit || visited > 4000) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (hits.length >= limit) return;
+      if (entry.name.startsWith('.') || isIgnored(entry.name)) continue;
+      visited++;
+      const full = path.join(dir, entry.name);
+      if (entry.name.toLowerCase() === wanted) {
+        hits.push(path.relative(ctx.root, full));
+      }
+      if (entry.isDirectory()) walk(full, depth + 1);
+    }
+  };
+  walk(ctx.root, 1);
+
+  if (hits.length) {
+    return `\nDid you mean one of these? ${hits.join(', ')}`;
+  }
+  let top = [];
+  try {
+    top = fs
+      .readdirSync(ctx.root, { withFileTypes: true })
+      .filter((e) => !e.name.startsWith('.') && !isIgnored(e.name))
+      .slice(0, 20)
+      .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+  } catch {
+    top = [];
+  }
+  return top.length
+    ? `\nPaths are relative to the workspace root. The root contains: ${top.join(', ')}`
+    : '';
+}
+
+function numberLines(text, startLine = 1) {
+  return text
+    .split('\n')
+    .map((l, i) => `${String(startLine + i).padStart(5)}\t${l}`)
+    .join('\n');
+}
+
+// ripgrep があれば検索に使う（無ければ自前の走査に切り替える）
+function hasRipgrep() {
+  if (hasRipgrep.cached === undefined) {
+    try {
+      hasRipgrep.cached = spawnSync('rg', ['--version'], { encoding: 'utf8' }).status === 0;
+    } catch {
+      hasRipgrep.cached = false;
+    }
+  }
+  return hasRipgrep.cached;
+}
+
+// ── 1. ファイルを読む ────────────────────────────────────────
+const readFile = {
+  name: 'read_file',
+  approval: 'never',
+  description:
+    'Read a text file from the workspace. Returns the content with line numbers. ' +
+    'Always read a file before editing it.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'File path, relative to the workspace root.' },
+      offset: { type: 'integer', description: 'Optional 1-based line number to start from.' },
+      limit: { type: 'integer', description: 'Optional maximum number of lines to return.' }
+    },
+    required: ['path']
+  },
+  async run(args, ctx) {
+    const abs = resolveSafe(args.path, ctx);
+    const st = statSafe(abs);
+    if (!st) {
+      return {
+        isError: true,
+        output: `File not found: ${args.path}${suggestPaths(args.path, ctx)}`,
+        display: 'ファイルが見つかりません'
+      };
+    }
+    if (st.isDirectory()) {
+      return { isError: true, output: `${args.path} is a directory. Use list_dir instead.`, display: 'フォルダです' };
+    }
+    if (st.size > ctx.config.maxFileBytes) {
+      return {
+        isError: true,
+        output: `File is too large (${st.size} bytes). Read it in parts with offset/limit.`,
+        display: `大きすぎます (${Math.round(st.size / 1024)}KB)`
+      };
+    }
+    const buf = fs.readFileSync(abs);
+    if (isProbablyBinary(buf)) {
+      return { isError: true, output: `${args.path} looks like a binary file and cannot be read as text.`, display: 'バイナリのため読めません' };
+    }
+
+    const text = buf.toString('utf8');
+    const allLines = text.split('\n');
+    const start = Math.max(1, Number(args.offset) || 1);
+    const limit = Math.max(1, Number(args.limit) || 2000);
+    const slice = allLines.slice(start - 1, start - 1 + limit);
+
+    if (slice.length === 0) {
+      return { output: `(no lines at offset ${start}; file has ${allLines.length} lines)`, display: '該当行なし' };
+    }
+
+    const shown = numberLines(slice.join('\n'), start);
+    const more = allLines.length > start - 1 + slice.length
+      ? `\n\n[showing lines ${start}-${start + slice.length - 1} of ${allLines.length}]`
+      : '';
+    ctx.readFiles.add(abs);
+    return {
+      output: truncateOutput(shown + more, ctx.config.maxToolChars),
+      display: `${slice.length} 行を読み込み`
+    };
+  }
+};
+
+// ── 2. ファイルを丸ごと書く ──────────────────────────────────
+const writeFile = {
+  name: 'write_file',
+  // 既存を丸ごと置き換えうるので、必ず人に見せてから
+  approval: 'always',
+  description:
+    'Create a new file, or overwrite an existing one with the given content. ' +
+    'For small changes to an existing file prefer edit_file.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'File path, relative to the workspace root.' },
+      content: { type: 'string', description: 'The full content to write.' }
+    },
+    required: ['path', 'content']
+  },
+  approvalTitle(args, ctx) {
+    const abs = resolveSafe(args.path, ctx);
+    return fs.existsSync(abs) ? `ファイルを上書きします: ${args.path}` : `ファイルを新規作成します: ${args.path}`;
+  },
+  preview(args, ctx) {
+    const abs = resolveSafe(args.path, ctx);
+    const content = String(args.content ?? '');
+    if (fs.existsSync(abs)) {
+      return renderDiff(fs.readFileSync(abs, 'utf8'), content);
+    }
+    return truncateForDisplay(
+      content.split('\n').map((l, i) => c.green(`  ${String(i + 1).padStart(4)} +${l}`)).join('\n'),
+      20
+    );
+  },
+  async run(args, ctx) {
+    const abs = resolveSafe(args.path, ctx);
+    const content = String(args.content ?? '');
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const existed = fs.existsSync(abs);
+    fs.writeFileSync(abs, content, 'utf8');
+    ctx.changedFiles.add(abs);
+    ctx.readFiles.add(abs);
+    const lines = content.split('\n').length;
+    return {
+      output: `${existed ? 'Overwrote' : 'Created'} ${displayPath(abs, ctx)} (${lines} lines).`,
+      display: `${existed ? '上書き' : '新規作成'} (${lines} 行)`
+    };
+  }
+};
+
+// ── 3. ファイルの一部を置き換える ────────────────────────────
+const editFile = {
+  name: 'edit_file',
+  // 差分を見てから決められるようにする
+  approval: 'always',
+  description:
+    'Replace an exact snippet of text inside an existing file. ' +
+    'old_string must match the file content exactly, including indentation, and must be unique ' +
+    'unless replace_all is true. Read the file first, and copy the text WITHOUT the line numbers ' +
+    'that read_file adds. To append to the end of a file, use the last existing lines as old_string ' +
+    'and repeat them followed by the new code in new_string.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'File path, relative to the workspace root.' },
+      old_string: { type: 'string', description: 'Exact text to find. Include enough surrounding lines to be unique.' },
+      new_string: { type: 'string', description: 'Text to replace it with. Use an empty string to delete.' },
+      replace_all: { type: 'boolean', description: 'Replace every occurrence instead of requiring a unique match.' }
+    },
+    required: ['path', 'old_string', 'new_string']
+  },
+  approvalTitle(args) {
+    return `ファイルを編集します: ${args.path}`;
+  },
+  // 確認を出す前に、そもそも成立する編集かを見る（失敗ならユーザーを煩わせない）
+  validate(args, ctx) {
+    const abs = resolveSafe(args.path, ctx);
+    if (!fs.existsSync(abs)) {
+      return `File not found: ${args.path}${suggestPaths(args.path, ctx)}`;
+    }
+    const result = applyEdit(fs.readFileSync(abs, 'utf8'), args);
+    return result.error || null;
+  },
+  preview(args, ctx) {
+    const abs = resolveSafe(args.path, ctx);
+    if (!fs.existsSync(abs)) return c.red('  (ファイルが存在しません)');
+    const before = fs.readFileSync(abs, 'utf8');
+    const after = applyEdit(before, args);
+    if (after.error) return c.red(`  ${after.error}`);
+    return renderDiff(before, after.text);
+  },
+  async run(args, ctx) {
+    const abs = resolveSafe(args.path, ctx);
+    if (!fs.existsSync(abs)) {
+      return {
+        isError: true,
+        output: `File not found: ${args.path}${suggestPaths(args.path, ctx)}`,
+        display: 'ファイルが見つかりません'
+      };
+    }
+    const before = fs.readFileSync(abs, 'utf8');
+    const result = applyEdit(before, args);
+    if (result.error) {
+      return { isError: true, output: result.error, display: '置き換えできませんでした' };
+    }
+    fs.writeFileSync(abs, result.text, 'utf8');
+    ctx.changedFiles.add(abs);
+    return {
+      output: `Edited ${displayPath(abs, ctx)} (${result.count} replacement${result.count > 1 ? 's' : ''}).`,
+      display: `${result.count} か所を置き換え${result.fuzzy ? '（空白のズレを補正）' : ''}`
+    };
+  }
+};
+
+// read_file は行番号つきで返すので、それをそのまま貼ってきた場合に剥がす
+function stripLineNumbers(text) {
+  const lines = text.split('\n');
+  const numbered = lines.filter((l) => l !== '');
+  if (numbered.length && numbered.every((l) => /^\s*\d+\t/.test(l))) {
+    return lines.map((l) => l.replace(/^\s*\d+\t/, '')).join('\n');
+  }
+  return text;
+}
+
+function applyEdit(before, args) {
+  const rawOld = String(args.old_string ?? '');
+  const rawNew = String(args.new_string ?? '');
+
+  // そのままで一致するならいじらない。一致しないときだけ行番号を剥がして試す。
+  let oldStr = rawOld;
+  let newStr = rawNew;
+  if (rawOld !== '' && !before.includes(rawOld)) {
+    const stripped = stripLineNumbers(rawOld);
+    if (stripped !== rawOld) {
+      oldStr = stripped;
+      newStr = stripLineNumbers(rawNew);
+    }
+  }
+
+  if (oldStr === '') {
+    return { error: 'old_string must not be empty. Use write_file to create a new file.' };
+  }
+  if (oldStr === newStr) {
+    return { error: 'old_string and new_string are identical; nothing to change.' };
+  }
+
+  const parts = before.split(oldStr);
+  const count = parts.length - 1;
+
+  if (count === 1 || (count > 1 && args.replace_all)) {
+    return { text: parts.join(newStr), count };
+  }
+  if (count > 1) {
+    return {
+      error:
+        `old_string appears ${count} times. Add more surrounding lines so it is unique, ` +
+        'or set replace_all to true.'
+    };
+  }
+
+  // 完全一致しなかったとき、行末の空白やインデントのズレだけなら救う
+  const matches = fuzzyLineMatch(before, oldStr);
+  if (matches.length === 1 || (matches.length > 1 && args.replace_all)) {
+    const fileLines = before.split('\n');
+    const targets = matches.length === 1 ? matches : [...matches].reverse();
+    for (const m of targets) {
+      const replacement = newStr
+        .split('\n')
+        .map((l) => (m.indent && l.trim() !== '' ? m.indent + l : l));
+      fileLines.splice(m.start, m.end - m.start, ...replacement);
+    }
+    return { text: fileLines.join('\n'), count: targets.length, fuzzy: true };
+  }
+  if (matches.length > 1) {
+    return {
+      error:
+        `A whitespace-insensitive match for old_string appears ${matches.length} times. ` +
+        'Add more surrounding lines so it is unique, or set replace_all to true.'
+    };
+  }
+
+  // それでも駄目なら、いま入っている中身をそのまま返して直させる
+  const lines = before.split('\n');
+  const shown = numberLines(lines.slice(0, 80).join('\n'));
+  const more = lines.length > 80 ? `\n…[${lines.length - 80} more lines]` : '';
+  return {
+    error:
+      'old_string was not found in the file. It must match the file text exactly.\n' +
+      'Here is what the file actually contains right now — copy the exact text from it:\n\n' +
+      `${shown}${more}`
+  };
+}
+
+// 行末の空白の違い、または全行そろって同じだけずれたインデントを許して探す
+function fuzzyLineMatch(before, oldStr) {
+  const fileLines = before.split('\n');
+  const oldLines = oldStr.split('\n');
+  while (oldLines.length > 1 && oldLines[oldLines.length - 1].trim() === '') oldLines.pop();
+  const n = oldLines.length;
+  if (n === 0 || n > fileLines.length) return [];
+
+  const matches = [];
+  for (let i = 0; i + n <= fileLines.length; i++) {
+    const window = fileLines.slice(i, i + n);
+
+    if (window.every((l, k) => l.trimEnd() === oldLines[k].trimEnd())) {
+      matches.push({ start: i, end: i + n, indent: '' });
+      continue;
+    }
+    if (!window.every((l, k) => l.trim() === oldLines[k].trim())) continue;
+
+    // 空でない行すべてで「足りない字下げ」が同じなら、その分だけ足して合わせる
+    const prefixes = new Set();
+    let ok = true;
+    window.forEach((l, k) => {
+      if (l.trim() === '') return;
+      const fileIndent = l.match(/^\s*/)[0];
+      const oldIndent = oldLines[k].match(/^\s*/)[0];
+      if (!fileIndent.endsWith(oldIndent)) {
+        ok = false;
+        return;
+      }
+      prefixes.add(fileIndent.slice(0, fileIndent.length - oldIndent.length));
+    });
+    if (ok && prefixes.size === 1) {
+      matches.push({ start: i, end: i + n, indent: [...prefixes][0] });
+    }
+  }
+  return matches;
+}
+
+// ── 4. フォルダの中身を見る ──────────────────────────────────
+const listDir = {
+  name: 'list_dir',
+  approval: 'never',
+  description: 'List files and folders. Use this to explore the project structure.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Directory path. Defaults to the workspace root.' },
+      depth: { type: 'integer', description: 'How many levels deep to list. Default 2, max 4.' }
+    }
+  },
+  async run(args, ctx) {
+    const abs = resolveSafe(args.path || '.', ctx);
+    const st = statSafe(abs);
+    if (!st) {
+      return {
+        isError: true,
+        output: `Directory not found: ${args.path || '.'}${suggestPaths(args.path || '.', ctx)}`,
+        display: '見つかりません'
+      };
+    }
+    if (!st.isDirectory()) return { isError: true, output: `${args.path} is a file, not a directory.`, display: 'ファイルです' };
+
+    const maxDepth = Math.min(4, Math.max(1, Number(args.depth) || 2));
+    const lines = [];
+    let count = 0;
+    const LIMIT = 400;
+
+    const walk = (dir, depth, prefix) => {
+      if (depth > maxDepth || count >= LIMIT) return;
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      entries.sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      for (const entry of entries) {
+        if (count >= LIMIT) break;
+        if (entry.name.startsWith('.') && entry.name !== '.env.example') continue;
+        if (isIgnored(entry.name)) {
+          lines.push(`${prefix}${entry.name}/ (skipped)`);
+          continue;
+        }
+        count++;
+        if (entry.isDirectory()) {
+          lines.push(`${prefix}${entry.name}/`);
+          walk(path.join(dir, entry.name), depth + 1, `${prefix}  `);
+        } else {
+          const size = statSafe(path.join(dir, entry.name))?.size ?? 0;
+          lines.push(`${prefix}${entry.name} (${size}B)`);
+        }
+      }
+    };
+
+    walk(abs, 1, '');
+    const header = `${displayPath(abs, ctx)}/`;
+    const body = lines.length ? lines.join('\n') : '(empty)';
+    const note = count >= LIMIT ? `\n[stopped after ${LIMIT} entries]` : '';
+    return {
+      output: truncateOutput(`${header}\n${body}${note}`, ctx.config.maxToolChars),
+      display: `${count} 件`
+    };
+  }
+};
+
+// ── 5. 文字列を探す ──────────────────────────────────────────
+const searchFiles = {
+  name: 'search_files',
+  approval: 'never',
+  description:
+    'Search the workspace for a regular expression and return matching lines with file names ' +
+    'and line numbers. Use this to locate code before reading whole files.',
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: 'Regular expression to search for.' },
+      path: { type: 'string', description: 'Directory or file to search in. Defaults to the workspace root.' },
+      glob: { type: 'string', description: 'Optional file filter such as *.js or *.py.' }
+    },
+    required: ['pattern']
+  },
+  async run(args, ctx) {
+    const pattern = String(args.pattern || '');
+    if (!pattern) return { isError: true, output: 'pattern is required.', display: 'パターンが空です' };
+    const abs = resolveSafe(args.path || '.', ctx);
+    const MAX_MATCHES = 120;
+
+    if (hasRipgrep()) {
+      const rgArgs = ['--line-number', '--no-heading', '--color', 'never', '--max-count', '20', '-e', pattern];
+      if (args.glob) rgArgs.push('--glob', String(args.glob));
+      rgArgs.push(abs);
+      const result = await runProcess('rg', rgArgs, { cwd: ctx.root, timeoutMs: 30000 });
+      if (result.code === 1 && !result.output.trim()) {
+        return { output: 'No matches found.', display: '一致なし' };
+      }
+      const rel = result.output
+        .split('\n')
+        .filter(Boolean)
+        .slice(0, MAX_MATCHES)
+        .map((l) => (l.startsWith(ctx.root) ? l.slice(ctx.root.length + 1) : l))
+        .join('\n');
+      const total = result.output.split('\n').filter(Boolean).length;
+      const note = total > MAX_MATCHES ? `\n[${total - MAX_MATCHES} more matches not shown]` : '';
+      return {
+        output: truncateOutput(rel + note, ctx.config.maxToolChars),
+        display: `${Math.min(total, MAX_MATCHES)} 件ヒット`
+      };
+    }
+
+    // ripgrep が無いときの自前検索
+    let re;
+    try {
+      re = new RegExp(pattern);
+    } catch (err) {
+      return { isError: true, output: `Invalid regular expression: ${err.message}`, display: '正規表現が不正' };
+    }
+    const globRe = args.glob ? globToRegExp(String(args.glob)) : null;
+    const matches = [];
+    const walk = (dir) => {
+      if (matches.length >= MAX_MATCHES) return;
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (matches.length >= MAX_MATCHES) return;
+        if (entry.name.startsWith('.') || isIgnored(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+        } else {
+          if (globRe && !globRe.test(entry.name)) continue;
+          const st = statSafe(full);
+          if (!st || st.size > ctx.config.maxFileBytes) continue;
+          let buf;
+          try {
+            buf = fs.readFileSync(full);
+          } catch {
+            continue;
+          }
+          if (isProbablyBinary(buf)) continue;
+          buf.toString('utf8').split('\n').forEach((text, i) => {
+            if (matches.length >= MAX_MATCHES) return;
+            if (re.test(text)) {
+              matches.push(`${path.relative(ctx.root, full)}:${i + 1}:${text.slice(0, 300)}`);
+            }
+          });
+        }
+      }
+    };
+    const st = statSafe(abs);
+    if (st && st.isFile()) {
+      fs.readFileSync(abs, 'utf8').split('\n').forEach((text, i) => {
+        if (matches.length < MAX_MATCHES && re.test(text)) {
+          matches.push(`${path.relative(ctx.root, abs)}:${i + 1}:${text.slice(0, 300)}`);
+        }
+      });
+    } else {
+      walk(abs);
+    }
+
+    if (!matches.length) return { output: 'No matches found.', display: '一致なし' };
+    return {
+      output: truncateOutput(matches.join('\n'), ctx.config.maxToolChars),
+      display: `${matches.length} 件ヒット`
+    };
+  }
+};
+
+function globToRegExp(glob) {
+  const escaped = glob
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  return new RegExp(`^${escaped}$`);
+}
+
+// ── 6. コマンドを実行する ────────────────────────────────────
+const runCommand = {
+  name: 'run_command',
+  // 読み取り専用のものだけ素通し。判断は needsApproval にある。
+  approval: 'conditional',
+  description:
+    'Run a shell command in the workspace and return its combined output and exit code. ' +
+    'Use it to run tests, build, install packages, or inspect the system. ' +
+    'Do not use it for interactive programs that wait for input.',
+  parameters: {
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: 'The shell command to run.' },
+      cwd: { type: 'string', description: 'Optional directory to run in, relative to the workspace root.' },
+      timeout_ms: { type: 'integer', description: 'Optional timeout in milliseconds. Default 120000.' }
+    },
+    required: ['command']
+  },
+  approvalTitle(args) {
+    return 'コマンドを実行します';
+  },
+  preview(args) {
+    return c.cyan(`  $ ${String(args.command || '').slice(0, 500)}`);
+  },
+  needsApproval(args, ctx, perms) {
+    return !perms.isSafeCommand(args.command || '');
+  },
+  async run(args, ctx) {
+    const command = String(args.command || '').trim();
+    if (!command) return { isError: true, output: 'command is required.', display: 'コマンドが空です' };
+
+    // 計画モードでは、状態を変えうるコマンドは実行しない。
+    // 「調べてから提案する」ための時間なので、調べる以外はさせない。
+    if (ctx.config.planMode && !isSafeCommand(command, ctx.config)) {
+      return {
+        isError: true,
+        output:
+          'You are in plan mode: only read-only commands are allowed right now. ' +
+          'Finish investigating, then describe what you would run as part of your plan.',
+        display: '計画中なので実行しません'
+      };
+    }
+
+    const cwd = args.cwd ? resolveSafe(args.cwd, ctx) : ctx.root;
+    const timeoutMs = Math.min(600000, Number(args.timeout_ms) || ctx.config.commandTimeoutMs);
+
+    const result = await runProcess(command, null, { cwd, timeoutMs, shell: true, signal: ctx.signal });
+    const body = result.output.trim() || '(no output)';
+    const status = result.timedOut
+      ? `Command timed out after ${timeoutMs} ms and was killed.`
+      : `Exit code: ${result.code}`;
+    return {
+      isError: result.code !== 0,
+      output: truncateOutput(`${status}\n\n${body}`, ctx.config.maxToolChars),
+      display: result.timedOut ? '時間切れで停止' : `終了コード ${result.code}`
+    };
+  }
+};
+
+function runProcess(command, argv, { cwd, timeoutMs, shell = false, signal } = {}) {
+  return new Promise((resolve) => {
+    const child = argv
+      ? spawn(command, argv, { cwd })
+      : spawn(command, { cwd, shell: true });
+    let output = '';
+    let timedOut = false;
+    let settled = false;
+
+    const limit = 400000;
+    const append = (chunk) => {
+      if (output.length < limit) output += chunk.toString();
+    };
+    child.stdout?.on('data', append);
+    child.stderr?.on('data', append);
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* すでに終了している */
+      }
+    }, timeoutMs || 120000);
+
+    const onAbort = () => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* noop */
+      }
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve({ code, output, timedOut });
+    };
+
+    child.on('error', (err) => {
+      output += `\n${err.message}`;
+      finish(127);
+    });
+    child.on('close', (code) => finish(code ?? 0));
+  });
+}
+
+// ── 7. ネットで調べる ────────────────────────────────────────
+//
+// ここから下の2つだけが、このPCの外へ出る道具。
+// 出ていくのは「検索の言葉」と「URL」だけで、ファイルの中身も会話も送らない。
+const webSearch = {
+  name: 'web_search',
+  approval: 'always',
+  description:
+    'Search the public internet and return short summaries with source URLs. ' +
+    'Use it for things this machine cannot know: current library versions, release notes, ' +
+    'error messages you do not recognise, or API documentation. ' +
+    'Do not use it for anything about the local project — read those files instead.',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'What to search for. Be specific; include version numbers or exact error text.' },
+      max_results: { type: 'integer', description: 'How many results to return (1-10). Default 5.' }
+    },
+    required: ['query']
+  },
+  approvalTitle() {
+    return 'ネットで検索します';
+  },
+  preview(args) {
+    return `${c.cyan(`  ${String(args.query || '').slice(0, 300)}`)}\n${c.gray('  この言葉が検索サービス（Tavily）へ送られます')}`;
+  },
+  async run(args, ctx) {
+    if (ctx.config.net === false) {
+      return { isError: true, output: 'Web access is disabled (--no-net).', display: 'ネット接続は切られています' };
+    }
+    const query = String(args.query || '').trim();
+    if (!query) return { isError: true, output: 'query is required.', display: '検索語が空です' };
+
+    const res = await webSearchApi(query, {
+      maxResults: args.max_results,
+      signal: ctx.signal,
+      timeoutMs: ctx.config.netTimeoutMs
+    });
+    if (!res.ok) return { isError: true, output: res.reason, display: '検索できませんでした' };
+    if (!res.results.length) {
+      return { output: `No results for: ${query}`, display: '結果なし' };
+    }
+
+    const parts = [];
+    if (res.answer) parts.push(`Summary: ${res.answer}\n`);
+    res.results.forEach((r, i) => {
+      parts.push(`${i + 1}. ${r.title}\n   ${r.url}\n   ${r.content}`);
+    });
+    parts.push('\nThese are external sources. Verify anything important against the actual project files.');
+
+    return {
+      output: truncateOutput(parts.join('\n'), ctx.config.maxToolChars),
+      display: `${res.results.length} 件`
+    };
+  }
+};
+
+// ── 8. ページを読む ──────────────────────────────────────────
+const webFetch = {
+  name: 'web_fetch',
+  approval: 'always',
+  description:
+    'Fetch one public web page and return it as readable text. ' +
+    'Use it when you have a specific URL — from web_search, from the user, or from a file. ' +
+    'It cannot reach localhost or private addresses.',
+  parameters: {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: 'The full URL, including https://' }
+    },
+    required: ['url']
+  },
+  approvalTitle() {
+    return 'ネット上のページを読みます';
+  },
+  preview(args) {
+    return c.cyan(`  ${String(args.url || '').slice(0, 300)}`);
+  },
+  async run(args, ctx) {
+    if (ctx.config.net === false) {
+      return { isError: true, output: 'Web access is disabled (--no-net).', display: 'ネット接続は切られています' };
+    }
+    // fetchPage が返すのは Response ではなく、読み終えた中身。
+    // { ok, reason } か { ok, url, title, text } のどちらか。
+    const res = await fetchPage(args.url, {
+      signal: ctx.signal,
+      timeoutMs: ctx.config.netTimeoutMs,
+      maxBytes: ctx.config.maxFetchBytes
+    });
+    if (!res.ok) return { isError: true, output: res.reason, display: '読めませんでした' };
+
+    const head = res.title ? `# ${res.title}\n${res.url}\n\n` : `${res.url}\n\n`;
+    const body = res.text || '(the page had no readable text)';
+    return {
+      output: truncateOutput(head + body, ctx.config.maxToolChars),
+      display: res.title ? truncateForDisplay(res.title, 40) : `${body.length} 文字`
+    };
+  }
+};
+
+// ── ログイン済みのブラウザでページを開く ─────────────────────
+//
+// web_fetch との違いは2つ。
+//   ・保存したログイン状態を使うので、ログインが要るページも読める
+//   ・JavaScript で描くページも、描き終わった中身が読める
+// そのぶん重い（ブラウザを起こす）ので、web_fetch で足りるならそちらを使わせる。
+const browseTool = {
+  name: 'browse',
+  approval: 'always',
+  description:
+    "Open a page in the user's real browser, which keeps their saved logins, and return the visible text. " +
+    'Use it when web_fetch failed, when the page needs a login, when the content is rendered by JavaScript, ' +
+    'or for a local development server. Prefer web_fetch for plain public pages: it is much faster.',
+  parameters: {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: 'The URL to open.' }
+    },
+    required: ['url']
+  },
+  approvalTitle() {
+    return 'ログイン済みのブラウザでページを開きます';
+  },
+  preview(args) {
+    return (
+      `${c.cyan(`  ${String(args.url || '').slice(0, 300)}`)}\n` +
+      `${c.gray('  保存済みのログイン状態が使われます')}`
+    );
+  },
+  async run(args, ctx) {
+    if (ctx.config.net === false) {
+      return { isError: true, output: 'Web access is disabled (--no-net).', display: 'ネット接続は切られています' };
+    }
+    const res = await browse(args.url, {
+      timeoutMs: ctx.config.browseTimeoutMs,
+      maxChars: ctx.config.maxToolChars
+    });
+    if (!res.ok) return { isError: true, output: res.reason, display: '開けませんでした' };
+
+    const head = res.title ? `# ${res.title}\n${res.url}\n\n` : `${res.url}\n\n`;
+    const body = res.text || '(the page showed no text)';
+    return {
+      output: truncateOutput(head + body, ctx.config.maxToolChars),
+      display: res.title ? truncateForDisplay(res.title, 40) : `${body.length} 文字`
+    };
+  }
+};
+
+// ── ブラウザログイン ──────────────────────────────────────────
+//
+// ログインは人がやる。道具にできるのは「窓を開けること」と「閉じて保存すること」だけ。
+// モデルの呼び出しは1回で返さないといけないので、開けると閉じるを2回に分けてある。
+const browserLoginTool = {
+  name: 'browser_login',
+  approval: 'always',
+  description:
+    'Open a real browser so the USER can log in to a site by hand. You never type credentials. ' +
+    'Call it with a url to open the window. When the user says they are done, call it again with done=true ' +
+    'to close the window and keep the login. After that, browse can read pages on that site.',
+  parameters: {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: 'The site to log in to, e.g. https://github.com' },
+      done: { type: 'boolean', description: 'Set to true once the user says the login is finished.' }
+    }
+  },
+  approvalTitle(args) {
+    return args?.done ? 'ログイン状態を保存します' : 'ブラウザでログインします';
+  },
+  preview(args) {
+    if (args?.done) return c.gray('  開いているブラウザを閉じて、ログイン状態を保存します');
+    return (
+      `${c.cyan(`  ${String(args?.url || '').slice(0, 300)}`)}\n` +
+      `${c.gray('  ブラウザを開きます。入力はあなたの手で行ってください。')}`
+    );
+  },
+  async run(args, ctx) {
+    if (ctx.config.net === false) {
+      return { isError: true, output: 'Web access is disabled (--no-net).', display: 'ネット接続は切られています' };
+    }
+
+    if (args.done) {
+      const res = await finishLogin();
+      if (!res.ok) return { isError: true, output: res.reason, display: '開いていません' };
+      return {
+        output: `Saved the login for ${res.host} (${res.cookieCount} cookies). browse can now read pages there.`,
+        display: `${res.host} を保存`
+      };
+    }
+
+    if (!args.url) {
+      return { isError: true, output: 'url is required (or pass done=true to finish).', display: 'URLがありません' };
+    }
+    const res = await openForLogin(args.url);
+    if (!res.ok) return { isError: true, output: res.reason, display: '開けませんでした' };
+    return {
+      output:
+        `A browser window is open at ${res.host}. Tell the user to log in there by hand, ` +
+        'then wait for them to say they are done. When they do, call this tool again with done=true. ' +
+        'Do not ask them for their password.',
+      display: `${res.host} を開きました`
+    };
+  }
+};
+
+// ── やることリスト ───────────────────────────────────────────
+//
+// 何かを変えるわけではなく、頭の中の予定を紙に書き出させるだけの道具。
+// 小さいモデルは3手を超えると途中で目的を見失うので、
+// 「次に何をするか」を毎回自分で読み直せる場所を作る。
+//
+// 呼ぶたびに全部を置き換える。差分で足していく形にすると、
+// モデルが前の内容を思い出せずに壊す。
+const todoWrite = {
+  name: 'todo_write',
+  approval: 'never',
+  description:
+    'Record or update your task list for the current request. Pass the COMPLETE list every time — it replaces the previous one. ' +
+    'Use it when the work takes three or more steps, right after you understand what is needed. ' +
+    'Mark exactly one item as in_progress, and mark it completed as soon as it is done — do not batch the updates. ' +
+    'Skip it for single-step requests; it only adds noise there.',
+  parameters: {
+    type: 'object',
+    properties: {
+      todos: {
+        type: 'array',
+        description: 'The full task list, in the order you will do them.',
+        items: {
+          type: 'object',
+          properties: {
+            step: { type: 'string', description: 'What will be done, in one short line.' },
+            status: {
+              type: 'string',
+              enum: ['pending', 'in_progress', 'completed'],
+              description: 'pending / in_progress / completed'
+            }
+          },
+          required: ['step', 'status']
+        }
+      }
+    },
+    required: ['todos']
+  },
+  validate(args) {
+    if (!Array.isArray(args.todos)) return 'todos must be an array.';
+    if (args.todos.length === 0) return 'todos must not be empty. Omit the call instead.';
+    if (args.todos.length > 20) return 'Too many steps. Keep the list to 20 or fewer.';
+    return null;
+  },
+  async run(args, ctx) {
+    const allowed = new Set(['pending', 'in_progress', 'completed']);
+    const todos = args.todos
+      .map((t) => ({
+        step: String(t?.step ?? '').trim(),
+        status: allowed.has(t?.status) ? t.status : 'pending'
+      }))
+      .filter((t) => t.step);
+
+    if (!todos.length) {
+      return { isError: true, output: 'Every item needs a step.', display: '中身が空です' };
+    }
+
+    // 手をつけているものは1つだけ。2つ以上あると、どれを進めているのか分からなくなる。
+    const running = todos.filter((t) => t.status === 'in_progress');
+    if (running.length > 1) {
+      for (const t of running.slice(1)) t.status = 'pending';
+    }
+
+    ctx.todos = todos;
+    renderTodos(todos);
+
+    const done = todos.filter((t) => t.status === 'completed').length;
+    const next = todos.find((t) => t.status === 'in_progress') || todos.find((t) => t.status === 'pending');
+    return {
+      output:
+        `Task list updated (${done}/${todos.length} done).\n` +
+        todos.map((t, i) => `${i + 1}. [${t.status}] ${t.step}`).join('\n') +
+        (next ? `\n\nNext: ${next.step}` : '\n\nAll steps are complete.'),
+      display: `${done}/${todos.length} 完了`,
+      quiet: true
+    };
+  }
+};
+
+// ── 記号の意味で探す（LSP） ──────────────────────────────────
+//
+// search_files との違いは「意味で分かっているかどうか」。
+// `renderTodos` を文字で探すと、コメントに書かれた説明文まで当たる。
+// 言語サーバーは何がその名前を指すか知っているので、本物だけを返す。
+// 実測（このリポジトリ）：文字検索7件のうち2件はコメント。LSP は正しく4件だけ返した。
+const findSymbol = {
+  name: 'find_symbol',
+  approval: 'never',
+  description:
+    'Look up a function, class, or variable by NAME using the language server, which understands the code. ' +
+    'operation="definition" finds where it is defined, "references" finds every place that actually uses it, ' +
+    '"hover" shows its type and documentation. ' +
+    'Prefer this over search_files for code symbols: search_files matches plain text, so it also hits comments, ' +
+    'strings, and similar names. Use search_files for text that is not a symbol.',
+  parameters: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'The exact symbol name, e.g. "renderTodos". No parentheses.' },
+      operation: {
+        type: 'string',
+        enum: ['definition', 'references', 'hover'],
+        description: 'definition / references / hover. Default is definition.'
+      },
+      path: { type: 'string', description: 'Optional file to look in, if you already know which one.' }
+    },
+    required: ['name']
+  },
+  async run(args, ctx) {
+    const name = String(args.name || '').trim().replace(/\(\)$/, '');
+    if (!name) return { isError: true, output: 'name is required.', display: '名前が空です' };
+
+    const hint = args.path ? resolveSafe(args.path, ctx) : null;
+    const operation = ['definition', 'references', 'hover'].includes(args.operation)
+      ? args.operation
+      : 'definition';
+
+    let res;
+    try {
+      if (operation === 'references') res = await findReferences(name, ctx.root, hint);
+      else if (operation === 'hover') res = await findHover(name, ctx.root, hint);
+      else res = await findDefinition(name, ctx.root, hint);
+    } catch (err) {
+      return {
+        isError: true,
+        output: `The language server could not answer: ${err.message}. Use search_files instead.`,
+        display: '言語サーバーが応えませんでした'
+      };
+    }
+
+    if (!res.ok) {
+      return {
+        isError: true,
+        output: `${res.reason} Try search_files if it is not a code symbol.`,
+        display: '見つかりません'
+      };
+    }
+
+    if (operation === 'hover') {
+      return {
+        output: res.text
+          ? `${name} — ${res.place.file}:${res.place.line}\n\n${res.text}`
+          : `${name} is at ${res.place.file}:${res.place.line}, but the language server had no type information.`,
+        display: res.text ? truncateForDisplay(res.text.split('\n')[0], 40) : '説明なし'
+      };
+    }
+
+    const places = res.places || [];
+    if (!places.length) {
+      return {
+        output:
+          operation === 'references'
+            ? `${name} is not used anywhere else in this project.`
+            : `Could not resolve where ${name} is defined.`,
+        display: '0 件'
+      };
+    }
+
+    const lines = places.map((p) => `${p.file}:${p.line}  ${p.text}`);
+    return {
+      output: `${operation === 'references' ? 'Used at' : 'Defined at'}:\n${lines.join('\n')}`,
+      display: `${places.length} 件`
+    };
+  }
+};
+
+/**
+ * いま実際に渡す道具を決める。
+ *
+ * 呼べない道具は最初から見せない。
+ * 見せてしまうと、モデルが呼んで失敗し、その理由を考えるのに往復を1回使う。
+ */
+export function activeTools(config = {}) {
+  // 計画モードでは、書き換える道具そのものを渡さない。
+  // 「使わないでください」と頼むのではなく、無いことにする。
+  const list = config.planMode
+    ? [readFile, listDir, searchFiles, runCommand, todoWrite]
+    : [readFile, writeFile, editFile, listDir, searchFiles, runCommand, todoWrite];
+
+  // 言語サーバーが1つも入っていなければ渡さない（呼べない道具を見せない）。
+  // 読むだけの道具なので、計画モードでも使える。
+  if (config.lspReady) list.push(findSymbol);
+
+  if (config.net === false) return list;
+  if (loadApiKey()) list.push(webSearch);
+  list.push(webFetch);
+  // ブラウザは Playwright が入っているときだけ。
+  // 判定は起動時に済ませて config に入れてある（毎回 import を試すと遅い）。
+  if (config.browserReady) {
+    list.push(browseTool);
+    // ログインは人がやる作業だが、モデルから「窓を開ける」ことはできる。
+    // 計画モードでは渡さない（画面を開くのは調べる行為ではない）。
+    if (!config.planMode) list.push(browserLoginTool);
+  }
+  return list;
+}
+
+export const TOOLS = [
+  readFile, writeFile, editFile, listDir, searchFiles, runCommand,
+  webSearch, webFetch, browseTool, todoWrite, browserLoginTool, findSymbol
+];
+
+export const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));
+
+export { KEY_HELP, BROWSER_HELP };
+
+// Ollama へ渡す形（JSON スキーマ）に変換する
+export function toolSchemas(config) {
+  return activeTools(config || {}).map((t) => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.parameters || { type: 'object', properties: {} }
+    }
+  }));
+}
