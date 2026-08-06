@@ -10,6 +10,8 @@ import { browse, openForLogin, finishLogin, INSTALL_HELP as BROWSER_HELP } from 
 import { isSafeCommand } from './permissions.mjs';
 import { findDefinition, findReferences, findHover, anyServerAvailable } from './lsp.mjs';
 import { runSubagent } from './subagent.mjs';
+import { pendingRules, runAfterEdit } from './rules.mjs';
+import { loadSkills } from './skills.mjs';
 
 // 長すぎる出力は真ん中を省いて前後を残す
 export function truncateOutput(text, max) {
@@ -152,8 +154,10 @@ const readFile = {
       ? `\n\n[showing lines ${start}-${start + slice.length - 1} of ${allLines.length}]`
       : '';
     ctx.readFiles.add(abs);
+    // このフォルダに決まりごとがあれば、読んだこの瞬間に渡す。
+    // 触りもしないフォルダの作法まで最初から全部送ると、そのぶん文脈を食う。
     return {
-      output: truncateOutput(shown + more, ctx.config.maxToolChars),
+      output: truncateOutput(shown + more, ctx.config.maxToolChars) + pendingRules(abs, ctx),
       display: `${slice.length} 行を読み込み`
     };
   }
@@ -200,7 +204,10 @@ const writeFile = {
     ctx.readFiles.add(abs);
     const lines = content.split('\n').length;
     return {
-      output: `${existed ? 'Overwrote' : 'Created'} ${displayPath(abs, ctx)} (${lines} lines).`,
+      output:
+        `${existed ? 'Overwrote' : 'Created'} ${displayPath(abs, ctx)} (${lines} lines).` +
+        pendingRules(abs, ctx) +
+        runAfterEdit(abs, ctx),
       display: `${existed ? '上書き' : '新規作成'} (${lines} 行)`
     };
   }
@@ -264,7 +271,10 @@ const editFile = {
     fs.writeFileSync(abs, result.text, 'utf8');
     ctx.changedFiles.add(abs);
     return {
-      output: `Edited ${displayPath(abs, ctx)} (${result.count} replacement${result.count > 1 ? 's' : ''}).`,
+      output:
+        `Edited ${displayPath(abs, ctx)} (${result.count} replacement${result.count > 1 ? 's' : ''}).` +
+        pendingRules(abs, ctx) +
+        runAfterEdit(abs, ctx),
       display: `${result.count} か所を置き換え${result.fuzzy ? '（空白のズレを補正）' : ''}`
     };
   }
@@ -1109,6 +1119,46 @@ const spawnAgent = {
   }
 };
 
+// ── 手順書を読む ────────────────────────────────────────────
+//
+// 一覧（名前と一行の説明）は指示文に載せてある。
+// 中身は長いので、要ると分かった時点でここから読ませる。
+const readSkill = {
+  name: 'read_skill',
+  approval: 'never',
+  description:
+    'Read the full text of one of the skills listed in your instructions. ' +
+    'A skill is a written procedure for a specific job. ' +
+    'When the request matches a skill, read it before doing anything else and follow it.',
+  parameters: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'The skill name, exactly as listed in your instructions.' }
+    },
+    required: ['name']
+  },
+  async run(args, ctx) {
+    const wanted = String(args.name || '').trim();
+    const skills = loadSkills(ctx.root);
+    const found = skills.find((s) => s.name === wanted);
+
+    if (!found) {
+      // 名前を取り違えただけのことが多いので、実際にあるものを返す
+      return {
+        isError: true,
+        output: skills.length
+          ? `No skill named "${wanted}". Available: ${skills.map((s) => s.name).join(', ')}.`
+          : 'This project has no skills.',
+        display: '見つかりません'
+      };
+    }
+    return {
+      output: `--- Skill: ${found.name} ---\n${found.body}`,
+      display: `${found.name} を読み込み`
+    };
+  }
+};
+
 /**
  * いま実際に渡す道具を決める。
  *
@@ -1146,6 +1196,10 @@ export function activeTools(config = {}) {
   // 渡すと「3手以上なら最初に todo_write」の指示に従って往復を1回よけいに使う。
   if (!config.isSubagent) list.push(todoWrite);
 
+  // 手順書が1つも無いプロジェクトでは、読む道具そのものを渡さない。
+  // 渡すと、モデルは「あるはず」と思って呼び、空振りで往復を1回使う。
+  if (config.skillCount > 0) list.push(readSkill);
+
   // 言語サーバーが1つも入っていなければ渡さない（呼べない道具を見せない）。
   // 読むだけの道具なので、計画モードでも使える。
   if (config.lspReady) list.push(findSymbol);
@@ -1170,7 +1224,7 @@ export function activeTools(config = {}) {
 
 export const TOOLS = [
   readFile, writeFile, editFile, listDir, searchFiles, runCommand,
-  webSearch, webFetch, browseTool, todoWrite, browserLoginTool, findSymbol, spawnAgent
+  webSearch, webFetch, browseTool, todoWrite, browserLoginTool, findSymbol, spawnAgent, readSkill
 ];
 
 /**
@@ -1180,7 +1234,7 @@ export const TOOLS = [
  * やることリストは会話の中の覚え書きで、調べものの委譲は qwc をもう1つ動かすだけ。
  * どちらもファイルにもネットにも触れないので、相手の作法を通す必要がない。
  */
-export const INTERNAL_TOOLS = ['todo_write', 'spawn_agent'];
+export const INTERNAL_TOOLS = ['todo_write', 'spawn_agent', 'read_skill'];
 
 export const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));
 

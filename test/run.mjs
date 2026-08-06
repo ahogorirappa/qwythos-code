@@ -19,6 +19,7 @@ import { loadCommands, renderCommand, isReserved } from '../src/commands.mjs';
 import { pickBestModel } from '../src/ollama.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
+import { loadSkills, skillsBlock } from '../src/skills.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-test-'));
@@ -326,7 +327,8 @@ console.log('\n実行前の確認');
     browser_login: 'always',
     todo_write: 'never',
     find_symbol: 'never',
-    spawn_agent: 'never'
+    spawn_agent: 'never',
+    read_skill: 'never'
   };
   let ok = true;
   for (const t of TOOLS) {
@@ -418,6 +420,99 @@ console.log('\n調べものを任せる');
 
   const planPrompt = buildSystemPrompt({ root, config: { ...ctx.config, planMode: true } });
   check('計画モードにはそのままの説明文', planPrompt.includes('PLAN MODE') && !planPrompt.includes('research assistant'));
+}
+
+// ── フォルダごとの決まりごと ────────────────────────────────
+console.log('\nフォルダごとの決まりごと');
+{
+  put('rules/QWYTHOS.md', 'このフォルダは日本語で書くこと。');
+  put('rules/deep/QWYTHOS.md', 'ここでは英語で書くこと。');
+  put('rules/deep/target.js', 'const x = 1;\n');
+  put('rules/plain.js', 'const y = 2;\n');
+
+  const rulesCtx = { ...ctx, config: loadConfig(), deliveredRules: new Set() };
+
+  let r = await read.run({ path: 'rules/deep/target.js' }, rulesCtx);
+  check('近いフォルダの決まりごとを渡す', r.output.includes('ここでは英語で書くこと'), r.output.slice(-200));
+  check('上のフォルダの決まりごとも渡す', r.output.includes('このフォルダは日本語で書くこと'));
+  // 指示は末尾にあるものほど効くので、近いほうを後ろに置く
+  check('近いほうを後ろに置く',
+    r.output.lastIndexOf('ここでは英語') > r.output.lastIndexOf('このフォルダは日本語'));
+
+  // 同じものを何度も積むと、それだけで文脈が埋まる
+  r = await read.run({ path: 'rules/deep/target.js' }, rulesCtx);
+  check('同じ決まりごとは二度渡さない', !r.output.includes('ここでは英語で書くこと'));
+
+  // 作業フォルダ直下のものは最初から指示文に入っているので、ここでは渡さない
+  put('QWYTHOS.md', 'いちばん上の決まりごと。');
+  const freshCtx = { ...ctx, config: loadConfig(), deliveredRules: new Set() };
+  r = await read.run({ path: 'rules/plain.js' }, freshCtx);
+  check('いちばん上のものは二重に渡さない', !r.output.includes('いちばん上の決まりごと'));
+  check('途中のフォルダのものは渡す', r.output.includes('このフォルダは日本語で書くこと'));
+}
+
+// ── 書き換えたあとに走らせる処理 ────────────────────────────
+console.log('\n書き換えたあとに走らせる処理');
+{
+  const hookCtx = { ...ctx, config: loadConfig(), deliveredRules: new Set() };
+
+  put('.qwythos/hooks.json', JSON.stringify({ afterEdit: 'echo 整えました $QWC_FILE_RELATIVE' }));
+  let r = await write.run({ path: 'hooked.js', content: 'const a = 1;\n' }, hookCtx);
+  check('書いたあとに走る', r.output.includes('afterEdit hook ok'), r.output);
+  check('どのファイルかを渡す', r.output.includes('hooked.js'), r.output);
+
+  // 失敗しても止めない。出力をそのままモデルに返して、直す機会を残す
+  put('.qwythos/hooks.json', JSON.stringify({ afterEdit: 'echo かたちが違います >&2; exit 1' }));
+  r = await write.run({ path: 'hooked2.js', content: 'const b = 1;\n' }, hookCtx);
+  check('失敗しても書き込みは成功のまま', !r.isError, r.display);
+  check('失敗の中身をモデルに返す', r.output.includes('かたちが違います'), r.output);
+  check('直すよう促す', r.output.includes('Fix what it reported'), r.output);
+
+  // 設定が無いプロジェクトでは何も起きない
+  fs.rmSync(path.join(root, '.qwythos', 'hooks.json'));
+  r = await write.run({ path: 'hooked3.js', content: 'const c = 1;\n' }, hookCtx);
+  check('設定が無ければ何もしない', !r.output.includes('afterEdit'), r.output);
+
+  put('.qwythos/hooks.json', '{壊れた');
+  r = await write.run({ path: 'hooked4.js', content: 'const d = 1;\n' }, hookCtx);
+  check('壊れた設定は黙って無視しない', r.output.includes('読めませんでした'), r.output);
+  fs.rmSync(path.join(root, '.qwythos', 'hooks.json'));
+}
+
+// ── 手順書（スキル） ────────────────────────────────────────
+console.log('\n手順書（スキル）');
+{
+  put('.qwythos/skills/release/SKILL.md',
+    '---\nname: release\ndescription: リリース手順。版を上げてタグを打つまで\n---\n1. 版を上げる\n2. タグを打つ\n');
+  put('.qwythos/skills/nometa/SKILL.md', 'ただの本文です。\n');
+
+  const skills = loadSkills(root);
+  check('見つけられる', skills.length === 2, JSON.stringify(skills.map((s) => s.name)));
+
+  const release = skills.find((s) => s.name === 'release');
+  check('頭の名前と説明を読む', release?.description.includes('リリース手順'), JSON.stringify(release));
+  check('頭の部分は本文から外す', !release.body.includes('description:'), release?.body);
+  check('名前が無ければフォルダ名を使う', skills.some((s) => s.name === 'nometa'));
+
+  // 指示文に載せるのは名前と一行だけ。全文を載せると使わないぶんまで毎ターン払う
+  const block = skillsBlock(skills);
+  check('一覧には説明だけを載せる', block.includes('リリース手順') && !block.includes('1. 版を上げる'), block);
+
+  const skill = TOOL_MAP.get('read_skill');
+  let r = await skill.run({ name: 'release' }, ctx);
+  check('読みにきたら全文を渡す', r.output.includes('タグを打つ'), r.output);
+
+  // 名前を取り違えただけのことが多いので、実際にあるものを返す
+  r = await skill.run({ name: 'releaes' }, ctx);
+  check('名前違いには実際にあるものを教える', r.isError && r.output.includes('release'), r.output);
+
+  // 1つも無いプロジェクトでは、読む道具そのものを渡さない
+  const withSkills = activeTools({ net: false, skillCount: 2 }).map((t) => t.name);
+  const without = activeTools({ net: false, skillCount: 0 }).map((t) => t.name);
+  check('手順書があれば渡す', withSkills.includes('read_skill'));
+  check('無ければ渡さない', !without.includes('read_skill'));
+
+  fs.rmSync(path.join(root, '.qwythos', 'skills'), { recursive: true, force: true });
 }
 
 // ── 別のアプリの中で動く ────────────────────────────────────

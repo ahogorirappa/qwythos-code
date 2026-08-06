@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { statSafe } from './paths.mjs';
+import { loadSkills, skillsBlock } from './skills.mjs';
 
 const CONTEXT_FILES = ['QWYTHOS.md', 'AGENTS.md', 'CLAUDE.md', '.qwythos.md'];
 
@@ -187,6 +188,12 @@ Your job in this mode:
 The user will be asked to approve. If they approve, you get the write tools back and carry it out.
 `;
   }
+
+  // 手順書の一覧。名前と一行の説明だけを載せる。
+  // 中身は read_skill で読みにきたときに渡す（使わないものまで毎ターン払わないため）。
+  const skills = loadSkills(root);
+  config.skillCount = skills.length;
+  if (skills.length) prompt += skillsBlock(skills);
 
   if (projectContext) {
     prompt += `\n## Project instructions (from ${projectContext.name}) — follow these, they override the defaults above\n${projectContext.text.trim()}\n`;
