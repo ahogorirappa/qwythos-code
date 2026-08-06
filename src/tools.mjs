@@ -1165,6 +1165,15 @@ const readSkill = {
  * 呼べない道具は最初から見せない。
  * 見せてしまうと、モデルが呼んで失敗し、その理由を考えるのに往復を1回使う。
  */
+// つないだ外の道具（MCP）。startMcp が呼ばれるまでは空。
+let mcpTools = [];
+
+/** つないだ外の道具を登録する。呼ぶのは起動処理（bin/qwc.mjs）だけ。 */
+export function setMcpTools(tools) {
+  mcpTools = Array.isArray(tools) ? tools : [];
+  for (const tool of mcpTools) TOOL_MAP.set(tool.name, tool);
+}
+
 export function activeTools(config = {}) {
   // 別のアプリの中で動いているときは、そのアプリが持っている道具だけを見せる。
   //
@@ -1175,14 +1184,14 @@ export function activeTools(config = {}) {
   // やることリストと調べものの委譲は、外に手を出さない道具なので相手の実装が要らない。
   // ここが持ち込める中身でもある（相手は輪と一緒にこの2つも手に入る）。
   if (Array.isArray(config.hostToolNames)) {
-    const allowed = new Set([...config.hostToolNames, ...INTERNAL_TOOLS]);
+    const allowed = new Set([...config.hostToolNames, ...INTERNAL_TOOLS, ...mcpTools.map((t) => t.name)]);
     if (config.isSubagent) {
       // 任された側の扱いは、ここでも本体のときと同じにする。
       // 片方だけ違うと、同じ言葉で頼んだのに動きが変わる。
       allowed.delete('spawn_agent');
       allowed.delete('todo_write');
     }
-    return TOOLS.filter((tool) => allowed.has(tool.name));
+    return [...TOOLS, ...mcpTools].filter((tool) => allowed.has(tool.name));
   }
 
   // 計画モードでは、書き換える道具そのものを渡さない。
@@ -1207,6 +1216,9 @@ export function activeTools(config = {}) {
   // 調べものの委譲。ネットは要らないので、切断時でも使える。
   // 任された側には渡さない（入れ子で木が無限に広がるため）。
   if (!config.isSubagent) list.push(spawnAgent);
+
+  // 外の道具は、つないだぶんだけ。設定に書いていなければ1つも増えない。
+  list.push(...mcpTools);
 
   if (config.net === false) return list;
   if (loadApiKey()) list.push(webSearch);

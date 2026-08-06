@@ -20,6 +20,7 @@ import { pickBestModel } from '../src/ollama.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
+import { startMcp, stopMcp } from '../src/mcp.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-test-'));
@@ -513,6 +514,75 @@ console.log('\n手順書（スキル）');
   check('無ければ渡さない', !without.includes('read_skill'));
 
   fs.rmSync(path.join(root, '.qwythos', 'skills'), { recursive: true, force: true });
+}
+
+// ── 外の道具（MCP） ─────────────────────────────────────────
+console.log('\n外の道具（MCP）');
+{
+  // 最小の MCP サーバーを立てて、本物の JSON-RPC でやりとりする。
+  // 道具は3つ持たせ、設定では1つだけ使う（増やしすぎないことがいちばんの要点）。
+  put('fake-mcp.mjs', `
+import readline from 'node:readline';
+const send = (m) => process.stdout.write(JSON.stringify(m) + '\\n');
+readline.createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  let m; try { m = JSON.parse(line); } catch { return; }
+  if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2024-11-05', capabilities: {} } });
+  else if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [
+    { name: 'add', description: '2つの数を足す', inputSchema: { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } } } },
+    { name: 'noisy1', description: '使わない' },
+    { name: 'noisy2', description: '使わない' }
+  ] } });
+  else if (m.method === 'tools/call') {
+    const { name, arguments: args } = m.params;
+    if (name === 'add') send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: '答えは ' + (args.a + args.b) + ' です' }] } });
+    else send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: '知らない道具' } });
+  }
+});
+`);
+
+  put('.qwythos/mcp.json', JSON.stringify({
+    servers: { calc: { command: 'node', args: ['fake-mcp.mjs'], tools: ['add'] } }
+  }));
+
+  const { tools: mcp, notes } = await startMcp(root);
+  check('つながって道具を持ってくる', mcp.length === 1, JSON.stringify(mcp.map((t) => t.name)));
+  check('名前でどこの道具か分かる', mcp[0]?.name === 'mcp__calc__add', mcp[0]?.name);
+
+  // 30個持っているサーバーの道具を全部見せると、9B は選べなくなる
+  check('設定に書いた道具だけを渡す', !mcp.some((t) => t.name.includes('noisy')));
+
+  // 何をする道具かはこちらには分からない。分からないものを黙って走らせない
+  check('外の道具は必ず確認する', mcp[0]?.approval === 'always');
+
+  let r = await mcp[0].run({ a: 3, b: 4 });
+  check('実際に呼べて結果が返る', r.output.includes('答えは 7 です'), JSON.stringify(r));
+
+  check('余計なお知らせは出さない', notes.length === 0, notes.join(' / '));
+
+  // 設定で絞らなければ、上限まで自動で絞る
+  put('.qwythos/mcp.json', JSON.stringify({
+    servers: { calc2: { command: 'node', args: ['fake-mcp.mjs'] } }
+  }));
+  const loose = await startMcp(root);
+  check('絞っていなければ全部渡すが上限は超えない', loose.tools.length === 3, String(loose.tools.length));
+
+  // 名前を書き間違えたときに黙って減らさない
+  put('.qwythos/mcp.json', JSON.stringify({
+    servers: { calc3: { command: 'node', args: ['fake-mcp.mjs'], tools: ['addd'] } }
+  }));
+  const typo = await startMcp(root);
+  check('無い道具を指定したら教える', typo.notes.some((n) => n.includes('addd')), typo.notes.join(' / '));
+
+  // 立ち上がらないサーバーがあっても、理由を出して他は続ける
+  put('.qwythos/mcp.json', JSON.stringify({
+    servers: { broken: { command: 'this-command-does-not-exist-xyz' } }
+  }));
+  const broken = await startMcp(root);
+  check('つながらなければ理由を出す', broken.notes.some((n) => n.includes('broken')), broken.notes.join(' / '));
+  check('つながらなくても落ちない', Array.isArray(broken.tools) && broken.tools.length === 0);
+
+  stopMcp();
+  fs.rmSync(path.join(root, '.qwythos', 'mcp.json'));
 }
 
 // ── 別のアプリの中で動く ────────────────────────────────────

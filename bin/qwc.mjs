@@ -7,7 +7,8 @@ import { loadConfig, saveConfig } from '../src/config.mjs';
 import { checkServer, listModels, adaptToModel, pickBestModel } from '../src/ollama.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { Agent } from '../src/agent.mjs';
-import { TOOLS, activeTools, KEY_HELP } from '../src/tools.mjs';
+import { TOOLS, activeTools, setMcpTools, KEY_HELP } from '../src/tools.mjs';
+import { startMcp, stopMcp, loadMcpConfig } from '../src/mcp.mjs';
 import { loadApiKey } from '../src/web.mjs';
 import { resolveMentions, buildMentionBlock } from '../src/mentions.mjs';
 import { anyServerAvailable, serverStatus, stopAll as stopLsp } from '../src/lsp.mjs';
@@ -342,6 +343,17 @@ async function main() {
     process.exit(1);
   }
 
+  // 外の道具（MCP）をつなぐ。
+  // 設定が無ければ何も起きないので、立ち上げが遅くなるのは使う人だけ。
+  {
+    const { tools: mcp, notes } = await startMcp(root);
+    if (mcp.length) {
+      setMcpTools(mcp);
+      info(`外の道具を ${mcp.length} 個つなぎました（${mcp.map((t) => t.name).join(', ')}）。`);
+    }
+    for (const note of notes) warn(note);
+  }
+
   // ── 別のアプリの中でエンジンとして動く ──────────────────────
   //
   // 道具の実体は相手が持っている。こちらは輪だけを回して、
@@ -422,7 +434,7 @@ async function main() {
 
   // 言語サーバーは子プロセスとして残る。qwc が終わるときに必ず落とす。
   // 残ると、次に起動したときに二重に立ち上がってメモリを食う。
-  const cleanup = () => { try { stopLsp(); } catch { /* すでに落ちている */ } };
+  const cleanup = () => { try { stopLsp(); stopMcp(); } catch { /* すでに落ちている */ } };
   process.on('exit', cleanup);
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
