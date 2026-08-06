@@ -81,7 +81,7 @@ export const emit = {
  * @param handlers.onUser  頼みごと。1つ処理し終えるまで次は受け取らない
  * @param handlers.onInterrupt 中断
  */
-export async function serve({ onHello, onUser, onInterrupt }) {
+export async function serve({ onHello, onUser, onInterrupt, onGone }) {
   send = write;
 
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
@@ -151,6 +151,10 @@ export async function serve({ onHello, onUser, onInterrupt }) {
         resolve({ output: 'The host disconnected before this tool finished.', isError: true });
         waiting.delete(id);
       }
+      // 考えている途中なら、それも止める。
+      // 止めないと、相手が閉じたあともモデルを抱えたまま居座り続ける
+      // （実際に、落ちたアプリのぶんだけ居残っているのを見た）。
+      onGone?.();
       resolve();
     });
   });

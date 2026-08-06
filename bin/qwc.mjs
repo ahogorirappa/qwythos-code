@@ -241,8 +241,16 @@ async function runEmbedded({ config, root }) {
 
     onInterrupt() {
       agent?.interrupt();
+    },
+
+    onGone() {
+      agent?.interrupt();
     }
   });
+
+  // 相手がいなくなったら、こちらも終わる。
+  // 待っている通信が残っていると輪が抜けきらないことがあるので、ここで断ち切る。
+  process.exit(0);
 }
 
 // ── 本体 ────────────────────────────────────────────────────
