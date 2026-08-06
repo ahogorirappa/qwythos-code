@@ -4,11 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { TOOL_MAP } from '../src/tools.mjs';
+import { TOOL_MAP, truncateOutput } from '../src/tools.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
-import { salvageToolCalls } from '../src/ollama.mjs';
+import { salvageToolCalls, chatStream } from '../src/ollama.mjs';
 import { describesIntentWithoutActing } from '../src/agent.mjs';
 import { TOOLS, activeTools } from '../src/tools.mjs';
 import { checkUrl, htmlToText, decodeEntities, extractTitle } from '../src/web.mjs';
@@ -18,6 +18,7 @@ import { stripImages } from '../src/session.mjs';
 import { loadCommands, renderCommand, isReserved } from '../src/commands.mjs';
 import { pickBestModel } from '../src/ollama.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
+import { buildSystemPrompt } from '../src/prompt.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-test-'));
@@ -184,6 +185,19 @@ console.log('\n確認が要るコマンドの判定');
   check(`読み取り専用かどうかを ${cases.length} 件すべて正しく判定する`, ok, wrong.join(' / '));
 }
 
+// ── 長すぎる出力の切り詰め ──────────────────────────────────
+console.log('\n長すぎる出力の切り詰め');
+{
+  const long = 'あ'.repeat(5000);
+  const cut = truncateOutput(long, 1000);
+  check('短ければ触らない', truncateOutput('みじかい', 1000) === 'みじかい');
+  check('前と後ろを残す', cut.startsWith('あ') && cut.endsWith('あ'));
+  check('省略した文字数を言う', cut.includes('4000 characters omitted'), cut.slice(0, 60));
+  // ここが弱いと、前の3分の1だけを見て「該当は2つです」と答えてしまう（実測）
+  check('全部ではないと分かる書き方にする', cut.includes('THIS IS NOT THE WHOLE OUTPUT'));
+  check('次の手も書いてある', cut.includes('offset/limit'));
+}
+
 console.log('\n本文に書かれた道具呼び出しの救済');
 {
   // qwen2.5-coder のように、決められたタグを付けずに JSON をそのまま本文へ書くモデルがある。
@@ -214,6 +228,51 @@ console.log('\n本文に書かれた道具呼び出しの救済');
 
   r = salvage('やります。\n<tool_call>{"name":"run_command","arguments":{"command":"ls"}}</tool_call>');
   check('拾った部分は本文から取り除く', r.calls.length === 1 && r.cleaned === 'やります。', JSON.stringify(r));
+
+  // 関数を書くような形で本文に書く癖。qwythos 9B に道具の名前を出して頼むと、こうなる
+  const withArgs = [
+    { function: { name: 'spawn_agent', parameters: { properties: { task: { type: 'string' } } } } },
+    { function: { name: 'read_file', parameters: { properties: { path: {}, offset: {}, limit: {} } } } }
+  ];
+  const salvage2 = (text) => salvageToolCalls(text, withArgs);
+
+  r = salvage2('spawn_agent(task="src/tools.mjs を読み、always の道具を挙げてください。")');
+  check('関数の形も拾う', r.calls.length === 1 && r.calls[0].name === 'spawn_agent'
+    && r.calls[0].args.task.includes('always'), JSON.stringify(r));
+
+  r = salvage2('では調べます。\nread_file(path="src/app.js", limit=50)');
+  check('引数が複数でも拾う', r.calls.length === 1 && r.calls[0].args.path === 'src/app.js'
+    && r.calls[0].args.limit === 50, JSON.stringify(r));
+
+  r = salvage2('read_file({"path":"a.js"})');
+  check('括弧の中がJSONでも拾う', r.calls.length === 1 && r.calls[0].args.path === 'a.js', JSON.stringify(r));
+
+  // ここを間違えると、説明したつもりの一文が実行される
+  r = salvage2('この処理は read_file(ファイルを読む道具) を使っています。');
+  check('文の途中で触れただけなら拾わない', r.calls.length === 0, JSON.stringify(r));
+
+  r = salvage2('read_file(なにかいい感じに)');
+  check('引数の名前が合わなければ拾わない', r.calls.length === 0, JSON.stringify(r));
+
+  r = salvage2('spawn_agent(depth=3)');
+  check('持っていない引数名なら拾わない', r.calls.length === 0, JSON.stringify(r));
+
+  r = salvage2('unknown_tool(path="a.js")');
+  check('知らない道具の関数形は拾わない', r.calls.length === 0, JSON.stringify(r));
+
+  r = salvage2('調べます。\nspawn_agent(task="どこで決めているか（判定の場所）を教えて")');
+  check('引数の中の丸括弧で切らない', r.calls.length === 1
+    && r.calls[0].args.task === 'どこで決めているか（判定の場所）を教えて', JSON.stringify(r));
+
+  r = salvage2('やります。\nspawn_agent(task="調べて")');
+  check('関数形も本文から取り除く', r.cleaned === 'やります。', JSON.stringify(r));
+
+  // 書き方を説明しているだけの例を実行してしまわないこと
+  r = salvage2('使い方はこうです。\n```js\nread_file(path="a.js")\n```\n以上です。');
+  check('コード例の中は拾わない', r.calls.length === 0, JSON.stringify(r));
+
+  r = salvage2('文の途中に書かれた spawn_agent(task="やって") は拾いません。');
+  check('行の途中から始まるものは拾わない', r.calls.length === 0, JSON.stringify(r));
 }
 
 console.log('\n宣言だけで手を動かさない返答の検知');
@@ -266,7 +325,8 @@ console.log('\n実行前の確認');
     browse: 'always',
     browser_login: 'always',
     todo_write: 'never',
-    find_symbol: 'never'
+    find_symbol: 'never',
+    spawn_agent: 'never'
   };
   let ok = true;
   for (const t of TOOLS) {
@@ -320,6 +380,44 @@ console.log('\n意味で探す（LSP）');
   check('コメント行を定義とみなさない', looksLikeCommentForTest('  // export function foo() {'));
   check('本物の定義は通す', !looksLikeCommentForTest('export function foo() {'));
   check('ブロックコメントも除く', looksLikeCommentForTest('   * const bar = 1'));
+}
+
+// ── 調べものを任せる ────────────────────────────────────────
+console.log('\n調べものを任せる');
+{
+  const normal = activeTools({ net: false }).map((t) => t.name);
+  check('本体には渡す', normal.includes('spawn_agent'));
+
+  // 入れ子は木が無限に広がるので、任された側には渡さない
+  const sub = activeTools({ net: false, isSubagent: true }).map((t) => t.name);
+  check('任された側には渡さない', !sub.includes('spawn_agent'));
+
+  // 任された側は読むだけ。2つが同時に書いたら、どちらの結果も信用できなくなる
+  const subTools = activeTools({ net: false, planMode: true, isSubagent: true }).map((t) => t.name);
+  check('任された側は書き換えられない', !subTools.includes('write_file') && !subTools.includes('edit_file'));
+  check('任された側も調べる道具は持つ', subTools.includes('read_file') && subTools.includes('search_files'));
+
+  // 入れ子を頼まれたら、道具の側でも断る（渡していなくても、本文から拾われる場合がある）
+  const spawn = TOOL_MAP.get('spawn_agent');
+  const asSub = { ...ctx, config: { ...ctx.config, isSubagent: true } };
+  const refused = await spawn.run({ task: 'なにか調べて' }, asSub);
+  check('入れ子の依頼は道具が断る', refused.isError === true, refused.display);
+
+  check('空の依頼を断る', (await spawn.run({ task: '  ' }, { ...ctx, config: { ...ctx.config } })).isError === true);
+
+  // やることリストは人に見せるためのもの。任された側の画面は流れて消えるので渡さない
+  check('任された側にやることリストは渡さない', !subTools.includes('todo_write'));
+  check('計画モードだけならやることリストは渡す', activeTools({ net: false, planMode: true }).map((t) => t.name).includes('todo_write'));
+
+  // 立場が違うので指示ごと入れ替える。
+  // 計画モードの文面は「承認されたら自分が実装する」前提なので、任された側に渡ると嘘になる
+  const subPrompt = buildSystemPrompt({ root, config: { ...ctx.config, planMode: true, isSubagent: true } });
+  check('任された側は調べる係だと名乗る', subPrompt.includes('research assistant'));
+  check('計画モードの説明文は渡さない', !subPrompt.includes('PLAN MODE'));
+  check('変更したと言わせない', subPrompt.includes('Never claim you changed'));
+
+  const planPrompt = buildSystemPrompt({ root, config: { ...ctx.config, planMode: true } });
+  check('計画モードにはそのままの説明文', planPrompt.includes('PLAN MODE') && !planPrompt.includes('research assistant'));
 }
 
 // ── ログイン済みブラウザ ────────────────────────────────────
@@ -566,6 +664,112 @@ console.log('\nモデルの自動選択');
   check('埋め込みしか無ければ選ばない', pickBestModel(['qwen3-embedding:0.6b']) === null);
   check('1つも無ければ null', pickBestModel([]) === null);
   check('知らない名前でも1つは返す', pickBestModel(['mystery:7b']) === 'mystery:7b');
+}
+
+// ── 返事を待つ時間 ──────────────────────────────────────────
+//
+// Node の fetch は、1文字目が返るまで300秒で必ず諦める（undici の headersTimeout）。
+// 手元のモデルは文脈が長いとそれ以上かかるので、少し長い作業をすると必ず落ちていた。
+// 偽のサーバーを立てて、待ち方が自分の手の内にあることを確かめる。
+console.log('\n返事を待つ時間');
+{
+  const http = await import('node:http');
+
+  // 受け取るだけで何も返さないサーバー＝黙り込んだモデル
+  const silent = http.createServer(() => {});
+  await new Promise((r) => silent.listen(0, '127.0.0.1', r));
+  const silentPort = silent.address().port;
+
+  let waited = 0;
+  let message = '';
+  const t0 = Date.now();
+  try {
+    const stream = chatStream({
+      cfg: { host: `http://127.0.0.1:${silentPort}`, model: 'x', firstTokenMs: 300, stallMs: 300 },
+      messages: [{ role: 'user', content: 'hi' }]
+    });
+    for await (const _ of stream) { /* 来ない */ }
+  } catch (err) {
+    waited = Date.now() - t0;
+    message = err.message;
+  }
+  silent.close();
+
+  check('黙ったままなら自分で見切る', waited > 0 && waited < 5000, `${waited}ms`);
+  check('300秒の壁ではなく設定した長さで切れる', waited < 3000, `${waited}ms`);
+  check('理由と次の手を日本語で言う', message.includes('だまったまま') && message.includes('/clear'), message);
+
+  // 普通に返すサーバー＝ちゃんと最後まで読めること
+  const talker = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    res.write(JSON.stringify({ message: { content: 'こん' } }) + '\n');
+    res.write(JSON.stringify({ message: { content: 'にちは' } }) + '\n');
+    res.end(JSON.stringify({ done: true, prompt_eval_count: 12, eval_count: 3 }) + '\n');
+  });
+  await new Promise((r) => talker.listen(0, '127.0.0.1', r));
+  const talkPort = talker.address().port;
+
+  let text = '';
+  let done = null;
+  for await (const ev of chatStream({
+    cfg: { host: `http://127.0.0.1:${talkPort}`, model: 'x' },
+    messages: [{ role: 'user', content: 'hi' }]
+  })) {
+    if (ev.type === 'content') text += ev.text;
+    if (ev.type === 'done') done = ev;
+  }
+  talker.close();
+
+  check('逐次で届く本文をつなげる', text === 'こんにちは', text);
+  check('締めくくりの数字も拾う', done?.stats?.promptTokens === 12 && done?.stats?.outputTokens === 3);
+
+  // 話しはじめてから黙り込んだ場合。ここは短い方の物差しで切る
+  const halfway = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    res.write(JSON.stringify({ message: { content: 'とちゅう' } }) + '\n');
+    // 以降は何も書かないまま放置する
+  });
+  await new Promise((r) => halfway.listen(0, '127.0.0.1', r));
+  const halfPort = halfway.address().port;
+
+  let partial = '';
+  let stallMsg = '';
+  const t1 = Date.now();
+  try {
+    for await (const ev of chatStream({
+      cfg: { host: `http://127.0.0.1:${halfPort}`, model: 'x', firstTokenMs: 5000, stallMs: 300 },
+      messages: [{ role: 'user', content: 'hi' }]
+    })) {
+      if (ev.type === 'content') partial += ev.text;
+    }
+  } catch (err) {
+    stallMsg = err.message;
+  }
+  const stallWait = Date.now() - t1;
+  halfway.close();
+
+  check('途中で止まったら短い方で見切る', stallMsg.includes('とぎれた'), stallMsg);
+  check('見切るまで待ちすぎない', stallWait < 3000, `${stallWait}ms`);
+  check('そこまでに届いた分は受け取れている', partial === 'とちゅう', partial);
+
+  // エラーはエラーとして見せる（黙って握りつぶさない）
+  const angry = http.createServer((req, res) => {
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('model not found');
+  });
+  await new Promise((r) => angry.listen(0, '127.0.0.1', r));
+  const angryPort = angry.address().port;
+  let httpErr = '';
+  try {
+    for await (const _ of chatStream({
+      cfg: { host: `http://127.0.0.1:${angryPort}`, model: 'x' },
+      messages: [{ role: 'user', content: 'hi' }]
+    })) { /* 来ない */ }
+  } catch (err) {
+    httpErr = err.message;
+  }
+  angry.close();
+  check('サーバーの言い分をそのまま見せる', httpErr.includes('500') && httpErr.includes('model not found'), httpErr);
 }
 
 fs.rmSync(root, { recursive: true, force: true });

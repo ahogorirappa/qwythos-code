@@ -1,7 +1,121 @@
 // Ollama の /api/chat と話す部分。逐次（ストリーミング）で受け取る。
+import http from 'node:http';
+import https from 'node:https';
+
 const jsonHeaders = { 'Content-Type': 'application/json' };
 
 export class OllamaError extends Error {}
+
+// 待ち時間の既定値。
+//
+// ■ なぜ fetch を使わないのか
+//     Node の fetch は、応答のヘッダが返るまで **300秒で必ず諦める**（undici の headersTimeout）。
+//     この値を設定で伸ばす方法は公開されていない。
+//     実測: 12,668 トークンの依頼を投げたら、301秒ちょうどで `fetch failed`
+//     （`UND_ERR_HEADERS_TIMEOUT`）になった。Ollama 側は無事で、こちらが先に諦めていた。
+//     暖まっていれば前処理は毎秒500トークンほど出るが、モデルの読み込みや
+//     文脈枠の取り直しが挟まると、最初の1文字までが分単位になる。そこで踏む。
+//     やり取りが長い2か所だけ node:http で投げ直し、待ち方をこちらで決める。
+const FIRST_TOKEN_MS = 15 * 60 * 1000; // 最初の1文字が出るまで（長い文脈の下ごしらえを待つ）
+const STALL_MS = 3 * 60 * 1000;        // 出はじめたあとで途切れたとき
+
+/**
+ * JSON を POST して、応答を Node の Readable のまま返す。
+ *
+ * 止まったときは自分で見切る。切れ目は2段階で見る。
+ * 出はじめる前は長く待つ（下ごしらえに時間がかかるだけかもしれない）。
+ * 出はじめたあとは短く切る（途中で止まったのなら、待っても戻らない）。
+ */
+export function postStream({ url, payload, signal, firstTokenMs = FIRST_TOKEN_MS, stallMs = STALL_MS }) {
+  return new Promise((resolve, reject) => {
+    let target;
+    try {
+      target = new URL(url);
+    } catch {
+      reject(new OllamaError(`つなぎ先の指定が読めません: ${url}`));
+      return;
+    }
+    const lib = target.protocol === 'https:' ? https : http;
+    const body = Buffer.from(JSON.stringify(payload), 'utf8');
+
+    const req = lib.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        path: `${target.pathname}${target.search}`,
+        method: 'POST',
+        headers: { ...jsonHeaders, 'Content-Length': body.length },
+        signal
+      },
+      (res) => {
+        // ここで res に 'data' を聞きに行ってはいけない。
+        // listener を足した時点で流れ出し、受け取り手より先に最初の断片を持っていってしまう。
+        // 出はじめたあとの見切りは、読む側（withStallTimeout）で計る。
+        resolve(res);
+      }
+    );
+
+    req.setTimeout(firstTokenMs, () => {
+      req.destroy(new OllamaError(waitedTooLong(firstTokenMs)));
+    });
+    req.on('error', (err) => {
+      if (err.name === 'AbortError') return reject(err);
+      if (err instanceof OllamaError) return reject(err);
+      reject(new OllamaError(`Ollama につながりません (${url}): ${err.message}`));
+    });
+    req.end(body);
+  });
+}
+
+function waitedTooLong(ms) {
+  return (
+    `Ollama が ${Math.round(ms / 60000)} 分だまったままなので、待つのをやめました。` +
+    'いま送っている文脈が長すぎるのかもしれません（/clear で会話を空にするか、小さいモデルに替えてみてください）。'
+  );
+}
+
+/**
+ * 断片と断片のあいだが空きすぎたら見切る。
+ *
+ * 読む側で計るので、途中の断片を横取りしない。
+ * 最初の1つは計らない。応答が返ってきた時点で下ごしらえは終わっているし、
+ * そこに至るまでの長い待ちは postStream 側（`firstTokenMs`）が見ている。
+ */
+async function* withStallTimeout(res, stallMs = STALL_MS) {
+  const iter = res[Symbol.asyncIterator]();
+  let first = true;
+  for (;;) {
+    let timer;
+    const gaveUp = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        res.destroy();
+        reject(new OllamaError(stalled(stallMs)));
+      }, stallMs);
+    });
+    let next;
+    try {
+      // 最初の1つは、応答が返ってきた時点で下ごしらえが済んでいるので待たなくてよい
+      next = first ? await iter.next() : await Promise.race([iter.next(), gaveUp]);
+    } finally {
+      clearTimeout(timer);
+    }
+    first = false;
+    if (next.done) return;
+    yield next.value;
+  }
+}
+
+function stalled(ms) {
+  return `Ollama からの返事が ${Math.round(ms / 1000)} 秒とぎれたので、待つのをやめました。`;
+}
+
+/** 応答の中身を最後まで文字列で受け取る */
+async function readAll(res) {
+  const chunks = [];
+  for await (const chunk of res) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8');
+}
 
 export async function checkServer(cfg) {
   try {
@@ -117,6 +231,116 @@ function buildOptions(cfg) {
 // 決められたタグ（<tool_call>）を付けずに JSON をそのまま本文へ書くモデルがある。
 // その場合 Ollama は解釈できず、道具は永遠に呼ばれない。
 // モデル側は直せないので、こちらで受け止める。
+/**
+ * 本文に `道具の名前(引数)` と書かれているものを拾う。
+ *
+ * 見境なく拾うと、説明のつもりで書いた一文まで実行してしまう。そこで3つとも満たすものだけを取る。
+ *   1. 行の先頭から始まっている（文の途中で触れただけのものは取らない）
+ *   2. 名前がいま渡している道具のもの
+ *   3. 引数の名前が、その道具が実際に持っている引数と一致する
+ * 3つめが効く。`spawn_agent(task=…)` は通り、`これは spawn_agent(便利です)` は通らない。
+ */
+function findCallLikeText(text, tools) {
+  const specs = new Map();
+  for (const t of tools || []) {
+    const fn = t?.function;
+    if (fn?.name) specs.set(fn.name, Object.keys(fn.parameters?.properties || {}));
+  }
+  if (!specs.size || !text) return [];
+
+  // ``` で囲まれた中は見ない。書き方の例として見せているだけで、実行してほしいわけではない。
+  // （JSON の受け皿は逆に ```json の中を見に行く。あちらは道具の呼び出しがそこに書かれるため）
+  const scan = maskFences(text);
+
+  const found = [];
+  const lineStart = /(^|\n)[ \t]*([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/g;
+  let m;
+  while ((m = lineStart.exec(scan))) {
+    const name = m[2];
+    const keys = specs.get(name);
+    if (!keys) continue;
+
+    const open = m.index + m[0].length - 1;
+    const close = matchingParen(text, open);
+    if (close < 0) continue;
+
+    const inner = text.slice(open + 1, close).trim();
+    const args = parseArgText(inner, keys);
+    if (!args) continue;
+
+    found.push({ name, args, raw: text.slice(m.index + m[1].length, close + 1) });
+    lineStart.lastIndex = close;
+  }
+  return found;
+}
+
+/** ``` の中を同じ長さの空白に置き換える（位置がずれないようにするため） */
+function maskFences(text) {
+  return text.replace(/```[\s\S]*?(```|$)/g, (block) => block.replace(/[^\n]/g, ' '));
+}
+
+/** 引用符の中の丸括弧は数えずに、対になる `)` を探す */
+function matchingParen(text, open) {
+  let depth = 0;
+  let quote = null;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '(') depth++;
+    else if (ch === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * 括弧の中を引数に直す。`{...}` の JSON か、`名前="値"` の並びだけを受け付ける。
+ * その道具が持っていない引数名が1つでも混ざっていたら、まるごと諦める（取り違えるより出さないほうがよい）。
+ */
+function parseArgText(inner, keys) {
+  if (!inner) return null;
+
+  if (inner.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(inner);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return Object.keys(parsed).every((k) => keys.includes(k)) ? parsed : null;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  const args = {};
+  const pair = /([a-zA-Z_][a-zA-Z0-9_]*)\s*[=:]\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,]*)/g;
+  let seen = 0;
+  let m;
+  while ((m = pair.exec(inner))) {
+    const key = m[1];
+    if (!keys.includes(key)) return null;
+    let value = m[2].trim();
+    if (/^["']/.test(value)) {
+      try {
+        value = JSON.parse(value[0] === "'" ? `"${value.slice(1, -1).replace(/"/g, '\\"')}"` : value);
+      } catch {
+        value = value.slice(1, -1);
+      }
+    } else if (/^-?\d+(\.\d+)?$/.test(value)) {
+      value = Number(value);
+    } else if (value === 'true' || value === 'false') {
+      value = value === 'true';
+    }
+    args[key] = value;
+    seen++;
+  }
+  return seen ? args : null;
+}
+
 export function salvageToolCalls(text, tools) {
   const known = new Set((tools || []).map((t) => t?.function?.name).filter(Boolean));
   if (!known.size || !text) return { calls: [], cleaned: text };
@@ -135,6 +359,14 @@ export function salvageToolCalls(text, tools) {
 
   const calls = [];
   let cleaned = text;
+
+  // 関数を書くような形 ── spawn_agent(task="…") ── で本文に書くモデルがある。
+  // JSON ではないので上の受け皿では拾えない。実測（qwythos 9B）では、
+  // こちらから道具の名前を出して頼むと、その名前をそのまま文章に書き写して手を止める。
+  for (const found of findCallLikeText(text, tools)) {
+    calls.push({ id: `salvaged_${calls.length}`, name: found.name, args: found.args });
+    cleaned = cleaned.replace(found.raw, '');
+  }
 
   for (const candidate of candidates) {
     let parsed;
@@ -176,22 +408,17 @@ export async function* chatStream({ cfg, messages, tools, signal }) {
   };
   if (tools && tools.length) body.tools = tools;
 
-  let res;
-  try {
-    res = await fetch(`${cfg.host}/api/chat`, {
-      method: 'POST',
-      headers: jsonHeaders,
-      body: JSON.stringify(body),
-      signal
-    });
-  } catch (err) {
-    if (err.name === 'AbortError') throw err;
-    throw new OllamaError(`Ollama につながりません (${cfg.host}): ${err.message}`);
-  }
+  const res = await postStream({
+    url: `${cfg.host}/api/chat`,
+    payload: body,
+    signal,
+    firstTokenMs: cfg.firstTokenMs,
+    stallMs: cfg.stallMs
+  });
 
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new OllamaError(`Ollama がエラーを返しました (HTTP ${res.status}): ${detail.slice(0, 400)}`);
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    const detail = await readAll(res).catch(() => '');
+    throw new OllamaError(`Ollama がエラーを返しました (HTTP ${res.statusCode}): ${detail.slice(0, 400)}`);
   }
 
   const decoder = new TextDecoder();
@@ -219,7 +446,7 @@ export async function* chatStream({ cfg, messages, tools, signal }) {
     }
   };
 
-  for await (const chunk of res.body) {
+  for await (const chunk of withStallTimeout(res, cfg.stallMs)) {
     buffer += decoder.decode(chunk, { stream: true });
     let nl;
     while ((nl = buffer.indexOf('\n')) >= 0) {
@@ -301,21 +528,33 @@ export async function* chatStream({ cfg, messages, tools, signal }) {
 }
 
 // ツールなしで一発だけ答えてもらう（要約などの裏方仕事に使う）
+//
+// ここも node:http で投げる。まとめ直しは会話まるごとを送るので、いちばん長くなる。
+// 文脈が溢れたから要約するのに、その要約が300秒で切られては元も子もない。
 export async function chatOnce({ cfg, messages, signal, temperature = 0.2 }) {
-  const res = await fetch(`${cfg.host}/api/chat`, {
-    method: 'POST',
-    headers: jsonHeaders,
-    body: JSON.stringify({
+  const res = await postStream({
+    url: `${cfg.host}/api/chat`,
+    signal,
+    firstTokenMs: cfg.firstTokenMs,
+    stallMs: cfg.stallMs,
+    payload: {
       model: cfg.model,
       messages,
       stream: false,
       think: false,
       keep_alive: cfg.keepAlive,
       options: { ...buildOptions(cfg), temperature }
-    }),
-    signal
+    }
   });
-  if (!res.ok) throw new OllamaError(`HTTP ${res.status}`);
-  const data = await res.json();
+  const text = await readAll(res);
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    throw new OllamaError(`HTTP ${res.statusCode}: ${text.slice(0, 200)}`);
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new OllamaError('Ollama の返事が読めませんでした');
+  }
   return (data.message && data.message.content) || '';
 }

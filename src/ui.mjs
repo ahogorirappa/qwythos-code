@@ -33,12 +33,29 @@ export function clearLine() {
   if (useColor) process.stdout.write('\r\x1b[2K');
 }
 
+// 出力の左に付ける印。
+//
+// サブエージェントが動いているあいだ、その出力を一段下げて見せるために使う。
+// 誰がしゃべっているのか分からないまま道具の実行が流れると、
+// 利用者は「本体が勝手なことを始めた」と受け取ってしまう。
+let outputPrefix = '';
+
+export function setOutputPrefix(prefix = '') {
+  outputPrefix = prefix;
+}
+
 export function out(s = '') {
-  process.stdout.write(s);
+  process.stdout.write(outputPrefix && s ? outputPrefix + s : s);
 }
 
 export function line(s = '') {
-  process.stdout.write(`${s}\n`);
+  if (!outputPrefix) return void process.stdout.write(`${s}\n`);
+  // 複数行でも、行ごとに印を付ける
+  const body = String(s)
+    .split('\n')
+    .map((l) => outputPrefix + l)
+    .join('\n');
+  process.stdout.write(`${body}\n`);
 }
 
 export function termWidth() {

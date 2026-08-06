@@ -9,6 +9,7 @@ import { search as webSearchApi, fetchPage, loadApiKey, KEY_HELP } from './web.m
 import { browse, openForLogin, finishLogin, INSTALL_HELP as BROWSER_HELP } from './browser.mjs';
 import { isSafeCommand } from './permissions.mjs';
 import { findDefinition, findReferences, findHover, anyServerAvailable } from './lsp.mjs';
+import { runSubagent } from './subagent.mjs';
 
 // 長すぎる出力は真ん中を省いて前後を残す
 export function truncateOutput(text, max) {
@@ -16,7 +17,17 @@ export function truncateOutput(text, max) {
   const headLen = Math.floor(max * 0.6);
   const tailLen = max - headLen;
   const omitted = text.length - max;
-  return `${text.slice(0, headLen)}\n\n…[${omitted} 文字を省略しました]…\n\n${text.slice(-tailLen)}`;
+  // 省略したことは、モデルに分かる書き方で伝える。
+  // 実測: 「…[N 文字を省略しました]…」だけだと 9B は気づかず、
+  // 45KB のファイルの前3分の1だけを見て「該当は2つです」と答えた（本当は6つあった）。
+  // 何が起きたかだけでなく、**次に何をすればよいか**まで書く。
+  return (
+    `${text.slice(0, headLen)}\n\n` +
+    `…[${omitted} characters omitted from the middle. THIS IS NOT THE WHOLE OUTPUT — ` +
+    'do not conclude anything about the omitted part. If it matters, read it with offset/limit ' +
+    'or narrow your search.]…\n\n' +
+    `${text.slice(-tailLen)}`
+  );
 }
 
 // 見つからなかったパスに近いものを探して教える。
@@ -1039,6 +1050,62 @@ const findSymbol = {
   }
 };
 
+// ── 調べものを任せる ─────────────────────────────────────────
+//
+// 読んだファイルの中身は、任された側の会話にだけ残る。
+// 本体に返るのは答えの数行だけなので、文脈を食いつぶさずに調べられる。
+const spawnAgent = {
+  name: 'spawn_agent',
+  approval: 'never',
+  description:
+    'Hand off a self-contained research question to a separate assistant that can only read. ' +
+    'It explores on its own and comes back with just the answer, so the files it reads never enter your context. ' +
+    'Use it when finding something out would take several reads — "where is X handled", "how does Y flow through the code", ' +
+    '"which files would a change to Z touch". ' +
+    'Ask one clear question and say what you want back. It cannot change anything, so do not ask it to.',
+  parameters: {
+    type: 'object',
+    properties: {
+      task: {
+        type: 'string',
+        description:
+          'The question, written so it stands alone — the assistant sees none of this conversation. ' +
+          'Say what to find and what to report back.'
+      }
+    },
+    required: ['task']
+  },
+  async run(args, ctx) {
+    // 入れ子は許さない。木が無限に広がる。
+    if (ctx.config.isSubagent) {
+      return {
+        isError: true,
+        output: 'You are already a research assistant. Do the work yourself with the read tools you have.',
+        display: '入れ子にはできません'
+      };
+    }
+
+    const res = await runSubagent({
+      task: args.task,
+      config: ctx.config,
+      root: ctx.root,
+      permissions: ctx.permissions,
+      signal: ctx.signal
+    });
+
+    if (!res.ok) {
+      return { isError: true, output: `${res.reason} Investigate it yourself instead.`, display: '戻りませんでした' };
+    }
+    return {
+      output:
+        `The research assistant reports:\n\n${res.answer}\n\n` +
+        '(It could only read. Verify anything you are about to change by reading the file yourself.)',
+      display: `${res.steps} 回調べて回答`,
+      quiet: true
+    };
+  }
+};
+
 /**
  * いま実際に渡す道具を決める。
  *
@@ -1049,12 +1116,21 @@ export function activeTools(config = {}) {
   // 計画モードでは、書き換える道具そのものを渡さない。
   // 「使わないでください」と頼むのではなく、無いことにする。
   const list = config.planMode
-    ? [readFile, listDir, searchFiles, runCommand, todoWrite]
-    : [readFile, writeFile, editFile, listDir, searchFiles, runCommand, todoWrite];
+    ? [readFile, listDir, searchFiles, runCommand]
+    : [readFile, writeFile, editFile, listDir, searchFiles, runCommand];
+
+  // やることリストは人に見せるためのもの。
+  // 任された側の画面は本体の作業の途中に挟まって流れるだけなので、渡しても場所を取るだけ。
+  // 渡すと「3手以上なら最初に todo_write」の指示に従って往復を1回よけいに使う。
+  if (!config.isSubagent) list.push(todoWrite);
 
   // 言語サーバーが1つも入っていなければ渡さない（呼べない道具を見せない）。
   // 読むだけの道具なので、計画モードでも使える。
   if (config.lspReady) list.push(findSymbol);
+
+  // 調べものの委譲。ネットは要らないので、切断時でも使える。
+  // 任された側には渡さない（入れ子で木が無限に広がるため）。
+  if (!config.isSubagent) list.push(spawnAgent);
 
   if (config.net === false) return list;
   if (loadApiKey()) list.push(webSearch);
@@ -1072,7 +1148,7 @@ export function activeTools(config = {}) {
 
 export const TOOLS = [
   readFile, writeFile, editFile, listDir, searchFiles, runCommand,
-  webSearch, webFetch, browseTool, todoWrite, browserLoginTool, findSymbol
+  webSearch, webFetch, browseTool, todoWrite, browserLoginTool, findSymbol, spawnAgent
 ];
 
 export const TOOL_MAP = new Map(TOOLS.map((t) => [t.name, t]));

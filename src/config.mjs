@@ -23,6 +23,15 @@ export const DEFAULT_CONFIG = {
   repeatPenalty: 1.05,
   keepAlive: '30m',
   think: true,
+
+  // モデルの返事をどれだけ待つか。
+  //
+  // モデルの読み込みや文脈枠の取り直しが挟まると、最初の1文字までが分単位になる。
+  // Node の fetch はここを300秒で必ず打ち切るので、この2か所だけ node:http で投げている。
+  // 出はじめる前は長く待ち、出はじめたあとで途切れたら短く見切る。
+  firstTokenMs: 15 * 60 * 1000,
+  stallMs: 3 * 60 * 1000,
+
   showThinking: 'compact', // compact（1行だけ流す）/ full（全部出す）/ off（出さない）
 
   // エージェントの動作

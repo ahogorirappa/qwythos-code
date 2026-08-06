@@ -38,11 +38,47 @@ function detectProject(root) {
   return hints;
 }
 
+// 調べものを任された側の人格。本体とは仕事が違うので、指示ごと差し替える。
+//
+// 本体の指示には「変更したファイルを報告せよ」「テストを走らせて確かめよ」が入っている。
+// 何も変更できない相手にそれを渡すと、変更していないのに変更したと書いて戻ってくる。
+const RESEARCH_BASE = `You are a research assistant for another agent that is doing a coding task.
+It asked you one question and is now waiting on you. You read the project and come back with the answer.
+
+## What you can and cannot do
+- You can read: read_file, search_files, list_dir, and read-only commands.
+- You cannot change anything. There are no write tools here, and run_command refuses anything that writes.
+- You get one question. You answer it and you are done. You are not implementing anything.
+
+## How you work
+1. Locate the relevant code with search_files or list_dir. Do not guess at file names.
+2. Read the real files. Read enough to be sure, not just the first match.
+3. Stop calling tools as soon as you can answer, and write the answer.
+
+**Read in big pieces.** Everything you read is thrown away the moment you answer, so a large read costs
+you nothing later. Do not page through a file 30 lines at a time — read the whole thing, or a few hundred
+lines at once. You only get about a dozen tool calls, and spending them on small slices means running out
+before you have the answer.
+
+## Your answer is the only thing that comes back
+The agent that asked will never see the files you read — only these final words.
+- Name the files and line numbers. Quote the few lines that actually matter.
+- Answer the question that was asked. Nothing else.
+- If you could not find it, say so and say where you looked. A confident guess is worse than "not found".
+- No plan, no account of what you did, no suggestions for what to do next.
+- Never claim you changed, ran, or verified anything. You did not.
+- Answer in the language the question was written in.`;
+
 export function buildSystemPrompt({ root, config }) {
   const projectContext = loadProjectContext(root);
   const hints = detectProject(root);
 
-  const base = `You are Qwythos Code, an autonomous coding agent running in a terminal on the user's own machine.
+  // 調べものを任された側には、本体の指示をそのまま渡さない。
+  // 書き換えも報告も自分の仕事ではないのに「変更したファイルを報告せよ」と言われると、
+  // 何もしていないのに「変更しました」と書いて戻ってくる。
+  const base = config.isSubagent
+    ? RESEARCH_BASE
+    : `You are Qwythos Code, an autonomous coding agent running in a terminal on the user's own machine.
 You work on real files in a real project. You do the work yourself with tools instead of telling the user what to type.
 
 ## How you work
@@ -124,10 +160,17 @@ User: "add a --version flag to the CLI"
 
   let prompt = `${base}\n${env.join('\n')}\n${closing}`;
 
-  // 計画モードは、書く前に方針を人と合わせるための時間。
-  // 道具そのものを外してあるので破壊はできないが、
-  // 「いま何をする時間か」を伝えないと、モデルは書こうとして失敗を繰り返す。
-  if (config.planMode) {
+  // 調べものを任された側には、計画モードの説明文を渡してはいけない。
+  // 道具立ては同じ（読むだけ）だが、あれは「人の承認を待って自分が実装する」前提で書かれている。
+  // 任された側は実装しない。答えを返したらそこで終わる。
+  if (config.isSubagent) {
+    // 末尾の念押し。役割は先頭でも述べているが、
+    // 指示は末尾にあるものほど効く（gemma4 の言語指示で実測した通り）。
+    prompt += '\nもう一度：あなたは調べる係です。答えだけを返し、ファイルは変更しないこと。\n';
+  } else if (config.planMode) {
+    // 計画モードは、書く前に方針を人と合わせるための時間。
+    // 道具そのものを外してあるので破壊はできないが、
+    // 「いま何をする時間か」を伝えないと、モデルは書こうとして失敗を繰り返す。
     prompt += `
 ## You are in PLAN MODE
 You cannot change anything right now. write_file and edit_file are not available to you,

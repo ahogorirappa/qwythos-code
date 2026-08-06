@@ -36,6 +36,8 @@ export class Agent {
     this.ctx = {
       root,
       config,
+      // 道具から使う。いまは spawn_agent が、任せる相手にそのまま引き継ぐために読む。
+      permissions,
       changedFiles: new Set(),
       readFiles: new Set(),
       // いまのやることリスト。todo_write が書き換える。
@@ -173,8 +175,11 @@ export class Agent {
         // 短い作業ならそれで困らないので、そこは放っておく。
         // 困るのは長い作業で、途中で何を頼まれていたのか見失うとき。
         // 促すのは1回だけ。毎回言うと、そのぶん往復を食って本来の作業が進まない。
+        // 調べものを任された側には todo_write を渡していないので、促さない。
+        // 無い道具を促すと、呼んで失敗して、その理由を考えるのに往復を2回使う。
         if (
           !toldAboutTodos &&
+          !this.config.isSubagent &&
           !this.ctx.todos?.length &&
           this.stats.toolCalls >= (this.config.todoHintAfter ?? 6)
         ) {
@@ -189,10 +194,16 @@ export class Agent {
         }
 
         if (step === this.config.maxSteps - 1) {
-          warn(`ツールの往復が上限 (${this.config.maxSteps} 回) に達したので止めました。続けるなら「続けて」と言ってください。`);
+          // 任された側の上限は本体より短い。ここで「続けて」と言えるのは人だけなので、
+          // 任された側では出さない（そのぶんは呼び出し元が答えの薄さとして受け取る）。
+          if (!this.config.isSubagent) {
+            warn(`ツールの往復が上限 (${this.config.maxSteps} 回) に達したので止めました。続けるなら「続けて」と言ってください。`);
+          }
           this.messages.push({
             role: 'user',
-            content: 'You reached the maximum number of tool calls for this turn. Summarize what you did and what is left.'
+            content: this.config.isSubagent
+              ? 'You have run out of tool calls. Answer now with what you actually found, and say plainly what you did not manage to check.'
+              : 'You reached the maximum number of tool calls for this turn. Summarize what you did and what is left.'
           });
         }
       }
