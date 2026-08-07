@@ -21,6 +21,15 @@ export const DEFAULT_CONFIG = {
   // 必要なのは 18GB。GPU枠に載らない環境では `-m qwythos:latest`（7.4GB）に落とす。
   model: 'gemma4:26b',
 
+  // 既定のモデルが GPU に載りきらなかったときの逃げ先（7.4GB）。
+  //
+  // 載りきらないと、はみ出した分が CPU 側で動いて極端に遅くなる。
+  // そうなるくらいなら、遅いが GPU に収まるほうを使う。
+  // 切り替えるのは載らなかったときだけで、作業の内容では切り替えない
+  // （実測では 26B のほうが 9B より速く、正しい。落とす理由が容量以外に無い）。
+  lightModel: 'qwythos:latest',
+  autoDowngrade: true,
+
   // 生成パラメータ（qwythos の Modelfile に合わせた値）
   numCtx: 32768,
   temperature: 0.3,

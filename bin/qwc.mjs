@@ -4,7 +4,7 @@ import readline from 'node:readline';
 import path from 'node:path';
 import process from 'node:process';
 import { loadConfig, saveConfig } from '../src/config.mjs';
-import { checkServer, listModels, adaptToModel, pickBestModel } from '../src/ollama.mjs';
+import { checkServer, listModels, adaptToModel, pickBestModel, checkGpuFit } from '../src/ollama.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { Agent } from '../src/agent.mjs';
 import { TOOLS, activeTools, setMcpTools, KEY_HELP } from '../src/tools.mjs';
@@ -21,7 +21,7 @@ import {
   INSTALL_HELP as BROWSER_HELP
 } from '../src/browser.mjs';
 import { newSessionId, saveSession, listSessions, loadSession, latestSessionForRoot } from '../src/session.mjs';
-import { c, line, out, banner, info, warn, error, success, renderTodos, sendDisplayToStderr } from '../src/ui.mjs';
+import { c, line, out, banner, info, warn, error, success, renderTodos, sendDisplayToStderr, Spinner } from '../src/ui.mjs';
 import { serve, requestTool, emit, ready, turnEnd } from '../src/embed.mjs';
 
 const VERSION = '0.1.0';
@@ -292,8 +292,10 @@ async function main() {
     info('別のターミナルで `ollama serve` を実行してから、もう一度お試しください。');
     process.exit(1);
   }
+  // 一覧はこの下の「載りきるか」の判定でも使うので、try の外に出しておく
+  let models = [];
   try {
-    const models = await listModels(config);
+    models = await listModels(config);
     // Ollama では「名前だけ」は「名前:latest」と同じ扱いになる
     const wanted = config.model.includes(':') ? config.model : `${config.model}:latest`;
     let found = models.includes(config.model) || models.includes(wanted);
@@ -330,6 +332,24 @@ async function main() {
     }
   } catch (err) {
     warn(`モデル一覧を確認できませんでした: ${err.message}`);
+  }
+
+  // GPU に載りきるかを先に確かめる。
+  //
+  // 載りきらないと、はみ出した分が CPU 側で動いて極端に遅くなるが、画面には何も出ない。
+  // 「今日はなぜか遅い」で終わらせないために、ここで実際に測って、駄目なら軽いほうに落とす。
+  // -m で明示されたときは落とさない。本人が選んだものを黙ってすり替えないため。
+  if (config.autoDowngrade && !opts.overrides.model && config.lightModel && config.lightModel !== config.model) {
+    const spinner = new Spinner(`${config.model} を読み込んでいます`).start();
+    const fit = await checkGpuFit(config);
+    spinner.stop();
+    if (!fit.ok && models.includes(config.lightModel)) {
+      const pct = Math.round(fit.onGpu * 100);
+      warn(`${config.model} は GPU に ${pct}% しか載りませんでした（残りは CPU 側で動くため極端に遅くなります）。`);
+      info(`${config.lightModel} に切り替えます。GPU の空きが戻れば、次回はそのまま ${config.model} を使います。`);
+      info(`このまま使いたいときは -m ${config.model} を付けてください。`);
+      config.model = config.lightModel;
+    }
   }
 
   // モデルの能力に設定を合わせる（思考モードの有無など）

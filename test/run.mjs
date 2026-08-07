@@ -16,7 +16,7 @@ import { normalizeUrl, PROFILE_DIR } from '../src/browser.mjs';
 import { findMentions, resolveMentions, buildMentionBlock, isImagePath } from '../src/mentions.mjs';
 import { stripImages } from '../src/session.mjs';
 import { loadCommands, renderCommand, isReserved } from '../src/commands.mjs';
-import { pickBestModel } from '../src/ollama.mjs';
+import { pickBestModel, checkGpuFit, GPU_FIT_THRESHOLD } from '../src/ollama.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
@@ -1011,6 +1011,57 @@ console.log('\nモデルの自動選択');
   check('埋め込みしか無ければ選ばない', pickBestModel(['qwen3-embedding:0.6b']) === null);
   check('1つも無ければ null', pickBestModel([]) === null);
   check('知らない名前でも1つは返す', pickBestModel(['mystery:7b']) === 'mystery:7b');
+}
+
+// ── GPU に載りきったかを見る ────────────────────────────────
+//
+// 載りきらないと、はみ出した分が CPU 側で動いて極端に遅くなる。
+// 画面には何も出ないので「今日はなぜか遅い」で終わってしまう。それを検知して軽いほうへ落とす。
+console.log('\nGPU に載りきったかの判定');
+{
+  const http = await import('node:http');
+
+  // Ollama のふりをして、載り具合だけ差し替えられるサーバー
+  const fake = (ps) =>
+    http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      // /api/generate は読み込み、/api/ps は状況
+      res.end(JSON.stringify(req.url === '/api/ps' ? ps : { done: true }));
+    });
+
+  const withServer = async (ps, fn) => {
+    const srv = fake(ps);
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    try {
+      return await fn({ host: `http://127.0.0.1:${srv.address().port}`, model: 'big:26b', keepAlive: '30m' });
+    } finally {
+      srv.close();
+    }
+  };
+
+  // 丸ごと GPU に載った
+  const full = await withServer({ models: [{ name: 'big:26b', size: 17_300_000_000, size_vram: 17_300_000_000 }] }, checkGpuFit);
+  check('全部 GPU に載っていれば、そのまま使う', full.ok === true && full.onGpu === 1);
+
+  // 半分しか載らなかった＝はみ出しがCPU側にある
+  const half = await withServer({ models: [{ name: 'big:26b', size: 17_300_000_000, size_vram: 8_000_000_000 }] }, checkGpuFit);
+  check('半分しか載らなければ、載りきらないと判定する', half.ok === false, `GPU率 ${Math.round(half.onGpu * 100)}%`);
+
+  // わずかなはみ出しは実害が無いので通す（数値の端数で毎回警告を出さない）
+  const almost = await withServer({ models: [{ name: 'big:26b', size: 100, size_vram: 98 }] }, checkGpuFit);
+  check('わずかな端数では騒がない', almost.ok === true && GPU_FIT_THRESHOLD <= 0.98);
+
+  // Ollama は :latest を付けたり外したりして返すことがある
+  const bare = await withServer({ models: [{ name: 'big:26b:latest', size: 100, size_vram: 10 }] }, checkGpuFit);
+  check(':latest の有無が違っても同じモデルと分かる', bare.ok === false);
+
+  // 自分のモデルが一覧に無い＝判断材料が無い。取り上げずに通す
+  const missing = await withServer({ models: [{ name: 'other:7b', size: 100, size_vram: 10 }] }, checkGpuFit);
+  check('自分のモデルが見当たらなければ通す', missing.ok === true && missing.unknown === true);
+
+  // つながらないときも、確かめられないことを理由に使えるものを取り上げない
+  const down = await checkGpuFit({ host: 'http://127.0.0.1:1', model: 'big:26b', keepAlive: '30m' });
+  check('Ollama に聞けなくても止めない', down.ok === true && down.unknown === true);
 }
 
 // ── 返事を待つ時間 ──────────────────────────────────────────

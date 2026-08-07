@@ -135,6 +135,68 @@ export async function listModels(cfg) {
   return (data.models || []).map((m) => m.name);
 }
 
+// ── モデルが GPU に丸ごと載ったかを見る ──────────────────────
+//
+// 載りきらないと、はみ出した分は CPU 側で動く。**これが一番痛い遅さ**で、
+// 実測では GPU に収まっているときの数分の一まで落ちる。しかも画面には何も出ないので、
+// 「今日はなぜか遅い」としか分からない。他のアプリが GPU を掴んでいるときに起きる。
+//
+// 空きを先に測る手立ては Ollama には無い（他アプリの取り分は見えない）。
+// 実際に載せてから `/api/ps` の size_vram と size を比べるのが唯一の確実な方法。
+// 読み込みは最初のやり取りでどのみち起きるので、それを起動時に前倒しするだけ。
+
+// モデルを読み込ませる（生成はしない）。prompt を空にすると Ollama は読み込みだけ行う。
+export async function preloadModel(cfg, name = cfg.model, timeoutMs = 10 * 60 * 1000) {
+  const res = await fetch(`${cfg.host}/api/generate`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ model: name, keep_alive: cfg.keepAlive }),
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  if (!res.ok) throw new OllamaError(`モデルを読み込めませんでした (HTTP ${res.status})`);
+  await res.json();
+}
+
+// いま載っているモデルの内訳。GPU に何割載ったかを返す。
+export async function loadedModels(cfg) {
+  const res = await fetch(`${cfg.host}/api/ps`, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new OllamaError(`読み込み状況が取れませんでした (HTTP ${res.status})`);
+  const data = await res.json();
+  return (data.models || []).map((m) => ({
+    name: m.name,
+    size: m.size || 0,
+    vram: m.size_vram || 0,
+    // size が 0 のときに 0 除算しない。分からないものは「載っている」扱いにして騒がない
+    onGpu: m.size ? (m.size_vram || 0) / m.size : 1
+  }));
+}
+
+// GPU に載りきらなかったモデルには、軽いものに落とすよう促す。
+//
+// 判定を 1.0 にはしない。数値には端数があり、ぴったり 100% にならないことがある。
+// 一方で 5% ほどのはみ出しなら実害は出ないので、そこは通す。
+export const GPU_FIT_THRESHOLD = 0.95;
+
+export async function checkGpuFit(cfg, name = cfg.model) {
+  try {
+    await preloadModel(cfg, name);
+    const loaded = await loadedModels(cfg);
+    // Ollama は指定と少し違う名前で返すことがある（:latest の付け外し）
+    const bare = (s) => String(s).replace(/:latest$/, '');
+    const mine = loaded.find((m) => bare(m.name) === bare(name));
+    if (!mine) return { ok: true, unknown: true };
+    return {
+      ok: mine.onGpu >= GPU_FIT_THRESHOLD,
+      onGpu: mine.onGpu,
+      size: mine.size,
+      vram: mine.vram
+    };
+  } catch (err) {
+    // 測れなかったときは黙って通す。確かめられないことを理由に、使えるものを取り上げない
+    return { ok: true, unknown: true, error: err.message };
+  }
+}
+
 // モデルが何をできるか（tools / thinking など）を聞く。
 // 思考モードを持たないモデルに think を送るとエラーになるので、事前に合わせるために使う。
 export async function showModel(cfg, name = cfg.model) {
