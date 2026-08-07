@@ -40,6 +40,10 @@ export class Agent {
       permissions,
       changedFiles: new Set(),
       readFiles: new Set(),
+      // 手を動かした回数（書き込み・置き換え・コマンド実行）。
+      // changedFiles は「どのファイルか」の集合なので、同じファイルを2度直しても増えない。
+      // 「今回のお願いで実際に何かしたか」を見るには、回数で持つ必要がある。
+      mutations: 0,
       // いまのやることリスト。todo_write が書き換える。
       todos: [],
       signal: null
@@ -65,6 +69,7 @@ export class Agent {
     this.messages = [{ role: 'system', content: this.systemPrompt }];
     this.ctx.changedFiles.clear();
     this.ctx.readFiles.clear();
+    this.ctx.mutations = 0;
     this.ctx.todos = [];
   }
 
@@ -93,6 +98,8 @@ export class Agent {
     const recentCalls = new Map();
     let interrupted = false;
     let nudges = 0;
+    // このお願いを受ける前の回数。これと比べて、今回手を動かしたかを見る。
+    const mutationsAtStart = this.ctx.mutations || 0;
     // やることリストの促しは1回まで（下の判定で使う）
     let toldAboutTodos = false;
 
@@ -140,6 +147,30 @@ export class Agent {
                 'You described what you are going to do, but you did not actually use any tool. ' +
                 'Nothing happened. Do it now by calling the tools yourself. ' +
                 'Do not ask the user to proceed and do not describe the steps again.'
+            });
+            continue;
+          }
+
+          // 「直しました」と過去形で報告しているのに、今回まだ一度も手を動かしていない場合。
+          //
+          // 上の判定は文章だけを見るので、ここは拾えない（過去形はわざと除外してある。
+          // 本当に終わったときまで催促してしまうため）。そこで文章ではなく、
+          // 実際に書き換え・実行が起きた回数と突き合わせる。数のほうは嘘をつかない。
+          if (
+            said &&
+            nudges < (this.config.maxNudges ?? 5) &&
+            (this.ctx.mutations || 0) === mutationsAtStart &&
+            claimsWorkDone(said)
+          ) {
+            nudges++;
+            info('やったと報告しましたが、まだ何も変えていないので、促しました。');
+            this.messages.push({
+              role: 'user',
+              content:
+                'You reported that you made the change, but you did not call write_file, edit_file, or run_command. ' +
+                'The file on disk is unchanged, so nothing was actually done. ' +
+                'Make the change now by calling the tool. ' +
+                'If you believe no change is needed, say that plainly instead of reporting one you did not make.'
             });
             continue;
           }
@@ -598,6 +629,30 @@ export function describesIntentWithoutActing(text) {
     return intent.test(merged) && !done.test(merged);
   }
   return false;
+}
+
+// 「変えました」と報告しているか。
+//
+// describesIntentWithoutActing とは逆側の判定。あちらは「これからやります」を拾い、
+// こちらは「やりました」を拾う。呼び出し側で実際の回数と突き合わせて初めて意味を持つので、
+// この関数だけでは何も断定しない。
+//
+// 拾うのは「中身を変えた」と言っている場合だけに絞る。
+// 「確認しました」「読みました」は手を動かさなくても成り立つ正しい報告なので入れない。
+export function claimsWorkDone(text) {
+  const claim =
+    /(\bI (have |already |just )?(changed|edited|fixed|created|updated|added|removed|deleted|replaced|renamed|wrote|implemented|applied)\b|\bhas been (changed|edited|fixed|created|updated|added|removed|replaced|applied)\b|\bthe (fix|change|edit) (is|has been) applied\b|修正しました|直しました|変更しました|書き換えました|作成しました|追加しました|削除しました|更新しました|置き換えました|実装しました|反映しました|修正済み|変更済み)/i;
+
+  // 打ち消しの言い回しは除く。
+  // 「まだ修正していません」「修正しませんでした」を完了報告として拾うと、
+  // 正しく手を止めている場面で催促してしまう。
+  const negated = /(していません|しませんでした|できませんでした|しないでください|必要ありません|\bdid not\b|\bdo not\b|\bhave not\b|\bcannot\b|\bcould not\b|\bno (change|edit|fix)s? (is|are|was|were) needed\b)/i;
+
+  // 判定は文ごとに行う。全文で打ち消しを見ると
+  // 「修正しました。テストは実行していません。」のような並びで、
+  // 正しい完了報告のほうまで打ち消されてしまう。
+  const sentences = text.trim().split(/(?<=[.。!?！？])\s*|\n+/).filter((s) => s.trim());
+  return sentences.some((s) => claim.test(s) && !negated.test(s));
 }
 
 // 本文の書き出しが、道具の呼び出しに見えるか

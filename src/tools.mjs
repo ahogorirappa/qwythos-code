@@ -202,6 +202,7 @@ const writeFile = {
     fs.writeFileSync(abs, content, 'utf8');
     ctx.changedFiles.add(abs);
     ctx.readFiles.add(abs);
+    ctx.mutations = (ctx.mutations || 0) + 1;
     const lines = content.split('\n').length;
     return {
       output:
@@ -270,6 +271,7 @@ const editFile = {
     }
     fs.writeFileSync(abs, result.text, 'utf8');
     ctx.changedFiles.add(abs);
+    ctx.mutations = (ctx.mutations || 0) + 1;
     return {
       output:
         `Edited ${displayPath(abs, ctx)} (${result.count} replacement${result.count > 1 ? 's' : ''}).` +
@@ -628,6 +630,9 @@ const runCommand = {
     const timeoutMs = Math.min(600000, Number(args.timeout_ms) || ctx.config.commandTimeoutMs);
 
     const result = await runProcess(command, null, { cwd, timeoutMs, shell: true, signal: ctx.signal });
+    // 実際にコマンドが走ったこと自体を数える。
+    // 「実行しました」という報告が本当かどうかは、これでしか確かめられない。
+    ctx.mutations = (ctx.mutations || 0) + 1;
     const body = result.output.trim() || '(no output)';
     const status = result.timedOut
       ? `Command timed out after ${timeoutMs} ms and was killed.`

@@ -9,7 +9,7 @@ import { loadConfig } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
 import { salvageToolCalls, chatStream } from '../src/ollama.mjs';
-import { describesIntentWithoutActing } from '../src/agent.mjs';
+import { describesIntentWithoutActing, claimsWorkDone, Agent } from '../src/agent.mjs';
 import { TOOLS, activeTools } from '../src/tools.mjs';
 import { checkUrl, htmlToText, decodeEntities, extractTitle } from '../src/web.mjs';
 import { normalizeUrl, PROFILE_DIR } from '../src/browser.mjs';
@@ -300,6 +300,118 @@ console.log('\n宣言だけで手を動かさない返答の検知');
   for (const t of yes) if (!describesIntentWithoutActing(t)) { ok = false; console.log(`       見逃し: ${t.slice(0, 40)}`); }
   for (const t of no) if (describesIntentWithoutActing(t)) { ok = false; console.log(`       誤検知: ${t.slice(0, 40)}`); }
   check(`宣言だけの返答${yes.length}件を検知し、完了報告${no.length}件は促さない`, ok);
+}
+
+// ── やっていないのに「やりました」と言う ────────────────────
+//
+// 実機で出た不具合。read_file だけ呼んで「4行目を修正しました」と報告し、
+// ファイルは1文字も変わらないまま終わっていた。
+// 上の判定は過去形をわざと除外しているので、こちらで拾う。
+// この関数は「そう言っているか」だけを見る。本当かどうかは ctx.mutations と突き合わせる。
+console.log('\nやっていないのに「やりました」と言う返答の検知');
+{
+  const claims = [
+    '4 行目の i <= items.length を i < items.length に修正しました。',
+    'sum.js を直しました。',
+    'I fixed the off-by-one error in cart.js.',
+    'I have updated the loop condition.',
+    'The fix is applied to line 4.',
+    'テストを追加しました。',
+    '不要な行を削除しました。',
+    'ファイルを作成しました。'
+  ];
+  const notClaims = [
+    // 手を動かさなくても成り立つ、正しい報告
+    'ファイルを確認しました。バグは 4 行目にあります。',
+    'I read cart.js and the bug is on line 4.',
+    '合計は 57,000円です。',
+    // 打ち消している場合
+    'まだ修正していません。先に確認させてください。',
+    'I did not change the file because the path was outside the project.',
+    '直す必要はありません。',
+    // 完了報告と打ち消しが同居する形。前半は本物の主張なので拾えないと困る
+  ];
+  let ok = true;
+  for (const t of claims) if (!claimsWorkDone(t)) { ok = false; console.log(`       見逃し: ${t.slice(0, 40)}`); }
+  for (const t of notClaims) if (claimsWorkDone(t)) { ok = false; console.log(`       誤検知: ${t.slice(0, 40)}`); }
+  check(`「やりました」${claims.length}件を検知し、そうでない${notClaims.length}件は拾わない`, ok);
+
+  // 打ち消しは文ごとに見る。全文で見ると、前半の本物の完了報告まで消えてしまう。
+  check(
+    '打ち消しが別の文にあっても、完了報告は拾える',
+    claimsWorkDone('cart.js を修正しました。テストは実行していません。')
+  );
+}
+
+// ── 促しが本当にループから出るか ────────────────────────────
+//
+// 判定の関数が正しいことと、それがループで使われていることは別。
+// モデルの返事を台本で差し替えて、往復そのものを確かめる。
+// 実機は温度0.3で毎回違う道を通るので、これを実機の確認の代わりにはできない。逆も同じ。
+console.log('\nやったと言い張ったときの促し（ループの往復）');
+{
+  // 台本どおりに返すだけの偽モデル
+  class ScriptedAgent extends Agent {
+    constructor(opts, script) {
+      super(opts);
+      this.script = script;
+      this.calls = 0;
+    }
+    async streamAssistant() {
+      const step = this.script[this.calls++] || { content: '終わりです。' };
+      if (step.mutate) this.ctx.mutations = (this.ctx.mutations || 0) + 1;
+      return {
+        message: { role: 'assistant', content: step.content },
+        toolCalls: [],
+        stats: null
+      };
+    }
+  }
+
+  const mkAgent = (script) =>
+    new ScriptedAgent(
+      {
+        config: { ...loadConfig(), maxSteps: 6, isSubagent: true },
+        root,
+        permissions: new PermissionManager(loadConfig(), async () => 'n')
+      },
+      script
+    );
+
+  const nudgeText = /did not call write_file/;
+  const nudgesIn = (agent) =>
+    agent.messages.filter((m) => m.role === 'user' && nudgeText.test(m.content || '')).length;
+
+  // 実機で出た形。読んだだけで「修正しました」と言って終わる。
+  {
+    const a = mkAgent([{ content: '4 行目の i <= items.length を i < items.length に修正しました。' }, { content: '直しました。' }]);
+    await a.runTurn('cart.js のバグを直して');
+    check('手を動かさずに「修正しました」と言ったら促す', nudgesIn(a) > 0);
+  }
+
+  // 本当に直したときは促さない。ここが壊れると、正しく終わるたびに催促が出る。
+  {
+    const a = mkAgent([{ content: 'cart.js を修正しました。', mutate: true }]);
+    await a.runTurn('cart.js のバグを直して');
+    check('本当に書き換えたあとの完了報告は促さない', nudgesIn(a) === 0);
+  }
+
+  // 手を動かしていなくても、変えたと言っていなければ促さない（ただの質問への答え）。
+  {
+    const a = mkAgent([{ content: 'バグは 4 行目にあります。境界の比較が誤っています。' }]);
+    await a.runTurn('cart.js のどこが悪い？');
+    check('変えたと言っていない答えは促さない', nudgesIn(a) === 0);
+  }
+
+  // 促しても言い張り続ける相手に、無限に付き合わない
+  {
+    const script = Array.from({ length: 20 }, () => ({ content: '修正しました。' }));
+    const a = mkAgent(script);
+    a.config.maxNudges = 2;
+    a.config.maxSteps = 20;
+    await a.runTurn('cart.js のバグを直して');
+    check('促す回数は maxNudges で頭打ちになる', nudgesIn(a) === 2, `実際: ${nudgesIn(a)} 回`);
+  }
 }
 
 console.log('\n差分表示');
