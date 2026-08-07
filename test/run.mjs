@@ -9,7 +9,7 @@ import { loadConfig } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
 import { salvageToolCalls, chatStream } from '../src/ollama.mjs';
-import { describesIntentWithoutActing, claimsWorkDone, Agent } from '../src/agent.mjs';
+import { describesIntentWithoutActing, claimsWorkDone, looksLikeFileRewrite, Agent } from '../src/agent.mjs';
 import { TOOLS, activeTools } from '../src/tools.mjs';
 import { checkUrl, htmlToText, decodeEntities, extractTitle } from '../src/web.mjs';
 import { normalizeUrl, PROFILE_DIR } from '../src/browser.mjs';
@@ -294,7 +294,12 @@ console.log('\n宣言だけで手を動かさない返答の検知');
     'sum.js の引き算を足し算に直しました。npm test は通っています。',
     'I changed the implementation in sum.js and the tests now pass.',
     '合計は 57,000円です。',
-    'I ran npm test and verified all tests passed.'
+    'I ran npm test and verified all tests passed.',
+    // 実機で誤検知した形。ただのコードの説明が「します。」で終わっているだけ。
+    // これを拾うと、正しく答えたあとに催促が出て「指示が不明確です」と聞き返す返事に化ける。
+    'cart.js の total 関数は、買い物かごの合計金額を計算するものです。\n\n引数 items という配列を受け取り、各アイテムの価格と数量を掛け合わせて合計を求め、その合計金額を返します。',
+    'この関数は配列を受け取り、条件に合う要素だけを残した新しい配列を返します。',
+    'エラーが起きた場合は null を返します。'
   ];
   let ok = true;
   for (const t of yes) if (!describesIntentWithoutActing(t)) { ok = false; console.log(`       見逃し: ${t.slice(0, 40)}`); }
@@ -341,6 +346,48 @@ console.log('\nやっていないのに「やりました」と言う返答の�
     '打ち消しが別の文にあっても、完了報告は拾える',
     claimsWorkDone('cart.js を修正しました。テストは実行していません。')
   );
+}
+
+// ── 直した全文を画面に貼るだけで保存しない ──────────────────
+//
+// 実機で出た不具合。read_file のあと、関数を1つ足した全文を ``` で囲んで出して終わり、
+// ファイルは元のままだった。本人は何も主張しないので、文章を読む判定では捕まらない。
+console.log('\n書き直した中身を貼っただけの返事の検知');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-rewrite-'));
+  const target = path.join(dir, 'cart.js');
+  const source = [
+    '// 買い物かごの合計を出す',
+    'export function total(items) {',
+    '  let sum = 0;',
+    '  for (let i = 0; i < items.length; i++) {',
+    '    sum += items[i].price * items[i].qty;',
+    '  }',
+    '  return sum;',
+    '}'
+  ].join('\n');
+  fs.writeFileSync(target, source, 'utf8');
+  const rctx = { root: dir, readFiles: new Set([target]) };
+
+  // 実機で出た形そのまま。元の全文＋足した関数
+  const rewrite = '```javascript\n' + source + '\n\n// 割引後の合計\nexport function totalWithDiscount(items, discount) {\n  return total(items) * (1 - discount);\n}\n```';
+  check('元の全文を含む塊は「保存し忘れ」と分かる', looksLikeFileRewrite(rewrite, rctx) === target);
+
+  // 説明のための短い引用は、重なりが少ないので拾わない
+  const quote = '合計はここで足しています。\n\n```javascript\n    sum += items[i].price * items[i].qty;\n```\n\nこの1行が本体です。';
+  check('説明のための数行の引用は拾わない', looksLikeFileRewrite(quote, rctx) === null);
+
+  // まったく別のコードを見せる場合も拾わない
+  const other = '```javascript\nconst x = fetch("https://example.com/very/long/path");\nconsole.log(await x.text());\nprocess.exit(0);\n```';
+  check('関係のないコード例は拾わない', looksLikeFileRewrite(other, rctx) === null);
+
+  // コードの塊が無ければ、そもそも対象外
+  check('``` が無ければ拾わない', looksLikeFileRewrite('cart.js は合計を計算します。', rctx) === null);
+
+  // 読んでいないファイルは比べようがない
+  check('読んでいないファイルとは比べない', looksLikeFileRewrite(rewrite, { root: dir, readFiles: new Set() }) === null);
+
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 // ── 促しが本当にループから出るか ────────────────────────────

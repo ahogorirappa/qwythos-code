@@ -1,4 +1,5 @@
 // エージェント本体。「考える → 道具を使う → 結果を見る」を繰り返す輪の部分。
+import fs from 'node:fs';
 import path from 'node:path';
 import { chatStream, chatOnce } from './ollama.mjs';
 import { TOOL_MAP, toolSchemas, truncateOutput } from './tools.mjs';
@@ -173,6 +174,26 @@ export class Agent {
                 'If you believe no change is needed, say that plainly instead of reporting one you did not make.'
             });
             continue;
+          }
+
+          // 直した全文を画面に貼っただけで、保存していない場合。
+          // 上の2つと違い、本人は何も主張しない（コードを出しただけ）ので、文章では捕まらない。
+          if (nudges < (this.config.maxNudges ?? 5) && (this.ctx.mutations || 0) === mutationsAtStart) {
+            const target = looksLikeFileRewrite(said, this.ctx);
+            if (target) {
+              nudges++;
+              const rel = path.relative(this.root, target) || target;
+              info(`書き直した中身を画面に出しただけで保存していないので、促しました（${rel}）。`);
+              this.messages.push({
+                role: 'user',
+                content:
+                  `You printed the new version of ${rel} in your reply instead of saving it. ` +
+                  'Showing code to the user does not change the file. ' +
+                  `Call write_file or edit_file on ${rel} now with that content. ` +
+                  'If you only meant to show an example and no change is wanted, say so plainly instead.'
+              });
+              continue;
+            }
           }
 
           break;
@@ -608,9 +629,14 @@ export class Agent {
 //
 // 道具を呼ばずにターンを終えた返答だけに対して使う。
 // 過去形の報告（直しました・実行しました）は対象外にしないと、正しい完了報告まで促してしまう。
+//
+// 語尾の「します。」を入れてはいけない。
+// 「その合計金額を返します。」のような**コードの説明文**がことごとく当たり、
+// 正しく答えたあとに催促が出て、答えを打ち消す返事に化ける（実機で観測）。
+// 拾ってよいのは、コードの説明には現れない言い回しだけ。
 export function describesIntentWithoutActing(text) {
   const intent =
-    /(\bI will\b|\bI'll\b|\blet me\b|\blet's\b|\bI am going to\b|\bI'm going to\b|\bnext,? I\b|please proceed|proceed with|\bStep 1\b|これから|次に|してください|していきます|する予定|します。)/i;
+    /(\bI will\b|\bI'll\b|\blet me\b|\blet's\b|\bI am going to\b|\bI'm going to\b|\bnext,? I\b|please proceed|proceed with|\bStep 1\b|これから|次に|してください|していきます|してみます|しましょう|やります|する予定)/i;
   const done =
     /(\bI (have |already )?(changed|edited|fixed|created|ran|verified|updated)\b|\bnow pass(es|ed)?\b|しました|直しました|作成しました|確認しました|通りました)/i;
 
@@ -653,6 +679,55 @@ export function claimsWorkDone(text) {
   // 正しい完了報告のほうまで打ち消されてしまう。
   const sentences = text.trim().split(/(?<=[.。!?！？])\s*|\n+/).filter((s) => s.trim());
   return sentences.some((s) => claim.test(s) && !negated.test(s));
+}
+
+// 返事の中の ``` で囲まれた塊を取り出す
+function fencedBlocks(text) {
+  const blocks = [];
+  const re = /```[^\n]*\n([\s\S]*?)```/g;
+  let m;
+  while ((m = re.exec(text))) blocks.push(m[1]);
+  return blocks;
+}
+
+// 「直したファイルの全文」を画面に貼っただけの返事か。
+//
+// 実機で一番多い外し方がこれ。read_file で読んだあと、書き直した全文を ``` で囲んで出して終わる。
+// 本人は仕事をした気でいるが、ファイルは元のままなので、何も起きていない。
+//
+// 例として短い断片を見せているだけの場合と区別するために、
+// 「今回読んだファイルの中身が、その塊にほぼ丸ごと入っているか」で見る。
+// 説明のための引用なら数行しか重ならず、書き直した全文なら元の行がそのまま残るため、はっきり分かれる。
+export function looksLikeFileRewrite(text, ctx) {
+  const blocks = fencedBlocks(text);
+  if (!blocks.length) return null;
+
+  // 意味のある行だけを比べる。閉じ括弧や空行は、どのファイルにもあるので当てにならない。
+  const meaningful = (src) =>
+    src
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length >= 8 && !/^[)}\];,]+$/.test(l));
+
+  for (const file of ctx.readFiles || []) {
+    let original;
+    try {
+      const stat = fs.statSync(file);
+      if (!stat.isFile() || stat.size > 200000) continue;
+      original = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue; // 消えていたり読めないものは飛ばす
+    }
+    const lines = meaningful(original);
+    if (lines.length < 3) continue; // 短すぎるファイルは判定できない
+
+    for (const block of blocks) {
+      const inBlock = new Set(meaningful(block));
+      const hit = lines.filter((l) => inBlock.has(l)).length;
+      if (hit / lines.length >= 0.6) return file;
+    }
+  }
+  return null;
 }
 
 // 本文の書き出しが、道具の呼び出しに見えるか
