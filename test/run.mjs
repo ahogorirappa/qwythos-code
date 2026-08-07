@@ -1005,7 +1005,8 @@ console.log('\n自分で作るコマンド');
 // ── 入っているモデルから選ぶ ────────────────────────────────
 console.log('\nモデルの自動選択');
 {
-  check('9B を優先する', pickBestModel(['qwen3:32b-q4_K_M', 'qwythos:latest']) === 'qwythos:latest');
+  check('gemma4 を最優先する', pickBestModel(['qwen3:32b-q4_K_M', 'qwythos:latest', 'gemma4:26b']) === 'gemma4:26b');
+  check('gemma4 が無ければ 9B', pickBestModel(['qwen3:32b-q4_K_M', 'qwythos:latest']) === 'qwythos:latest');
   check('埋め込み専用は選ばない', pickBestModel(['qwen3-embedding:0.6b', 'qwen3:14b-q4_K_M']) === 'qwen3:14b-q4_K_M');
   check('埋め込みしか無ければ選ばない', pickBestModel(['qwen3-embedding:0.6b']) === null);
   check('1つも無ければ null', pickBestModel([]) === null);

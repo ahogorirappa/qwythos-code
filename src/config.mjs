@@ -10,10 +10,16 @@ export const SESSION_DIR = path.join(HOME_DIR, 'sessions');
 export const DEFAULT_CONFIG = {
   // 接続先
   host: 'http://localhost:11434',
-  // 既定は 9B。実測でこれが一番ちょうどよかった。
-  // 14B は同じ作業に20倍かかり（5手の修正で 30秒 → 10分超）、
-  // 大きいほど自律的に動けるわけでもない（README「モデルの癖への対処」）。
-  model: 'qwythos:latest',
+  // 既定は gemma4:26b（2026-08-07 に qwythos:latest から変更）。
+  //
+  // 26B だが MoE で実効3.8Bなので、9B より速い。実測では速さと正しさの両方で上回った：
+  // 同じ課題（既存の関数を使い回して新しい関数を足す）で
+  //   9B      = 46.5秒・引数を取り違えた壊れたコード。存在しないパスも3手試した
+  //   gemma4  = 36秒（18GBの読み込み込み）・正しいコード。自分からやることリストも作った
+  // 14B は論外（同じ作業に20倍かかる。5手の修正で 30秒 → 10分超）。
+  //
+  // 必要なのは 18GB。GPU枠に載らない環境では `-m qwythos:latest`（7.4GB）に落とす。
+  model: 'gemma4:26b',
 
   // 生成パラメータ（qwythos の Modelfile に合わせた値）
   numCtx: 32768,

@@ -173,7 +173,8 @@ export function pickBestModel(models) {
   if (!usable.length) return null;
 
   const preferred = [
-    /^qwythos/i,        // 9B。速く、対策なしで完走した
+    /^gemma4/i,         // MoEで実効3.8B。26Bだが9Bより速く、書くコードも正しかった
+    /^qwythos/i,        // 9B。軽い（7.4GB）。gemma4 が載らない環境向け
     /^qwen3:14b/i,      // 遅いが確実
     /^qwen2\.5-coder/i, // 癖はあるが対策済み
     /^qwen3:/i,

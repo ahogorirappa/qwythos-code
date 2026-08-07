@@ -76,7 +76,7 @@ ${c.bold('使い方')}
 
 ${c.bold('オプション')}
   -p, --print <文>       一回だけ実行して結果を出す（自動化向け）
-  -m, --model <名前>     使うモデル（既定: qwythos:latest）
+  -m, --model <名前>     使うモデル（既定: gemma4:26b）
       --host <URL>       Ollama の場所（既定: http://localhost:11434）
       --ctx <数>         文脈の広さ（既定: 32768）
       --temp <数>        創造性の高さ 0〜1（既定: 0.3）
@@ -339,7 +339,7 @@ async function main() {
     else info(note.text);
   }
   if (adapted.canTools === false) {
-    info('ツール呼び出しに対応したモデルを指定してください（例: -m qwythos:latest）。');
+    info('ツール呼び出しに対応したモデルを指定してください（例: -m gemma4:26b）。');
     process.exit(1);
   }
 
