@@ -84,7 +84,7 @@ export function renderCommand(command, args) {
 export function isReserved(name) {
   const reserved = new Set([
     'help', 'clear', 'compact', 'model', 'think', 'yolo', 'tools', 'stats',
-    'files', 'init', 'save', 'exit', 'quit', 'plan', 'todo', 'todos',
+    'files', 'init', 'save', 'exit', 'quit', 'plan', 'todo', 'todos', 'refine',
     'login', 'logins', 'logout', 'commands'
   ]);
   return reserved.has(String(name).toLowerCase());

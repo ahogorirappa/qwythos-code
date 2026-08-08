@@ -21,6 +21,7 @@ import {
   INSTALL_HELP as BROWSER_HELP
 } from '../src/browser.mjs';
 import { newSessionId, saveSession, listSessions, loadSession, latestSessionForRoot } from '../src/session.mjs';
+import { loadHarness, undoHarness, describeHarness } from '../src/harness.mjs';
 import { c, line, out, banner, info, warn, error, success, renderTodos, sendDisplayToStderr, Spinner } from '../src/ui.mjs';
 import { serve, requestTool, emit, ready, turnEnd } from '../src/embed.mjs';
 
@@ -95,7 +96,7 @@ ${c.bold('オプション')}
   -v, --version          バージョン
 
 ${c.bold('対話中に使えるコマンド')}
-  /help /clear /compact /model /think /yolo /tools /stats /files /init /exit
+  /help /clear /compact /model /think /yolo /tools /stats /files /refine /init /exit
   /login /logins /logout   ログインが要るサイトを読めるようにする
 `);
 }
@@ -118,6 +119,7 @@ ${c.bold('  対話中のコマンド')}
   ${c.cyan('/logout')}    保存したログイン状態をすべて消す
   ${c.cyan('/stats')}     使ったトークン数などの記録
   ${c.cyan('/files')}     このセッションで書き換えたファイル
+  ${c.cyan('/refine')}    いまのやり取りから、覚えておくことを直す（/refine list ・ /refine undo）
   ${c.cyan('/init')}      プロジェクトを調べて QWYTHOS.md を作る
   ${c.cyan('/save')}      いまの設定を次回以降の既定にする
   ${c.cyan('/exit')}      終了（Ctrl+D でも同じ）
@@ -799,6 +801,54 @@ async function handleSlash(text, { agent, config, permissions, root }) {
       printChanged(agent);
       if (!agent.changedFileList().length) info('まだ何も書き換えていません。');
       return;
+
+    case 'refine': {
+      const harness = loadHarness(root);
+
+      if (arg === 'list') {
+        line();
+        const show = (notes, label) => {
+          if (!notes.length) return;
+          line(`  ${c.bold(label)}`);
+          for (const n of notes) {
+            line(`    ${c.gray(n.id)} ${n.text}`);
+            line(`         ${c.gray(`根拠: ${n.evidence}`)}`);
+          }
+        };
+        show(harness.project, 'このフォルダ');
+        show(harness.global, '全体');
+        if (!harness.project.length && !harness.global.length) info(describeHarness(harness));
+        line();
+        return;
+      }
+
+      if (arg === 'undo') {
+        const undone = undoHarness(root);
+        if (!undone.length) info('取り消せる変更がありません。');
+        else {
+          agent.rebuildSystemPrompt();
+          success('直前の見直しを取り消しました。');
+        }
+        return;
+      }
+
+      const spinner = new Spinner('やり取りを見直しています').start();
+      const result = await agent.refine(arg);
+      spinner.stop();
+
+      if (!result.applied.length) {
+        info(result.reason || '変更はありませんでした。');
+        return;
+      }
+      line();
+      for (const a of result.applied) {
+        const mark = a.op === 'delete' ? c.red('−') : a.op === 'update' ? c.cyan('~') : c.green('+');
+        line(`  ${mark} ${a.scope === 'global' ? c.gray('[全体]') : c.gray('[このフォルダ]')} ${a.text}`);
+      }
+      line();
+      info('取り消すなら /refine undo。一覧は /refine list。');
+      return;
+    }
 
     case 'save': {
       saveConfig({

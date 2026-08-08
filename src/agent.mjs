@@ -4,6 +4,7 @@ import path from 'node:path';
 import { chatStream, chatOnce } from './ollama.mjs';
 import { TOOL_MAP, toolSchemas, truncateOutput } from './tools.mjs';
 import { buildSystemPrompt, COMPACT_PROMPT } from './prompt.mjs';
+import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
 import { PathError } from './paths.mjs';
 import {
   c, line, out, clearLine, supportsAnsi, Spinner, toolHeader, toolResultLine,
@@ -620,6 +621,66 @@ export class Agent {
     info('文脈が長くなったので、これまでの内容を要約して続けます。');
   }
 
+  /**
+   * いまのやり取りを見直して、覚えておくことを直す。
+   *
+   * 覚えるのはモデルだが、**何を覚えてよいかはこちらが決める**（REFINE_PROMPT）。
+   * 際限なく足させると、当たらない思い込みが毎ターンの固定費として積み上がるため。
+   *
+   * 基礎の指示文には一切触れない。足すのは別の層だけ。
+   */
+  async refine(instructions = '') {
+    const transcript = this.messages
+      .filter((m) => m.role !== 'system')
+      .map((m) => {
+        if (m.role === 'tool') return `[tool ${m.tool_name}] ${String(m.content).slice(0, 400)}`;
+        if (m.role === 'assistant' && m.tool_calls) {
+          return `[assistant used tools] ${m.tool_calls
+            .map((t) => `${t.function.name}(${JSON.stringify(t.function.arguments).slice(0, 120)})`)
+            .join(', ')} ${m.content || ''}`;
+        }
+        return `[${m.role}] ${m.content || ''}`;
+      })
+      .join('\n')
+      .slice(-30000);
+
+    if (!transcript.trim()) return { applied: [], reason: 'まだ何のやり取りもありません。' };
+
+    // いま覚えていることも渡す。渡さないと同じことを何度も足してくる。
+    const current = JSON.stringify(loadHarness(this.root));
+    const ask = [
+      `Existing notes (do not duplicate these): ${current}`,
+      instructions ? `The user asks you to focus on: ${instructions}` : '',
+      '',
+      'Session transcript:',
+      transcript
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    let raw = '';
+    try {
+      raw = await chatOnce({
+        cfg: this.config,
+        messages: [
+          { role: 'system', content: REFINE_PROMPT },
+          { role: 'user', content: ask }
+        ]
+      });
+    } catch (err) {
+      return { applied: [], reason: `見直せませんでした: ${err.message}` };
+    }
+
+    const edits = parseEdits(raw);
+    if (!edits) return { applied: [], reason: '返事が読めませんでした（JSON ではありませんでした）。' };
+    if (!edits.length) return { applied: [], reason: '覚えておくほどのことはありませんでした。' };
+
+    const applied = applyHarnessEdits(this.root, edits);
+    // いまのセッションにもすぐ効かせる
+    if (applied.length) this.rebuildSystemPrompt();
+    return { applied, reason: applied.length ? '' : '当てられる変更がありませんでした。' };
+  }
+
   changedFileList() {
     return [...this.ctx.changedFiles];
   }
@@ -655,6 +716,79 @@ export function describesIntentWithoutActing(text) {
     return intent.test(merged) && !done.test(merged);
   }
   return false;
+}
+
+/**
+ * 見直しの返事から、差し引きの一覧を取り出す。
+ *
+ * 「JSON だけ返せ」と書いても、小さいモデルは前置きを付けたり ``` で囲んだりする。
+ * そこで、まるごと読めなければ最初の `{`〜最後の `}` を切り出して読み直す。
+ * それでも駄目なら null（＝読めなかった）を返す。**当て推量では当てない。**
+ */
+export function parseEdits(raw) {
+  const text = String(raw ?? '');
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidates = [text.trim()];
+  if (fenced) candidates.unshift(fenced[1].trim());
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first >= 0 && last > first) candidates.push(text.slice(first, last + 1));
+
+  const normalize = (edits) =>
+    edits
+      .filter((e) => e && typeof e === 'object' && ['create', 'update', 'delete'].includes(e.op))
+      .map((e) => ({ ...e, scope: e.scope === 'global' ? 'global' : 'project' }));
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    const edits = Array.isArray(parsed) ? parsed : parsed?.edits;
+    if (!Array.isArray(edits)) continue;
+    // 形の合わないものは捨てる。置き場の指定が無いものは project 扱いにする
+    return normalize(edits);
+  }
+
+  // ここまで来たら JSON としては壊れている。
+  //
+  // 実機で見た壊れ方は決まっていて、**中の文にコマンドを引用符ごと書いてしまう**もの。
+  //   "evidence":"run_command({"command":"node test_cart.js"}) を実行した"
+  // これで JSON 全体が読めなくなり、良い覚え書きまで丸ごと捨てることになる。
+  // 鍵の名前は決まっているので、そこを頼りに1つずつ拾い直す。
+  const salvaged = salvageEdits(text);
+  return salvaged.length ? normalize(salvaged) : null;
+}
+
+/** 壊れた JSON から、決まった鍵だけを頼りに拾い直す */
+function salvageEdits(text) {
+  const KEYS = 'op|scope|id|text|evidence';
+  // 値の終わりは「次の鍵が続く引用符」か「閉じ括弧の直前の引用符」だけと見なす。
+  // 中に引用符が混ざっていても、そこでは切らない。
+  const field = (slice, key) => {
+    const re = new RegExp(`"${key}"\\s*:\\s*"([\\s\\S]*?)"\\s*(?=,\\s*"(?:${KEYS})"|\\}|$)`);
+    const m = slice.match(re);
+    return m ? m[1] : undefined;
+  };
+
+  // "op" ごとに区切る。1件ぶんの塊にしてから、その中だけを見る
+  const starts = [...text.matchAll(/"op"\s*:/g)].map((m) => m.index);
+  const out = [];
+  for (let i = 0; i < starts.length; i++) {
+    const slice = text.slice(starts[i], starts[i + 1] ?? text.length);
+    const op = field(slice, 'op');
+    if (!op) continue;
+    const edit = { op };
+    for (const key of ['scope', 'id', 'text', 'evidence']) {
+      const value = field(slice, key);
+      if (value !== undefined) edit[key] = value;
+    }
+    out.push(edit);
+  }
+  return out;
 }
 
 // 「変えました」と報告しているか。

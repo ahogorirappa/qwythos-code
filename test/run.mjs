@@ -17,6 +17,15 @@ import { findMentions, resolveMentions, buildMentionBlock, isImagePath } from '.
 import { stripImages } from '../src/session.mjs';
 import { loadCommands, renderCommand, isReserved } from '../src/commands.mjs';
 import { pickBestModel, checkGpuFit, GPU_FIT_THRESHOLD } from '../src/ollama.mjs';
+import {
+  loadHarness,
+  harnessBlock,
+  applyHarnessEdits,
+  undoHarness,
+  MAX_NOTES,
+  MAX_NOTE_CHARS
+} from '../src/harness.mjs';
+import { parseEdits } from '../src/agent.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
@@ -1011,6 +1020,116 @@ console.log('\nモデルの自動選択');
   check('埋め込みしか無ければ選ばない', pickBestModel(['qwen3-embedding:0.6b']) === null);
   check('1つも無ければ null', pickBestModel([]) === null);
   check('知らない名前でも1つは返す', pickBestModel(['mystery:7b']) === 'mystery:7b');
+}
+
+// ── 使ううちに覚えたこと（継続ハーネス） ─────────────────────
+//
+// 考え方は prime-agent（MIT）から借りた。借りたのは
+// 「基礎の指示文は書き換えない／小さく直す／根拠を持たせる／戻せるようにする」の4つ。
+console.log('\n覚えたことの置き場');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-harness-'));
+
+  check('何も無ければ、指示文に1文字も足さない', harnessBlock(loadHarness(dir)) === '');
+
+  applyHarnessEdits(dir, [
+    { op: 'create', scope: 'project', text: 'テストは npm test で走る', evidence: '実際に走らせて確認' }
+  ]);
+  const one = loadHarness(dir);
+  check('作業フォルダ側に覚えられる', one.project.length === 1 && one.global.length === 0);
+  check('根拠も一緒に残る', one.project[0].evidence === '実際に走らせて確認');
+
+  const block = harnessBlock(one);
+  check('指示文に載る', block.includes('テストは npm test で走る'));
+  check('決めつけではなく手がかりとして渡す', block.includes('hints, not rules'));
+
+  // 同じことを二度覚えない（毎ターンの固定費が二重になる）
+  applyHarnessEdits(dir, [{ op: 'create', scope: 'project', text: 'テストは npm test で走る' }]);
+  check('同じ内容は重ねて覚えない', loadHarness(dir).project.length === 1);
+
+  // 長すぎる note は読み飛ばされるので切り詰める
+  applyHarnessEdits(dir, [{ op: 'create', scope: 'project', text: 'あ'.repeat(500) }]);
+  const long = loadHarness(dir).project.find((n) => n.text.startsWith('あ'));
+  check('長すぎる覚え書きは切り詰める', long.text.length <= MAX_NOTE_CHARS, `${long.text.length} 文字`);
+
+  // 直す・消す
+  const id = loadHarness(dir).project[0].id;
+  applyHarnessEdits(dir, [{ op: 'update', scope: 'project', id, text: 'テストは npm test（217件）' }]);
+  check('覚えたことを直せる', loadHarness(dir).project[0].text === 'テストは npm test（217件）');
+  applyHarnessEdits(dir, [{ op: 'delete', scope: 'project', id }]);
+  check('覚えたことを消せる', !loadHarness(dir).project.some((n) => n.id === id));
+
+  // 取り消し。当てる前の控えから丸ごと戻す
+  undoHarness(dir);
+  check('直前の変更を取り消せる', loadHarness(dir).project.some((n) => n.id === id));
+
+  // 上限。覚えたことは毎ターンの入力に必ず乗るので、際限なく増やさない
+  const many = Array.from({ length: MAX_NOTES + 8 }, (_, i) => ({
+    op: 'create',
+    scope: 'project',
+    text: `覚え書き ${i}`
+  }));
+  applyHarnessEdits(dir, many);
+  check('件数の上限を超えない', loadHarness(dir).project.length <= MAX_NOTES, `${loadHarness(dir).project.length} 件`);
+
+  // 分からない指示は黙って捨てる。覚え書きのために作業を止めない
+  applyHarnessEdits(dir, [{ op: 'なにこれ', scope: 'project', text: 'x' }, null, { op: 'create' }]);
+  check('読めない指示では壊れない', loadHarness(dir).project.length <= MAX_NOTES);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n見直しの返事の読み取り');
+{
+  check(
+    '素のJSONを読める',
+    parseEdits('{"edits":[{"op":"create","scope":"project","text":"あ"}]}').length === 1
+  );
+  check(
+    'フェンスで囲まれていても読める',
+    parseEdits('わかりました。\n```json\n{"edits":[{"op":"create","scope":"global","text":"あ"}]}\n```').length === 1
+  );
+  check(
+    '前置きが付いていても読める',
+    parseEdits('以下のとおりです: {"edits":[{"op":"create","scope":"project","text":"あ"}]} 以上です。').length === 1
+  );
+  check('空の返事は「覚えることなし」として読める', parseEdits('{"edits":[]}').length === 0);
+  check('JSONでなければ読めなかったと分かる', parseEdits('特にありません。') === null);
+  check(
+    '置き場の指定が無ければ、このフォルダ扱いにする',
+    parseEdits('{"edits":[{"op":"create","text":"あ"}]}')[0].scope === 'project'
+  );
+  check(
+    '知らない操作は捨てる',
+    parseEdits('{"edits":[{"op":"drop","text":"あ"},{"op":"create","text":"い"}]}').length === 1
+  );
+
+  // 実機で出た壊れ方。中の文にコマンドを引用符ごと書いてしまい、JSON 全体が読めなくなる。
+  // ここで諦めると、良い覚え書きまで丸ごと捨てることになる。
+  {
+    const broken =
+      '```json\n{"edits":[{"op":"create","scope":"project",' +
+      '"text":"node test_cart.js でテストを実行できる。",' +
+      '"evidence":"run_command({"command":"node test_cart.js"}) を実行して成功したため。"}]}\n```';
+    const got = parseEdits(broken);
+    check('引用符で壊れた返事からでも拾い直せる', got && got.length === 1, JSON.stringify(got));
+    check(
+      '肝心の本文は欠けずに取れる',
+      got?.[0]?.text === 'node test_cart.js でテストを実行できる。',
+      got?.[0]?.text,
+    );
+    check('置き場も取れる', got?.[0]?.scope === 'project');
+  }
+
+  // 拾い直しは最後の手段。**まともな JSON なら、そちらを優先して使う**
+  {
+    const good = parseEdits('{"edits":[{"op":"create","scope":"global","text":"あ","evidence":"い"}]}');
+    check('読める JSON はそのまま使う', good[0].evidence === 'い');
+  }
+
+  // 何も無い返事から、無理に拾わない
+  check('覚えることが無い返事から捏造しない', parseEdits('{"edits":[]}').length === 0);
+  check('関係のない文からは拾わない', parseEdits('特にありません。') === null);
 }
 
 // ── GPU に載りきったかを見る ────────────────────────────────

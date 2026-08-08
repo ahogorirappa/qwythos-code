@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { statSafe } from './paths.mjs';
 import { loadSkills, skillsBlock } from './skills.mjs';
+import { loadHarness, harnessBlock } from './harness.mjs';
 
 const CONTEXT_FILES = ['QWYTHOS.md', 'AGENTS.md', 'CLAUDE.md', '.qwythos.md'];
 
@@ -194,6 +195,13 @@ The user will be asked to approve. If they approve, you get the write tools back
   const skills = loadSkills(root);
   config.skillCount = skills.length;
   if (skills.length) prompt += skillsBlock(skills);
+
+  // 使ううちに覚えたこと。**基礎の指示文は書き換えず、別の節として足すだけ**にする。
+  // 決まりごと（QWYTHOS.md）より先に置く。あちらは「上を上書きする」と宣言しているので、
+  // 覚え書きが人の決めた決まりごとを追い越さないよう、順番で勝たせておく。
+  if (!config.isSubagent) {
+    prompt += harnessBlock(loadHarness(root));
+  }
 
   if (projectContext) {
     prompt += `\n## Project instructions (from ${projectContext.name}) — follow these, they override the defaults above\n${projectContext.text.trim()}\n`;
