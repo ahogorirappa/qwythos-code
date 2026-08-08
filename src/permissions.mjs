@@ -33,6 +33,28 @@ export class PermissionManager {
     this.config.autoApprove = Boolean(v);
   }
 
+  /**
+   * 書き換えだけ黙って通す段階。
+   *
+   * 全部飛ばす（--yolo）と、毎回聞かれるの間。
+   * ふだんの作業でうるさいのは書き換えの確認で、そこは差分が画面に出るので後から追える。
+   * コマンド実行とネットは**引き続き聞く**。あれは戻せないものを含むうえ、
+   * 画面に出ても「何が起きたか」が事前には分からない。
+   */
+  get acceptEdits() {
+    return Boolean(this.config.acceptEdits);
+  }
+
+  set acceptEdits(v) {
+    this.config.acceptEdits = Boolean(v);
+  }
+
+  /** その道具が、いまの段階で黙って通ってよいか */
+  autoAllowed(toolName) {
+    if (this.autoApprove) return true;
+    return this.acceptEdits && (toolName === 'write_file' || toolName === 'edit_file');
+  }
+
   // 危険な連結が含まれていない、素直な読み取り専用コマンドかを見る
   isSafeCommand(command) {
     return isSafeCommand(command, this.config);
@@ -47,7 +69,7 @@ export class PermissionManager {
   }
 
   async request({ toolName, args, title, preview }) {
-    if (this.autoApprove) return { granted: true, reason: 'auto' };
+    if (this.autoAllowed(toolName)) return { granted: true, reason: 'auto' };
 
     const key = this.key(toolName, args);
     if (this.alwaysAllow.has(key)) return { granted: true, reason: 'remembered' };

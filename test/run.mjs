@@ -593,6 +593,39 @@ console.log('\nやったと言い張ったときの促し（ループの往復�
   }
 }
 
+// ── 確認をどこまで飛ばすか ──────────────────────────────────
+//
+// 全部飛ばす（--yolo）と毎回聞かれるの間に、書き換えだけ飛ばす段階を置いてある。
+console.log('\n確認を飛ばす段階');
+{
+  const mk = (over) => new PermissionManager({ ...loadConfig(), ...over }, async () => 'n');
+
+  const strict = mk({});
+  check('既定では、書き換えもコマンドも確認する', !strict.autoAllowed('edit_file') && !strict.autoAllowed('run_command'));
+
+  const edits = mk({ acceptEdits: true });
+  check('書き換えだけ飛ばす: write_file は通す', edits.autoAllowed('write_file'));
+  check('書き換えだけ飛ばす: edit_file は通す', edits.autoAllowed('edit_file'));
+  // ここが緩むと、戻せない操作が黙って走る
+  check('書き換えだけ飛ばす: コマンドは通さない', !edits.autoAllowed('run_command'));
+  check('書き換えだけ飛ばす: ネットは通さない', !edits.autoAllowed('web_fetch') && !edits.autoAllowed('web_search'));
+  check('書き換えだけ飛ばす: ブラウザは通さない', !edits.autoAllowed('browse'));
+
+  const all = mk({ autoApprove: true });
+  check('全部飛ばす: どれも通す', all.autoAllowed('run_command') && all.autoAllowed('edit_file') && all.autoAllowed('browse'));
+
+  // 実際に確認をとる経路でも同じ判断になっているか（判定だけ直して経路が古い、を防ぐ）
+  const asked = [];
+  const spy = new PermissionManager({ ...loadConfig(), acceptEdits: true }, async (q) => {
+    asked.push(q);
+    return 'n';
+  });
+  const okEdit = await spy.request({ toolName: 'edit_file', args: {}, title: '', preview: '' });
+  check('書き換えでは人に聞かない', okEdit.granted && asked.length === 0);
+  const okCmd = await spy.request({ toolName: 'run_command', args: { command: 'rm -rf x' }, title: '', preview: '' });
+  check('コマンドでは人に聞く', !okCmd.granted && asked.length === 1);
+}
+
 console.log('\n差分表示');
 {
   const d = renderDiff('a\nb\nc\n', 'a\nB\nc\n');

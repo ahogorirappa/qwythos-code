@@ -3,7 +3,8 @@
 import readline from 'node:readline';
 import path from 'node:path';
 import process from 'node:process';
-import { loadConfig, saveConfig } from '../src/config.mjs';
+import fs from 'node:fs';
+import { loadConfig, saveConfig, HOME_DIR } from '../src/config.mjs';
 import { checkServer, listModels, adaptToModel, pickBestModel, checkGpuFit } from '../src/ollama.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { Agent } from '../src/agent.mjs';
@@ -44,6 +45,7 @@ function parseArgs(argv) {
       case '--temp': opts.overrides.temperature = Number(next()); break;
       case '--steps': opts.overrides.maxSteps = Number(next()); break;
       case '--yolo': case '--dangerously-skip-permissions': opts.overrides.autoApprove = true; break;
+      case '--accept-edits': opts.overrides.acceptEdits = true; break;
       case '--no-think': opts.overrides.think = false; break;
       case '--show-thinking': opts.overrides.showThinking = 'full'; break;
       case '--quiet-thinking': opts.overrides.showThinking = 'off'; break;
@@ -82,7 +84,8 @@ ${c.bold('オプション')}
       --ctx <数>         文脈の広さ（既定: 32768）
       --temp <数>        創造性の高さ 0〜1（既定: 0.3）
       --steps <数>       1回のお願いで許すツール実行の上限（既定: 40）
-      --yolo             確認を全部飛ばす（自動運転。中身を分かっている時だけ）
+      --yolo             確認を全部飛ばす（--dangerously-skip-permissions も同じ）
+      --accept-edits     書き換えだけ確認なしにする（コマンドとネットは確認する）
       --no-think         思考モードを切る（速くなるが精度は落ちる）
       --show-thinking    考えている内容を全部表示する
       --quiet-thinking   考えている様子を表示しない
@@ -96,7 +99,7 @@ ${c.bold('オプション')}
   -v, --version          バージョン
 
 ${c.bold('対話中に使えるコマンド')}
-  /help /clear /compact /model /think /yolo /tools /stats /files /refine /init /exit
+  /help /clear /compact /model /think /yolo /accept /tools /stats /files /refine /init /exit
   /login /logins /logout   ログインが要るサイトを読めるようにする
 `);
 }
@@ -109,7 +112,8 @@ ${c.bold('  対話中のコマンド')}
   ${c.cyan('/compact')}   会話をいますぐ要約して短くする
   ${c.cyan('/model')}     モデルを見る・切り替える（例: /model qwen3:14b-q4_K_M）
   ${c.cyan('/think')}     思考モードの切り替え（on / off / full / compact）
-  ${c.cyan('/yolo')}      確認あり／なしを切り替える
+  ${c.cyan('/yolo')}      確認あり／なしを切り替える（全部飛ばす）
+  ${c.cyan('/accept')}    書き換えだけ確認なしにする（コマンドとネットは確認する）
   ${c.cyan('/plan')}      計画モードの出入り（まず調べて方針を出す。書き換えない）
   ${c.cyan('/todo')}      いまのやることリストを見る
   ${c.cyan('/commands')}  自分で作ったコマンドの一覧（.qwythos/commands/*.md）
@@ -126,6 +130,48 @@ ${c.bold('  対話中のコマンド')}
 `);
 }
 
+// ── 打った依頼の履歴（↑ で呼び出せるようにする） ──────────────
+//
+// 終了しても残す。同じ作業を翌日に続けることが多く、毎回打ち直すのは無駄なため。
+// 残すのは**本人が打った依頼だけ**で、承認の y/n/a は残さない。
+const HISTORY_MAX = 200;
+const HISTORY_FILE = path.join(HOME_DIR, 'history');
+
+function loadHistory() {
+  try {
+    return fs
+      .readFileSync(HISTORY_FILE, 'utf8')
+      .split('\n')
+      .map((l) => l.trimEnd())
+      .filter((l) => l !== '')
+      .slice(-HISTORY_MAX);
+  } catch {
+    return [];
+  }
+}
+
+/** 打った依頼を控える。すぐ書くので、落ちても直前まで残る */
+function rememberInput(text) {
+  const value = String(text ?? '').trim();
+  if (!value || value.includes('\n')) return;
+  try {
+    const kept = loadHistory().filter((l) => l !== value);
+    kept.push(value);
+    fs.mkdirSync(HOME_DIR, { recursive: true });
+    fs.writeFileSync(HISTORY_FILE, `${kept.slice(-HISTORY_MAX).join('\n')}\n`, 'utf8');
+  } catch {
+    // 履歴が書けなくても作業は続けられる。ここで止めない
+  }
+}
+
+/** 承認の答えなど、残したくない行を履歴から抜く */
+function dropFromHistory(text) {
+  const value = String(text ?? '');
+  if (!rl || !Array.isArray(rl.history)) return;
+  // readline は新しいものを先頭に積む。いま入ったものだけを見る
+  if (rl.history[0] === value) rl.history.shift();
+}
+
 // ── 対話の入力受け付け ──────────────────────────────────────
 let rl = null;
 let pendingAsk = null;
@@ -137,8 +183,14 @@ function createReadline() {
     input: process.stdin,
     output: process.stdout,
     terminal: Boolean(process.stdin.isTTY),
-    historySize: 200
+    historySize: HISTORY_MAX
   });
+
+  // 前に打った依頼を、↑ で呼び出せるようにする。
+  // readline の history は「新しいものが先頭」なので、逆順に入れる。
+  if (process.stdin.isTTY && Array.isArray(rl.history)) {
+    rl.history.push(...loadHistory().reverse());
+  }
 
   // 作業中に打たれた行も取りこぼさないよう、いったん溜めておく
   rl.on('line', (text) => {
@@ -172,7 +224,14 @@ function showPrompt(question) {
   }
 }
 
-function ask(question) {
+/**
+ * 1行受け取る。
+ *
+ * `remember` を立てるのは、本人が打った**依頼**だけ。
+ * 承認の y/n/a まで残すと、↑ を押しても "y" しか出てこなくなり、履歴が使い物にならない
+ * （実際そうなっていた）。残さないものは、読んだ直後に履歴から抜く。
+ */
+function ask(question, { remember = false } = {}) {
   return new Promise((resolve) => {
     // 対話できない状況（-p など）では null を返す＝確認は「やめる」扱い
     if (!rl) return resolve(null);
@@ -180,6 +239,8 @@ function ask(question) {
     const deliver = (value) => {
       // パイプ入力は画面に出ないので、記録として自分で書き出す
       if (value !== null && !process.stdin.isTTY) line(value);
+      if (!remember) dropFromHistory(value);
+      else rememberInput(value);
       resolve(value);
     };
 
@@ -523,7 +584,8 @@ async function main() {
   }
 
   for (;;) {
-    const input = await ask(`${c.magenta('❯')} `);
+    // ここだけが「本人が打った依頼」。↑ で呼び出せるのはこれだけにする
+    const input = await ask(`${c.magenta('❯')} `, { remember: true });
     if (input === null || input === undefined) break;
     let text = input.trim();
     if (!text) continue;
@@ -765,6 +827,21 @@ async function handleSlash(text, { agent, config, permissions, root }) {
       return;
     }
 
+    // 全部飛ばすのと、毎回聞かれるの間。
+    // うるさいのは書き換えの確認だが、そこは差分が画面に出るので後から追える。
+    // コマンドとネットは引き続き聞く（戻せないものを含み、事前には何が起きるか分からない）。
+    case 'accept': {
+      permissions.acceptEdits = !permissions.acceptEdits;
+      agent.rebuildSystemPrompt();
+      if (permissions.acceptEdits) {
+        info('書き換えは確認なしで進めます。コマンド実行とネットは、これまでどおり確認します。');
+        if (permissions.autoApprove) warn('いまは確認なしモード（/yolo）なので、すべて確認しません。');
+      } else {
+        success('書き換えも確認するように戻しました。');
+      }
+      return;
+    }
+
     case 'tools': {
       // いま実際に渡している道具に印を付ける。
       // 一覧に出ているのに呼べない、という状態を作らない。
@@ -858,9 +935,16 @@ async function handleSlash(text, { agent, config, permissions, root }) {
         temperature: config.temperature,
         think: config.thinkPreference ?? config.think,
         showThinking: config.showThinking,
-        maxSteps: config.maxSteps
+        maxSteps: config.maxSteps,
+        // 書き換えを毎回確認するかどうかは好みが分かれるので、次回にも持ち越せるようにする。
+        // 確認を**全部**飛ばす設定（autoApprove）は保存しない。
+        // 一度うっかり入れたまま忘れると、以後ずっと無防備になるため、毎回明示してもらう。
+        acceptEdits: config.acceptEdits
       });
       success('いまの設定を次回以降の既定にしました。');
+      if (config.autoApprove) {
+        info('確認なしモード（/yolo）は保存していません。必要なときに毎回指定してください。');
+      }
       return;
     }
 
