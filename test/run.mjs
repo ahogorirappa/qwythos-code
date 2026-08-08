@@ -9,7 +9,13 @@ import { loadConfig } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
 import { salvageToolCalls, chatStream } from '../src/ollama.mjs';
-import { describesIntentWithoutActing, claimsWorkDone, looksLikeFileRewrite, Agent } from '../src/agent.mjs';
+import {
+  describesIntentWithoutActing,
+  claimsWorkDone,
+  looksLikeFileRewrite,
+  recommendsWithoutActing,
+  Agent
+} from '../src/agent.mjs';
 import { TOOLS, activeTools } from '../src/tools.mjs';
 import { checkUrl, htmlToText, decodeEntities, extractTitle } from '../src/web.mjs';
 import { normalizeUrl, PROFILE_DIR } from '../src/browser.mjs';
@@ -399,6 +405,36 @@ console.log('\n書き直した中身を貼っただけの返事の検知');
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+// ── 直し方を述べただけで、自分では直さない ───────────────────
+//
+// コーディングを頼む道具なのに、毎回「直して」と言い直させることになる。
+// 上の2つとは別物。あちらは「これからやります」と「やりました」。こちらは**やる気が無い**返事。
+console.log('\n直し方を述べただけの返事の検知');
+{
+  const advice = [
+    '税率が古いですね。0.08 を 0.1 に変更する必要があります。',
+    'この行は i < items.length にすべきです。',
+    'withTax の中身を修正してください。',
+    'The rate should be updated to 0.1.',
+    'You can change 1.08 to 1.1 to fix this.',
+    'I recommend extracting the rate into a constant.'
+  ];
+  const notAdvice = [
+    // 自分で直したうえで説明している
+    '0.08 を 0.1 に変更しました。テストも通っています。',
+    'I changed the rate to 0.1 and the tests pass.',
+    // ただの説明
+    'withTax は価格に税率をかけて返します。',
+    '合計は 57,000円です。',
+    // 直したうえで、次にやるべきことを利用者に伝えている
+    'price.js を修正しました。呼び出し側も確認したほうがよいかもしれません。'
+  ];
+  let ok = true;
+  for (const t of advice) if (!recommendsWithoutActing(t)) { ok = false; console.log(`       見逃し: ${t.slice(0, 40)}`); }
+  for (const t of notAdvice) if (recommendsWithoutActing(t)) { ok = false; console.log(`       誤検知: ${t.slice(0, 40)}`); }
+  check(`勧めただけ${advice.length}件を検知し、そうでない${notAdvice.length}件は拾わない`, ok);
+}
+
 // ── 促しが本当にループから出るか ────────────────────────────
 //
 // 判定の関数が正しいことと、それがループで使われていることは別。
@@ -457,6 +493,34 @@ console.log('\nやったと言い張ったときの促し（ループの往復�
     const a = mkAgent([{ content: 'バグは 4 行目にあります。境界の比較が誤っています。' }]);
     await a.runTurn('cart.js のどこが悪い？');
     check('変えたと言っていない答えは促さない', nudgesIn(a) === 0);
+  }
+
+  // 直し方を述べただけで終わったら、直させる
+  {
+    const a = mkAgent([{ content: '0.08 を 0.1 に変更する必要があります。' }, { content: 'はい。' }]);
+    a.config.isSubagent = false;
+    await a.runTurn('税率が古いよ');
+    const said = a.messages.filter((m) => m.role === 'user' && /did not make it/.test(m.content || ''));
+    check('勧めただけで終わったら促す', said.length > 0);
+  }
+
+  // 計画モードでは促さない。書く道具そのものが外してあり、勧めて終わるのが正しい
+  {
+    const a = mkAgent([{ content: '0.08 を 0.1 に変更する必要があります。' }]);
+    a.config.isSubagent = false;
+    a.config.planMode = true;
+    await a.runTurn('どう直すべき？');
+    const said = a.messages.filter((m) => m.role === 'user' && /did not make it/.test(m.content || ''));
+    check('計画モードでは促さない', said.length === 0);
+  }
+
+  // 調べもの係でも促さない。あちらは何も変更できない
+  {
+    const a = mkAgent([{ content: '0.08 を 0.1 に変更する必要があります。' }]);
+    a.config.isSubagent = true;
+    await a.runTurn('税率はどうなっている？');
+    const said = a.messages.filter((m) => m.role === 'user' && /did not make it/.test(m.content || ''));
+    check('調べもの係では促さない', said.length === 0);
   }
 
   // 促しても言い張り続ける相手に、無限に付き合わない

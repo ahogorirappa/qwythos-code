@@ -197,6 +197,30 @@ export class Agent {
             }
           }
 
+          // 「こう直すべきです」と勧めただけで、自分では直していない場合。
+          //
+          // **計画モードと調べもの係では出さない。**あちらは直さないのが仕事なので、
+          // 勧めて終わるのが正しい答えになる。ここで催促すると、できないことを強いることになる。
+          if (
+            nudges < (this.config.maxNudges ?? 5) &&
+            !this.config.planMode &&
+            !this.config.isSubagent &&
+            (this.ctx.mutations || 0) === mutationsAtStart &&
+            recommendsWithoutActing(said)
+          ) {
+            nudges++;
+            info('直し方を述べただけで直していないので、促しました。');
+            this.messages.push({
+              role: 'user',
+              content:
+                'You described the change that should be made, but you did not make it. ' +
+                'The user came to you so that they would not have to do it themselves. ' +
+                'Make the change now with edit_file or write_file. ' +
+                'If they only asked for your opinion and did not want the file touched, say that plainly instead.'
+            });
+            continue;
+          }
+
           break;
         }
 
@@ -813,6 +837,32 @@ export function claimsWorkDone(text) {
   // 正しい完了報告のほうまで打ち消されてしまう。
   const sentences = text.trim().split(/(?<=[.。!?！？])\s*|\n+/).filter((s) => s.trim());
   return sentences.some((s) => claim.test(s) && !negated.test(s));
+}
+
+/**
+ * 「こう直すべきです」と勧めただけで、自分では直していない返事か。
+ *
+ * ■ これが一番の外し方
+ *   利用者に「税率が古いよ」と言われて、「はい、0.08 を 0.1 に変えるべきです」と答えて終わる。
+ *   コーディングを頼む道具なのに、**毎回「直して」と言い直させることになる**。
+ *
+ *   上の2つとは別物。describesIntentWithoutActing は「これからやります」（自分がやる宣言）、
+ *   claimsWorkDone は「やりました」（嘘の完了報告）。こちらは**そもそも自分がやる気が無い**返事。
+ *
+ * ■ 拾ってはいけない場合
+ *   「どう直すべき？」と意見を求められたときは、勧めるのが正しい答え。
+ *   呼ぶ側で、計画モードと調べもの係を外してから使うこと（あちらは直さないのが仕事）。
+ */
+export function recommendsWithoutActing(text) {
+  const advice =
+    /(すべきです|すべきでしょう|する必要があります|したほうがよい|したほうがいい|修正が必要|変更が必要|直す必要|変更してください|修正してください|に変えてください|\bshould be (changed|updated|fixed|replaced)\b|\bneeds? to be (changed|updated|fixed)\b|\byou (can|could|should) (change|update|fix|replace)\b|\bI recommend\b|\bwould need to\b)/i;
+
+  // 自分で手を動かした話をしているなら、勧めているだけではない
+  const acted =
+    /(しました|直しました|変更しました|修正しました|置き換えました|作成しました|\bI (have |already |just )?(changed|edited|fixed|updated|replaced|created)\b)/i;
+
+  const sentences = text.trim().split(/(?<=[.。!?！？])\s*|\n+/).filter((s) => s.trim());
+  return sentences.some((s) => advice.test(s)) && !sentences.some((s) => acted.test(s));
 }
 
 // 返事の中の ``` で囲まれた塊を取り出す
