@@ -108,6 +108,12 @@ export class Agent {
     const mutationsAtStart = this.ctx.mutations || 0;
     // やることリストの促しは1回まで（下の判定で使う）
     let toldAboutTodos = false;
+    // 「調べるばかりで進まない」の区切りも1回まで
+    let toldToWrapUp = false;
+    // 促しても空の返事しか返ってこなかったか（黙って終わらせないための印）
+    let emptyEnded = false;
+    // このお願いを受ける前の道具の回数。今回どれだけ調べたかを見る
+    const toolCallsAtStart = this.stats.toolCalls;
 
     try {
       for (let step = 0; step < this.config.maxSteps; step++) {
@@ -133,13 +139,27 @@ export class Agent {
         if (!result.toolCalls.length) {
           const said = result.message.content.trim();
 
-          if (!said && step === 0) {
-            // 何も言わずに終わってしまったときは一度だけ促す
-            this.messages.push({
-              role: 'user',
-              content: 'You returned an empty response. Either use a tool to make progress, or answer the request directly.'
-            });
-            continue;
+          // 何も言わず、道具も呼ばずに返してきたとき。
+          //
+          // **ここを step === 0 に限ってはいけない。**
+          // 実測: どこを直すか書いていない依頼で6分ぶん読み進めたあと、
+          // 67.8秒考えて空を返し、その turn が**画面に1文字も出さないまま終わった**。
+          // 利用者から見れば「アバウトに頼むと何も起きない」になる。
+          if (!said) {
+            if (nudges < (this.config.maxNudges ?? 5)) {
+              nudges++;
+              this.messages.push({
+                role: 'user',
+                content:
+                  'You returned an empty response. That tells the user nothing. ' +
+                  'Say what you have found so far and what you are going to do, ' +
+                  'or make the change, or ask one specific question. Do not return empty again.'
+              });
+              continue;
+            }
+            // 促しても空のままなら、黙って終わらせない。何が起きたかを人に伝える。
+            emptyEnded = true;
+            break;
           }
 
           // 「これからやります」と書くだけで手を動かさないモデルがある。
@@ -274,6 +294,39 @@ export class Agent {
           continue;
         }
 
+        // 調べてばかりで、いつまでも結論に進まないとき。
+        //
+        // ■ どこで見たか
+        //   「画面が見にくいから、いい感じにして」のような**どこを直すか書いていない依頼**で、
+        //   28ファイルのプロジェクトを7分ぶん読み続け、同じ App.tsx を3回読み直し、
+        //   1文字も変えないまま終わった。指示文で「まず絞れ」と言っても、絞り切れずに読み続ける。
+        //
+        // ■ 何をするか
+        //   読んだ量ではなく**結論が出ていないこと**を見て、1度だけ区切りを入れる。
+        //   出口は3つ示す（直す・答える・1つ聞く）。**調べものの依頼でも正しい**ようにするため、
+        //   「変更しろ」とは言わない。ここで「変更しろ」と言うと、質問しただけの人のファイルを触ってしまう。
+        if (
+          !toldToWrapUp &&
+          !this.config.isSubagent &&
+          this.stats.toolCalls - toolCallsAtStart >= (this.config.exploreLimit ?? 10) &&
+          (this.ctx.mutations || 0) === mutationsAtStart
+        ) {
+          toldToWrapUp = true;
+          info('調べるばかりで先に進んでいないので、区切りを促しました。');
+          this.messages.push({
+            role: 'user',
+            content:
+              `You have used ${this.stats.toolCalls - toolCallsAtStart} tools and changed nothing yet. ` +
+              'Stop reading. You have enough to produce a result now. Do exactly one of these:\n' +
+              '1. Make the smallest concrete change that improves things, then report it.\n' +
+              '2. If the request was a question, answer it from what you have read.\n' +
+              '3. If you genuinely cannot tell what they want, ask ONE question naming two or three ' +
+              'concrete options you found, with file names.\n' +
+              'Do not read another file before doing one of these.'
+          });
+          continue;
+        }
+
         if (step === this.config.maxSteps - 1) {
           // 任された側の上限は本体より短い。ここで「続けて」と言えるのは人だけなので、
           // 任された側では出さない（そのぶんは呼び出し元が答えの薄さとして受け取る）。
@@ -293,6 +346,18 @@ export class Agent {
       this.abortController = null;
       this.ctx.signal = null;
       this.onSave();
+    }
+
+    // 何も言わないまま終わらせない。
+    // 画面に1文字も出ないと、利用者には「固まった」「無視された」としか見えない。
+    if (emptyEnded && !interrupted) {
+      line();
+      warn('モデルが何も返さないまま止まりました。');
+      info(
+        this.ctx.mutations > 0
+          ? 'ここまでの変更は残っています（/files で確認できます）。'
+          : '何も変更していません。頼みたいことを、もう少し具体的に（どのファイルの何を、まで）教えてください。'
+      );
     }
 
     if (interrupted) {

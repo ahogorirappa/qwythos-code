@@ -130,6 +130,48 @@ ${c.bold('  対話中のコマンド')}
 `);
 }
 
+/**
+ * 思考モードが、いまどうなっているかを見せる。
+ *
+ * ■ なぜ要るか
+ *   ここには**別々の2つ**がある。「考えさせるかどうか」と「考えている様子を画面に出すかどうか」。
+ *   どちらも見えないので、切り替えたつもりで切り替わっていないのか、
+ *   切り替わったが画面に出ていないだけなのかが分からなかった。
+ *
+ *   さらに、希望（thinkPreference）どおりになるとは限らない。
+ *   モデルが思考モードを持たなければ、実際に送る値（think）は false に落ちる。
+ *   「入れました」とだけ出すと、その場で嘘になる。**実際に効いている値**を出す。
+ */
+async function showThinkState(config) {
+  const label = {
+    off: '出さない',
+    compact: '1行だけ出す',
+    full: '全部出す'
+  }[config.showThinking] ?? config.showThinking;
+
+  // 見出しの幅をそろえる。全角なので、文字数ではなく見た目の幅で詰める
+  line();
+  line(`  ${c.gray('考えさせる　　')} ${config.think ? c.green('はい') : c.gray('いいえ')}`);
+  line(
+    `  ${c.gray('考えている様子')} ` +
+      (config.think
+        ? config.showThinking === 'off'
+          ? c.gray(label)
+          : c.green(label)
+        : c.gray(`${label}（考えさせていないので、いまは関係ありません）`))
+  );
+
+  // 希望と実際がずれているときだけ、理由を添える
+  if (config.thinkPreference && !config.think) {
+    line(`  ${c.yellow('※')} ${config.model} は思考モードを持たないので、考えさせる指定は効きません。`);
+  }
+  if (config.think && config.showThinking === 'off') {
+    line(`  ${c.gray('※ 考えてはいますが、様子は画面に出していません（/think compact で出せます）。')}`);
+  }
+  line(`  ${c.gray('変えるには: /think on | off | compact | full | quiet')}`);
+  line();
+}
+
 // ── 打った依頼の履歴（↑ で呼び出せるようにする） ──────────────
 //
 // 終了しても残す。同じ作業を翌日に続けることが多く、毎回打ち直すのは無駄なため。
@@ -700,25 +742,42 @@ async function handleSlash(text, { agent, config, permissions, root }) {
     }
 
     case 'think': {
+      // 引数なしは「いまどうなっているか」を見せるだけにする。
+      // 以前はここで思考モードを入れていたが、状態を確かめる手段が無く、
+      // 見るつもりで打つと勝手に切り替わっていた。
+      if (arg === '') {
+        await showThinkState(config);
+        return;
+      }
+
       if (arg === 'off') {
         config.thinkPreference = false;
-        success('思考モードを切りました。');
-      } else if (arg === 'on' || arg === '') {
+      } else if (arg === 'on') {
         config.thinkPreference = true;
         config.showThinking = config.showThinking === 'off' ? 'compact' : config.showThinking;
-        success('思考モードを入れました。');
       } else if (arg === 'full' || arg === 'compact') {
         config.thinkPreference = true;
         config.showThinking = arg;
-        success(`考えている内容の表示を ${arg} にしました。`);
+      } else if (arg === 'quiet') {
+        // 考えさせるが、様子は画面に出さない（--quiet-thinking と同じ）。
+        // これまで対話中から戻す手段が無かった。
+        config.thinkPreference = true;
+        config.showThinking = 'off';
       } else {
-        info('使い方: /think on | off | full | compact');
+        info('使い方: /think            いまの状態を見る');
+        info('        /think on|off    考えさせる／考えさせない');
+        info('        /think compact    考えている様子を1行だけ出す');
+        info('        /think full       考えている内容を全部出す');
+        info('        /think quiet      考えさせるが、様子は出さない');
         return;
       }
-      // モデルが思考モードを持たない場合はここで無効に戻る
+
+      // モデルが思考モードを持たない場合、ここで config.think が false に戻る。
+      // だから「入れました」と言い切る前に、これを通してから状態を出す。
       const adapted = await adaptToModel(config);
       for (const note of adapted.notes || []) info(note.text);
       agent.rebuildSystemPrompt();
+      await showThinkState(config);
       return;
     }
 

@@ -582,6 +582,47 @@ console.log('\nやったと言い張ったときの促し（ループの往復�
     check('調べもの係では促さない', said.length === 0);
   }
 
+  // 空の返事で黙って終わらない。
+  // 実機で、6分ぶん読み進めたあと空を返し、画面に1文字も出さずに終わっていた。
+  // 利用者から見れば「アバウトに頼むと何も起きない」になる。
+  {
+    const a = mkAgent(Array.from({ length: 10 }, () => ({ content: '' })));
+    a.config.isSubagent = false;
+    a.config.maxNudges = 2;
+    await a.runTurn('画面が見にくいから、いい感じにして');
+    const pushed = a.messages.filter((m) => m.role === 'user' && /empty response/.test(m.content || ''));
+    check('空の返事は、最初の1手でなくても促す', pushed.length === 2, `${pushed.length} 回`);
+    check('促す回数は maxNudges で止まる', pushed.length <= 2);
+  }
+
+  // 調べてばかりで結論に進まないとき、1度だけ区切りを入れる
+  {
+    // 道具を呼び続けるだけの台本。実機で見た「読み続けて終わらない」形
+    const a = mkAgent([]);
+    a.config.isSubagent = false;
+    a.config.exploreLimit = 4;
+    a.config.maxSteps = 12;
+    let calls = 0;
+    a.streamAssistant = async () => {
+      calls++;
+      return {
+        message: { role: 'assistant', content: '', tool_calls: [] },
+        toolCalls: [{ id: `t${calls}`, function: { name: 'list_dir', arguments: {} } }],
+        stats: null
+      };
+    };
+    // 道具は数えるだけにする（実物を動かさない）
+    a.executeTool = async () => {
+      a.stats.toolCalls++;
+      return { output: 'ok', denied: false };
+    };
+    await a.runTurn('画面が見にくいから、いい感じにして');
+    const wrap = a.messages.filter((m) => m.role === 'user' && /Stop reading/.test(m.content || ''));
+    check('調べるばかりで進まないとき、区切りを促す', wrap.length === 1, `${wrap.length} 回`);
+    // 出口に「変更しろ」だけを置くと、質問しただけの人のファイルを触ってしまう
+    check('答えるか、1つ聞く道も示す', /answer it/.test(wrap[0]?.content || '') && /ask ONE question/.test(wrap[0]?.content || ''));
+  }
+
   // 促しても言い張り続ける相手に、無限に付き合わない
   {
     const script = Array.from({ length: 20 }, () => ({ content: '修正しました。' }));
