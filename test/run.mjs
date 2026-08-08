@@ -93,8 +93,67 @@ console.log('\nedit_file — 置き換えの正しさ');
   r = await edit.run({ path: 'c.js', old_string: 'let x = 1;', new_string: 'let x = 2;', replace_all: true }, ctx);
   check('replace_all なら全部置き換える', get('c.js') === 'let x = 2;\nlet x = 2;\n', get('c.js'));
 
+  // まったく似ていないものを送ってきたとき。
+  // 「近い場所はここです」と嘘をつかず、別のファイルを見ている可能性を伝える
   r = await edit.run({ path: 'c.js', old_string: 'nope', new_string: 'x' }, ctx);
-  check('一致しないときは現物を返して直させる', r.isError && /actually contains/.test(r.output) && /let x = 2;/.test(r.output), r.output);
+  check(
+    '似た場所が無ければ、読み直させる',
+    r.isError && /nothing in it resembles/.test(r.output) && /let x = 2;/.test(r.output),
+    r.output
+  );
+
+  // ── 一致しなかったとき、狙った場所の現物を返す ──────────────
+  //
+  // ここで先頭80行を返していたせいで、長いファイルでは狙った場所が入っておらず、
+  // モデルが手がかりの無いまま推測を繰り返して無限に往復した（実機 Sidebar.tsx）。
+  {
+    const body = [];
+    for (let i = 1; i <= 120; i++) body.push(`  const line${i} = ${i};`);
+    body.splice(99, 0, '  return (', '    <div className="sidebar">', '      <span>ここ</span>', '    </div>', '  );');
+    put('long.tsx', `${body.join('\n')}\n`);
+
+    // 100行目より後ろを、少しずれた形で狙う
+    r = await edit.run(
+      {
+        path: 'long.tsx',
+        old_string: '  return (\n    <div className="sidebar">\n      <span>ちがう</span>\n    </div>\n  );',
+        new_string: 'x'
+      },
+      ctx
+    );
+    check('遠い場所でも、狙った付近を返す', r.isError && /<span>ここ<\/span>/.test(r.output), r.output.slice(0, 200));
+    check('どのあたりかを行番号で伝える', /closest place is around line 1\d\d/.test(r.output), r.output.slice(0, 200));
+    check('先頭を返さない', !/const line1 = 1;/.test(r.output), r.output.slice(0, 200));
+  }
+
+  // ── 同じファイルで続けて失敗したら、やり方を変えさせる ────────
+  //
+  // 引数が毎回わずかに違うので、同じ呼び出しを止める仕掛けでは捕まらない。
+  {
+    put('loop.js', 'const a = 1;\nconst b = 2;\n');
+    const fresh = { ...ctx, editFailures: new Map() };
+
+    const first = edit.validate({ path: 'loop.js', old_string: 'const a = 9;', new_string: 'x' }, fresh);
+    check('1回目は、まだやり方を変えさせない', !/Stop using edit_file/.test(first), first.slice(0, 120));
+
+    const second = edit.validate({ path: 'loop.js', old_string: 'const a = 8;', new_string: 'x' }, fresh);
+    check('2回続けて外したら、丸ごと書き直させる', /Stop using edit_file/.test(second), second.slice(0, 160));
+    check('そのとき現物の全文を渡す', /const a = 1;\nconst b = 2;/.test(second));
+
+    // 通ったら数えは消える。次に詰まったときは、また最初から
+    edit.validate({ path: 'loop.js', old_string: 'const a = 1;', new_string: 'const a = 3;' }, fresh);
+    const afterOk = edit.validate({ path: 'loop.js', old_string: 'const a = 7;', new_string: 'x' }, fresh);
+    check('一度通れば、数えは振り出しに戻る', !/Stop using edit_file/.test(afterOk), afterOk.slice(0, 120));
+
+    // 長すぎるファイルを丸ごと書き直させると、別の壊し方になる
+    const big = [];
+    for (let i = 0; i < 500; i++) big.push(`const v${i} = ${i};`);
+    put('big.js', `${big.join('\n')}\n`);
+    const bigCtx = { ...ctx, editFailures: new Map() };
+    edit.validate({ path: 'big.js', old_string: 'nope1', new_string: 'x' }, bigCtx);
+    const bigSecond = edit.validate({ path: 'big.js', old_string: 'nope2', new_string: 'x' }, bigCtx);
+    check('長すぎるファイルは丸ごと書き直させない', !/Stop using edit_file/.test(bigSecond) && /offset and limit/.test(bigSecond), bigSecond.slice(0, 160));
+  }
 
   put('d.js', 'export function sum(a, b) {\n  return a + b;\n}\n');
   r = await edit.run(

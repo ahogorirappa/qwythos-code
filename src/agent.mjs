@@ -42,6 +42,9 @@ export class Agent {
       permissions,
       changedFiles: new Set(),
       readFiles: new Set(),
+      // ファイルごとの「置き換えに失敗した回数」。
+      // 続けて外すようなら、edit_file をやめて丸ごと書き直させる（tools.mjs）。
+      editFailures: new Map(),
       // 手を動かした回数（書き込み・置き換え・コマンド実行）。
       // changedFiles は「どのファイルか」の集合なので、同じファイルを2度直しても増えない。
       // 「今回のお願いで実際に何かしたか」を見るには、回数で持つ必要がある。
@@ -71,6 +74,7 @@ export class Agent {
     this.messages = [{ role: 'system', content: this.systemPrompt }];
     this.ctx.changedFiles.clear();
     this.ctx.readFiles.clear();
+    this.ctx.editFailures.clear();
     this.ctx.mutations = 0;
     this.ctx.todos = [];
   }

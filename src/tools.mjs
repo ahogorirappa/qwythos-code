@@ -248,8 +248,14 @@ const editFile = {
     if (!fs.existsSync(abs)) {
       return `File not found: ${args.path}${suggestPaths(args.path, ctx)}`;
     }
-    const result = applyEdit(fs.readFileSync(abs, 'utf8'), args);
-    return result.error || null;
+    const before = fs.readFileSync(abs, 'utf8');
+    const result = applyEdit(before, args);
+    if (!result.error) {
+      // 通ったら数えを消す。次に詰まったときは、また最初から数える
+      ctx.editFailures?.delete(abs);
+      return null;
+    }
+    return result.error + escalateAfterRepeatedFailure(abs, before, ctx);
   },
   preview(args, ctx) {
     const abs = resolveSafe(args.path, ctx);
@@ -285,6 +291,49 @@ const editFile = {
     };
   }
 };
+
+/** 同じファイルで、この回数だけ続けて失敗したら、やり方を変えさせる */
+const EDIT_FAILURE_LIMIT = 2;
+
+/** 差し替えの案内に添えられるファイルの上限。これを超えるものは丸ごと書き直させない */
+const REWRITE_MAX_LINES = 400;
+
+/**
+ * 同じファイルで edit_file が続けて失敗したときに、道を変えさせる。
+ *
+ * ■ なぜ要るか
+ *   一致しない → 少し違う old_string で作り直す → また一致しない、を延々と繰り返す。
+ *   実機の記録では 83.9 秒の思考を挟んで同じ失敗を続けていた。
+ *   引数が毎回わずかに違うので、同じ呼び出しを止める仕掛け（duplicateLimit）では捕まらない。
+ *
+ * ■ 何をするか
+ *   2回続けて外したら「その道はもう通らない」と伝え、**現物の全文を渡して write_file に切り替えさせる**。
+ *   長すぎるファイルでは丸ごと書き直させない（別の壊し方になるため）。そのときは範囲を狭めさせる。
+ */
+function escalateAfterRepeatedFailure(abs, before, ctx) {
+  if (!ctx.editFailures) ctx.editFailures = new Map();
+  const count = (ctx.editFailures.get(abs) || 0) + 1;
+  ctx.editFailures.set(abs, count);
+  if (count < EDIT_FAILURE_LIMIT) return '';
+
+  const lines = before.split('\n');
+  const rel = displayPath(abs, ctx);
+
+  if (lines.length > REWRITE_MAX_LINES) {
+    return (
+      `\n\nYou have now failed to edit ${rel} ${count} times in a row. Stop guessing at old_string.\n` +
+      'Read a small part of the file with read_file using offset and limit, so you see one screen of ' +
+      'exact text, then copy old_string from that. Do not send an old_string you have not just read.'
+    );
+  }
+
+  return (
+    `\n\nYou have now failed to edit ${rel} ${count} times in a row. **Stop using edit_file on this file.**\n` +
+    'Call write_file with the complete new content instead. Below is the file exactly as it is on disk ' +
+    'right now, with no line numbers. Copy it, apply your change to your copy, and send the whole thing:\n\n' +
+    before
+  );
+}
 
 // read_file は行番号つきで返すので、それをそのまま貼ってきた場合に剥がす
 function stripLineNumbers(text) {
@@ -353,16 +402,70 @@ function applyEdit(before, args) {
     };
   }
 
-  // それでも駄目なら、いま入っている中身をそのまま返して直させる
+  // それでも駄目なら、**狙った場所の現物**を返して直させる。
+  //
+  // ここで先頭80行を返してはいけない。長いファイルでは狙った場所が入っておらず、
+  // モデルは手がかりの無いまま推測を繰り返す。実際に Sidebar.tsx で無限に往復した。
+  // いちばん近い場所を探して、その周りだけを出す。
+  const near = nearestRegion(before, oldStr);
   const lines = before.split('\n');
-  const shown = numberLines(lines.slice(0, 80).join('\n'));
-  const more = lines.length > 80 ? `\n…[${lines.length - 80} more lines]` : '';
+  if (near) {
+    const from = Math.max(0, near.start - 6);
+    const to = Math.min(lines.length, near.end + 6);
+    const shown = numberLines(lines.slice(from, to).join('\n'), from + 1);
+    return {
+      error:
+        'old_string was not found in the file. It must match the file text exactly.\n' +
+        `The closest place is around line ${near.start + 1} ` +
+        `(${near.matched} of your ${near.total} lines appear there).\n` +
+        'Here is what the file actually contains there. Copy from this, without the line numbers:\n\n' +
+        shown
+    };
+  }
+
+  // 近いところが1つも無い＝そもそも別のファイルを見ている可能性が高い
+  const head = numberLines(lines.slice(0, 60).join('\n'));
+  const more = lines.length > 60 ? `\n…[${lines.length - 60} more lines]` : '';
   return {
     error:
-      'old_string was not found in the file. It must match the file text exactly.\n' +
-      'Here is what the file actually contains right now — copy the exact text from it:\n\n' +
-      `${shown}${more}`
+      'old_string was not found in the file, and nothing in it resembles what you sent. ' +
+      'You may be editing the wrong file, or working from an old copy of it. ' +
+      'Read the file again before trying another edit.\n\n' +
+      `${head}${more}`
   };
+}
+
+/**
+ * old_string に**いちばん近い場所**を探す。
+ *
+ * 一致は諦めたあとに呼ぶ。狙いはどこを直そうとしていたのかを言い当てることだけで、
+ * 置き換えはしない（それは fuzzyLineMatch の仕事で、あちらは確実なときしか動かない）。
+ *
+ * 中身が半分も重ならない場所は返さない。見当違いの場所を「ここです」と言うと、
+ * モデルはそこを信じて別の間違いを重ねる。
+ */
+function nearestRegion(before, oldStr) {
+  const fileLines = before.split('\n');
+  const oldLines = oldStr.split('\n').map((l) => l.trim()).filter((l) => l !== '');
+  if (oldLines.length === 0) return null;
+
+  const n = Math.min(oldLines.length, fileLines.length);
+  let best = null;
+
+  for (let i = 0; i + n <= fileLines.length; i++) {
+    const window = fileLines.slice(i, i + n).map((l) => l.trim());
+    let matched = 0;
+    for (const line of oldLines) {
+      const at = window.indexOf(line);
+      if (at >= 0) matched++;
+    }
+    if (!best || matched > best.matched) {
+      best = { start: i, end: i + n, matched, total: oldLines.length };
+    }
+  }
+
+  if (!best || best.matched * 2 < best.total) return null;
+  return best;
 }
 
 // 行末の空白の違い、または全行そろって同じだけずれたインデントを許して探す
