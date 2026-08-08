@@ -166,6 +166,8 @@ const readFile = {
 // ── 2. ファイルを丸ごと書く ──────────────────────────────────
 const writeFile = {
   name: 'write_file',
+  // 実行後に、書いた中身を画面に出す（agent.mjs が preview を使う）
+  showsDiff: true,
   // 既存を丸ごと置き換えうるので、必ず人に見せてから
   approval: 'always',
   description:
@@ -217,6 +219,8 @@ const writeFile = {
 // ── 3. ファイルの一部を置き換える ────────────────────────────
 const editFile = {
   name: 'edit_file',
+  // 実行後に、置き換えた箇所を画面に出す
+  showsDiff: true,
   // 差分を見てから決められるようにする
   approval: 'always',
   description:

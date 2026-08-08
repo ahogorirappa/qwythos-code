@@ -516,18 +516,28 @@ export class Agent {
       needsApproval = tool.needsApproval(call.args, this.ctx, this.permissions);
     }
 
+    // 何がどう変わるかを、**実行より先に**作っておく。
+    //
+    // 書き換えたあとでは、元の中身がもう無いので差分を作れない。
+    // 確認を出すときはそこに載せ、確認を出さないとき（--yolo など）は実行後に出す。
+    let preview = '';
+    if (typeof tool.preview === 'function') {
+      preview = safeCall(() => tool.preview(call.args, this.ctx), '');
+    }
+    // 確認欄として既に画面に出したか。二重に出さないための印
+    let previewShown = false;
+
     if (needsApproval) {
-      let preview = '';
-      let title = tool.approvalTitle ? safeCall(() => tool.approvalTitle(call.args, this.ctx), '') : '';
-      if (typeof tool.preview === 'function') {
-        preview = safeCall(() => tool.preview(call.args, this.ctx), '');
-      }
+      const title = tool.approvalTitle ? safeCall(() => tool.approvalTitle(call.args, this.ctx), '') : '';
       const decision = await this.permissions.request({
         toolName: tool.name,
         args: call.args,
         title,
         preview
       });
+      // 実際に人に見せたときだけ「出した」とみなす。
+      // 自動許可（--yolo や記憶した許可）では、何も画面に出ていない。
+      previewShown = decision.reason === 'user' || decision.reason === 'always';
       if (!decision.granted) {
         toolResultLine('ユーザーが実行を断りました', true);
         return {
@@ -545,6 +555,16 @@ export class Agent {
       const res = await tool.run(call.args || {}, this.ctx);
       // 道具が自分で画面に出したときは、結果の行を重ねない（やることリストなど）
       if (!res.quiet) toolResultLine(res.display || 'done', Boolean(res.isError));
+
+      // 書いた中身を画面に出す。
+      //
+      // 「1 か所を置き換え」だけでは、何がどうなったのか分からない。
+      // 確認を出さない設定（--yolo）ほど、ここが唯一の手がかりになる。
+      // 確認欄で既に見せているときは重ねない。
+      if (tool.showsDiff && preview && !previewShown && !res.isError && this.config.showDiff !== false) {
+        for (const l of preview.split('\n')) line(l);
+      }
+
       return {
         output: truncateOutput(String(res.output ?? ''), this.config.maxToolChars),
         denied: false

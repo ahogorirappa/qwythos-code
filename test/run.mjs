@@ -539,6 +539,34 @@ console.log('\n差分表示');
   const d = renderDiff('a\nb\nc\n', 'a\nB\nc\n');
   check('変わった行だけを出す', /-b/.test(d) && /\+B/.test(d) && !/-a/.test(d), d);
   check('変化なしはその旨を出す', /変化はありません/.test(renderDiff('same\n', 'same\n')));
+
+  // 書き換えた中身を画面に出すのは、道具側の印（showsDiff）で決める。
+  // 印が付いていないと agent.mjs は何も出さないので、ここで固定しておく。
+  const writes = ['write_file', 'edit_file'];
+  const shows = TOOLS.filter((t) => t.showsDiff).map((t) => t.name).sort();
+  check('書き換える道具には、中身を出す印が付いている', JSON.stringify(shows) === JSON.stringify(writes.sort()), shows.join(', '));
+
+  // 読むだけの道具に付けてはいけない（読んだ中身を二重に流すことになる）
+  check(
+    '読むだけの道具には付いていない',
+    !TOOL_MAP.get('read_file').showsDiff && !TOOL_MAP.get('list_dir').showsDiff && !TOOL_MAP.get('run_command').showsDiff
+  );
+
+  // 実行前に作る必要がある。実行後では元の中身が消えていて、差分を作れない
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-diff-'));
+    const file = path.join(dir, 'a.txt');
+    fs.writeFileSync(file, 'いち\nに\nさん\n', 'utf8');
+    const dctx = { root: dir, config: loadConfig(), changedFiles: new Set(), readFiles: new Set(), signal: null };
+    const before = TOOL_MAP.get('write_file').preview({ path: 'a.txt', content: 'いち\nZZ\nさん\n' }, dctx);
+    check('実行前なら、消える行と増える行の両方が出る', /-に/.test(before) && /\+ZZ/.test(before), before);
+
+    // 新規作成のときは、消える行が無いので中身をそのまま見せる
+    const fresh = TOOL_MAP.get('write_file').preview({ path: 'b.txt', content: 'あ\nい\n' }, dctx);
+    check('新規作成では、書く中身が出る', /\+あ/.test(fresh) && /\+い/.test(fresh), fresh);
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ── 確認が本当に出るか ──────────────────────────────────────
