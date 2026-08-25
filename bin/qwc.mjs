@@ -51,6 +51,9 @@ function parseArgs(argv) {
       case '--temp': opts.overrides.temperature = Number(next()); break;
       case '--steps': opts.overrides.maxSteps = Number(next()); break;
       case '--yolo': case '--dangerously-skip-permissions': opts.overrides.autoApprove = true; break;
+      // 「確認なし」を既定として保存してあるとき、その回だけ確認ありに戻すため。
+      // 保存できるようにした以上、抜け道が無いと危ない作業のときに困る。
+      case '--confirm': case '--no-yolo': opts.overrides.autoApprove = false; break;
       case '--accept-edits': opts.overrides.acceptEdits = true; break;
       case '--no-think': opts.overrides.think = false; break;
       case '--show-thinking': opts.overrides.showThinking = 'full'; break;
@@ -91,6 +94,7 @@ ${c.bold('オプション')}
       --temp <数>        創造性の高さ 0〜1（既定: 0.3）
       --steps <数>       1回のお願いで許すツール実行の上限（既定: 40）
       --yolo             確認を全部飛ばす（--dangerously-skip-permissions も同じ）
+      --confirm          その回だけ確認ありに戻す（--no-yolo も同じ）
       --accept-edits     書き換えだけ確認なしにする（コマンドとネットは確認する）
       --no-think         思考モードを切る（速くなるが精度は落ちる）
       --show-thinking    考えている内容を全部表示する
@@ -650,7 +654,16 @@ async function main() {
 
   // ── 対話モード ────────────────────────────────────────────
   banner(config, root);
-  if (config.autoApprove) warn('確認なしモードです（--yolo）。書き換えもコマンドもそのまま実行されます。');
+  if (config.autoApprove) {
+    // 旗で入れたのか、保存された設定で入っているのかを言い分ける。
+    // 前に /save したことを忘れると「なぜ確認が出ないのか」が分からなくなり、
+    // 無防備なまま気づけない。ここが唯一の手がかりになる。
+    warn(
+      opts.overrides.autoApprove
+        ? '確認なしモードです（--yolo）。書き換えもコマンドもそのまま実行されます。'
+        : '確認なしモードです（保存された設定）。書き換えもコマンドもそのまま実行されます。--confirm でこの回だけ戻せます。'
+    );
+  }
   // 鍵が無ければ検索の道具は渡していない。黙って使えないより、理由が分かるほうがよい。
   if (config.net !== false && !loadApiKey()) {
     warn('ネット検索は使えません（ページ取得は使えます）。' + KEY_HELP.split('\n')[0]);
@@ -1107,14 +1120,16 @@ async function handleSlash(text, { agent, config, permissions, root }) {
         think: config.thinkPreference ?? config.think,
         showThinking: config.showThinking,
         maxSteps: config.maxSteps,
-        // 書き換えを毎回確認するかどうかは好みが分かれるので、次回にも持ち越せるようにする。
-        // 確認を**全部**飛ばす設定（autoApprove）は保存しない。
-        // 一度うっかり入れたまま忘れると、以後ずっと無防備になるため、毎回明示してもらう。
-        acceptEdits: config.acceptEdits
+        // 確認をどこまで飛ばすかは好みが分かれるので、次回にも持ち越せるようにする。
+        // 全部飛ばす設定（autoApprove）も保存する ── 2026-08-25 に本人が選択。
+        // 「一度うっかり入れたまま忘れると、以後ずっと無防備になる」危険は残るので、
+        // 起動のたびに保存された設定だと警告し、その回だけ戻せる --confirm を用意してある。
+        acceptEdits: config.acceptEdits,
+        autoApprove: config.autoApprove
       });
       success('いまの設定を次回以降の既定にしました。');
       if (config.autoApprove) {
-        info('確認なしモード（/yolo）は保存していません。必要なときに毎回指定してください。');
+        warn('確認なしモードも保存しました。次からも確認せずに動きます（--confirm でその回だけ戻せます）。');
       }
       return;
     }

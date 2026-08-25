@@ -1900,6 +1900,74 @@ console.log('\nrun_command — 確認のあとで固まらない');
   check('出力の多いコマンドも取りこぼさない', r.output.includes('50000'), r.output.slice(-80));
 }
 
+// ── 確認をどこまで飛ばすかの保存 ──────────────────────────
+//
+// 「毎回ツールの承認を聞かれるのが面倒」なので、/yolo も保存できるようにした。
+// 保存できる以上、忘れたまま無防備にならない手当てが要る。ここで固定するのは3つ。
+//   1. /save で autoApprove が本当に書かれるか
+//   2. 次に起動したとき「保存された設定だ」と分かる形で警告が出るか
+//   3. --confirm でその回だけ確認ありに戻せるか
+// 起動経路を実機のまま通したいので、偽 Ollama を立てて本物の bin/qwc.mjs を動かす。
+console.log('\n確認なしモードの保存と打ち消し');
+{
+  const http = await import('node:http');
+  const { spawn } = await import('node:child_process');
+  const qwcBin = path.join(here, '..', 'bin', 'qwc.mjs');
+
+  // 起動時に叩かれる分だけ返す。中身は問われないので最小限
+  const fake = http.createServer((req, res) => {
+    const body = {
+      '/api/version': { version: '0.20.0' },
+      '/api/tags': { models: [{ name: 'gemma4:26b' }] },
+      '/api/show': { capabilities: ['completion', 'tools', 'thinking'], model_info: {} },
+      '/api/ps': { models: [{ name: 'gemma4:26b', size: 100, size_vram: 100 }] },
+      '/api/generate': { done: true }
+    }[req.url.split('?')[0]] || { done: true };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  });
+  await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+  const host = `http://127.0.0.1:${fake.address().port}`;
+
+  // 本物の設定ファイルを踏まないよう、HOME ごと仮のものに差し替える
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-home-'));
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-work-'));
+  const cfgPath = path.join(home, '.qwythos-code', 'config.json');
+
+  const runQwc = (args, stdin) =>
+    new Promise((resolve) => {
+      const proc = spawn(process.execPath, [qwcBin, '--host', host, ...args], {
+        cwd: work,
+        env: { ...process.env, HOME: home },
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      let seen = '';
+      proc.stdout.on('data', (chunk) => { seen += chunk; });
+      proc.stderr.on('data', (chunk) => { seen += chunk; });
+      proc.stdin.end(stdin);
+      const giveUp = setTimeout(() => proc.kill('SIGKILL'), 20000);
+      proc.on('close', () => { clearTimeout(giveUp); resolve(seen); });
+    });
+
+  const saved = await runQwc([], '/yolo\n/save\n/exit\n');
+  const written = fs.existsSync(cfgPath) ? JSON.parse(fs.readFileSync(cfgPath, 'utf8')) : {};
+  check('/save は確認なしモードも書き込む', written.autoApprove === true, JSON.stringify(written));
+  check('保存したことは黙って済ませない', /確認なしモードも保存しました/.test(saved), saved.slice(-200));
+
+  const again = await runQwc([], '/exit\n');
+  check('次の起動でも確認なしのまま', /確認なしモードです/.test(again), again.slice(0, 300));
+  check('旗ではなく保存された設定だと分かる', /保存された設定/.test(again), again.slice(0, 300));
+
+  const back = await runQwc(['--confirm'], '/exit\n');
+  check('--confirm はその回だけ確認ありに戻す', !/確認なしモードです/.test(back), back.slice(0, 300));
+  const stillSaved = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  check('--confirm を使っても保存した設定は消えない', stillSaved.autoApprove === true);
+
+  fake.close();
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(work, { recursive: true, force: true });
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(`\n合計: ${passed} 件成功 / ${failed} 件失敗\n`);
