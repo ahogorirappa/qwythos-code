@@ -80,12 +80,19 @@ export function renderCommand(command, args) {
   return given ? `${command.body}\n\n${given}` : command.body;
 }
 
+/**
+ * 組み込みのコマンド名。
+ *
+ * 名前のぶつかりを見るのと、Tab の補完に出すのと、両方から使う。
+ * 2か所に別々の一覧を置くと、コマンドを足したときに片方だけ古いままになる。
+ */
+export const BUILTIN_COMMANDS = [
+  'help', 'clear', 'compact', 'model', 'think', 'yolo', 'accept', 'plan',
+  'todo', 'todos', 'commands', 'tools', 'stats', 'files', 'diff', 'undo',
+  'refine', 'login', 'logins', 'logout', 'init', 'save', 'exit', 'quit'
+];
+
 /** `/init` などの組み込みと名前がぶつかっていないか。 */
 export function isReserved(name) {
-  const reserved = new Set([
-    'help', 'clear', 'compact', 'model', 'think', 'yolo', 'tools', 'stats',
-    'files', 'init', 'save', 'exit', 'quit', 'plan', 'todo', 'todos', 'refine', 'accept',
-    'login', 'logins', 'logout', 'commands'
-  ]);
-  return reserved.has(String(name).toLowerCase());
+  return BUILTIN_COMMANDS.includes(String(name).toLowerCase());
 }

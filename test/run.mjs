@@ -36,6 +36,14 @@ import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../sr
 import { buildSystemPrompt } from '../src/prompt.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
 import { startMcp, stopMcp } from '../src/mcp.mjs';
+import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits } from '../src/edits.mjs';
+import { complete, completePath } from '../src/complete.mjs';
+import { createPasteBuffer } from '../src/paste.mjs';
+import { formatTiming, TIMING_FLOOR_MS } from '../src/ui.mjs';
+import { BUILTIN_COMMANDS } from '../src/commands.mjs';
+import { makeCompleter } from '../src/complete.mjs';
+import readline from 'node:readline';
+import { PassThrough } from 'node:stream';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-test-'));
@@ -1512,6 +1520,351 @@ console.log('\n返事を待つ時間');
   }
   angry.close();
   check('サーバーの言い分をそのまま見せる', httpErr.includes('500') && httpErr.includes('model not found'), httpErr);
+}
+
+
+console.log('\n/undo — 書き換えを戻す');
+{
+  const uroot = path.join(root, 'undo');
+  fs.mkdirSync(uroot, { recursive: true });
+  const fresh = () => ({
+    root: uroot,
+    config: ctx.config,
+    changedFiles: new Set(),
+    readFiles: new Set(),
+    editFailures: new Map(),
+    signal: null
+  });
+  const at = (name) => path.join(uroot, name);
+
+  // 新しく作ったファイルは、戻すと消える
+  {
+    const u = fresh();
+    beginTurn(u);
+    await write.run({ path: 'new.js', content: 'const a = 1;\n' }, u);
+    const made = fs.existsSync(at('new.js'));
+    const r = undoLastTurn(u);
+    check(
+      '新しく作ったファイルは、戻すと消える',
+      made && !fs.existsSync(at('new.js')) && r.restored[0]?.removed === true,
+      JSON.stringify(r)
+    );
+    check('戻したファイルは「書き換えたファイル」からも外れる', u.changedFiles.size === 0, [...u.changedFiles].join(','));
+  }
+
+  // 上書きは、前の中身に返る
+  {
+    const u = fresh();
+    fs.writeFileSync(at('keep.js'), 'もとの中身\n', 'utf8');
+    beginTurn(u);
+    await write.run({ path: 'keep.js', content: 'あたらしい中身\n' }, u);
+    undoLastTurn(u);
+    check('上書きしたファイルは、前の中身に返る', fs.readFileSync(at('keep.js'), 'utf8') === 'もとの中身\n');
+  }
+
+  // 1回のお願いで直した複数ファイルは、まとめて戻る
+  {
+    const u = fresh();
+    fs.writeFileSync(at('x.js'), 'x1\n', 'utf8');
+    fs.writeFileSync(at('y.js'), 'y1\n', 'utf8');
+    beginTurn(u);
+    await edit.run({ path: 'x.js', old_string: 'x1', new_string: 'x2' }, u);
+    await edit.run({ path: 'y.js', old_string: 'y1', new_string: 'y2' }, u);
+    const r = undoLastTurn(u);
+    check(
+      '1回のお願いで直した複数ファイルは、まとめて戻る',
+      r.restored.length === 2 &&
+        fs.readFileSync(at('x.js'), 'utf8') === 'x1\n' &&
+        fs.readFileSync(at('y.js'), 'utf8') === 'y1\n',
+      JSON.stringify(r)
+    );
+  }
+
+  // 同じファイルを2回直しても、最初の姿まで返る（後ろから戻すため）
+  {
+    const u = fresh();
+    fs.writeFileSync(at('twice.js'), 'A\n', 'utf8');
+    beginTurn(u);
+    await edit.run({ path: 'twice.js', old_string: 'A', new_string: 'B' }, u);
+    await edit.run({ path: 'twice.js', old_string: 'B', new_string: 'C' }, u);
+    undoLastTurn(u);
+    check('同じファイルを2度直しても、最初の姿まで返る', fs.readFileSync(at('twice.js'), 'utf8') === 'A\n', fs.readFileSync(at('twice.js'), 'utf8'));
+  }
+
+  // お願いが違えば、1回ずつ戻る
+  {
+    const u = fresh();
+    fs.writeFileSync(at('step.js'), '0\n', 'utf8');
+    beginTurn(u);
+    await edit.run({ path: 'step.js', old_string: '0', new_string: '1' }, u);
+    beginTurn(u);
+    await edit.run({ path: 'step.js', old_string: '1', new_string: '2' }, u);
+    undoLastTurn(u);
+    const mid = fs.readFileSync(at('step.js'), 'utf8');
+    undoLastTurn(u);
+    const first = fs.readFileSync(at('step.js'), 'utf8');
+    check('お願いが違えば、1回の /undo で1つぶんだけ戻る', mid === '1\n' && first === '0\n', `${mid}/${first}`);
+    check('戻しきったら、もう戻すものはない', canUndo(u) === false);
+  }
+
+  // そのあと人が触ったファイルには手を出さない
+  {
+    const u = fresh();
+    fs.writeFileSync(at('mine.js'), 'もと\n', 'utf8');
+    beginTurn(u);
+    await write.run({ path: 'mine.js', content: 'モデルが書いた\n' }, u);
+    fs.writeFileSync(at('mine.js'), '本人があとから直した\n', 'utf8');
+    const r = undoLastTurn(u);
+    check(
+      'そのあと本人が触ったファイルは、戻さずに理由を返す',
+      fs.readFileSync(at('mine.js'), 'utf8') === '本人があとから直した\n' &&
+        r.restored.length === 0 &&
+        /別に書き換え/.test(r.skipped[0]?.reason || ''),
+      JSON.stringify(r)
+    );
+  }
+
+  // 同じファイルを何度直しても、報告は1行にまとまる
+  {
+    const u = fresh();
+    fs.writeFileSync(at('many.js'), '1\n', 'utf8');
+    beginTurn(u);
+    await edit.run({ path: 'many.js', old_string: '1', new_string: '2' }, u);
+    await edit.run({ path: 'many.js', old_string: '2', new_string: '3' }, u);
+    await edit.run({ path: 'many.js', old_string: '3', new_string: '4' }, u);
+    const r = undoLastTurn(u);
+    check(
+      '同じファイルを3回直しても、報告は1行',
+      r.restored.length === 1 && fs.readFileSync(at('many.js'), 'utf8') === '1\n',
+      JSON.stringify(r)
+    );
+  }
+
+  // 作ったあとに消されたファイルは、消えたと言う
+  {
+    const u = fresh();
+    beginTurn(u);
+    await write.run({ path: 'temp.js', content: 'x\n' }, u);
+    await edit.run({ path: 'temp.js', old_string: 'x', new_string: 'y' }, u);
+    fs.rmSync(at('temp.js'));
+    const r = undoLastTurn(u);
+    check(
+      'もう無いファイルは「消されています」と言う（1行だけ）',
+      r.skipped.length === 1 && /消されています/.test(r.skipped[0].reason),
+      JSON.stringify(r)
+    );
+  }
+
+  // 読めない形式は控えず、消しにいかない
+  {
+    const u = fresh();
+    fs.writeFileSync(at('bin.dat'), Buffer.from([0x41, 0x00, 0x42]));
+    beginTurn(u);
+    await write.run({ path: 'bin.dat', content: 'テキストで上書き\n' }, u);
+    const r = undoLastTurn(u);
+    check(
+      '読めない形式のファイルは、戻せないと伝えて手を出さない',
+      fs.existsSync(at('bin.dat')) && r.restored.length === 0 && r.skipped.length === 1,
+      JSON.stringify(r)
+    );
+  }
+
+  // 控えの中身を取り違えない（あったのに読めない → 消さない）
+  {
+    const u = fresh();
+    beginTurn(u);
+    recordEdit(u, { path: at('unreadable.js'), before: null, after: 'x', existed: true });
+    const e = u.editLog[0];
+    check('あったのに読めなかったものを「無かった」と丸めない', e.existed === true && e.big === true, JSON.stringify(e));
+  }
+
+  // /clear で控えも消える
+  {
+    const u = fresh();
+    beginTurn(u);
+    await write.run({ path: 'gone.js', content: '1\n' }, u);
+    resetEdits(u);
+    check('/clear のあとは戻すものが残らない', canUndo(u) === false);
+  }
+}
+
+console.log('\n/diff — このセッションの通しの差分');
+{
+  const droot = path.join(root, 'diffsess');
+  fs.mkdirSync(droot, { recursive: true });
+  const d = {
+    root: droot,
+    config: ctx.config,
+    changedFiles: new Set(),
+    readFiles: new Set(),
+    editFailures: new Map(),
+    signal: null
+  };
+  fs.writeFileSync(path.join(droot, 'a.js'), '1\n', 'utf8');
+  beginTurn(d);
+  await edit.run({ path: 'a.js', old_string: '1', new_string: '2' }, d);
+  beginTurn(d);
+  await edit.run({ path: 'a.js', old_string: '2', new_string: '3' }, d);
+  const changes = sessionChanges(d);
+  check(
+    '3回直しても、出発点は最初の姿のまま',
+    changes.length === 1 && changes[0].before === '1\n' && changes[0].after === '3\n',
+    JSON.stringify(changes)
+  );
+
+  beginTurn(d);
+  await write.run({ path: 'b.js', content: 'new\n' }, d);
+  const both = sessionChanges(d);
+  check('新しく作ったファイルは「新規」として並ぶ', both.some((ch) => ch.created && ch.path.endsWith('b.js')), JSON.stringify(both));
+  check('1ファイルだけを指しても引ける', sessionChanges(d, path.join(droot, 'b.js')).length === 1);
+
+  // 戻したファイルは、差分から消える
+  undoLastTurn(d);
+  check('戻したファイルは差分に残らない', !sessionChanges(d).some((ch) => ch.path.endsWith('b.js')), JSON.stringify(sessionChanges(d)));
+}
+
+console.log('\nTab 補完');
+{
+  const croot = path.join(root, 'comp');
+  fs.mkdirSync(path.join(croot, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(croot, 'node_modules'), { recursive: true });
+  fs.writeFileSync(path.join(croot, 'src', 'agent.mjs'), '', 'utf8');
+  fs.writeFileSync(path.join(croot, 'src', 'app.mjs'), '', 'utf8');
+  fs.writeFileSync(path.join(croot, 'readme.md'), '', 'utf8');
+  fs.writeFileSync(path.join(croot, '.hidden'), '', 'utf8');
+
+  const opts = {
+    root: croot,
+    commandNames: () => [...BUILTIN_COMMANDS, 'review'],
+    modelNames: () => ['gemma4:26b', 'qwythos:latest']
+  };
+
+  let [hits, word] = complete('/mo', opts);
+  check('/mo は /model を出す', hits.includes('/model') && word === '/mo', JSON.stringify(hits));
+
+  [hits] = complete('/rev', opts);
+  check('自分で作ったコマンドも候補に入る', hits.includes('/review'), JSON.stringify(hits));
+
+  [hits, word] = complete('/model ge', opts);
+  check('/model の後はモデル名を出す', hits.includes('gemma4:26b') && word === 'ge', JSON.stringify(hits));
+
+  [hits, word] = complete('@src/a', opts);
+  check(
+    '@ はファイルを出し、@ を付けたまま返す',
+    hits.includes('@src/agent.mjs') && hits.includes('@src/app.mjs') && word === '@src/a',
+    JSON.stringify(hits)
+  );
+
+  [hits] = complete('この @sr', opts);
+  check('フォルダは末尾に / を付けて出す', hits.includes('@src/'), JSON.stringify(hits));
+
+  [hits] = complete('@', opts);
+  check('何も打っていないときは node_modules を出さない', !hits.includes('@node_modules/'), JSON.stringify(hits));
+  check('何も打っていないときは隠しファイルも出さない', !hits.includes('@.hidden'), JSON.stringify(hits));
+
+  [hits] = complete('@.h', opts);
+  check('打てば隠しファイルも出る', hits.includes('@.hidden'), JSON.stringify(hits));
+
+  [hits] = complete('@node_', opts);
+  check('自分で打った node_modules は出す', hits.includes('@node_modules/'), JSON.stringify(hits));
+
+  [hits] = complete('ふつうの日本語を打っている', opts);
+  check('ふつうの文章では候補を出さない', hits.length === 0, JSON.stringify(hits));
+
+  check('作業フォルダの外は補完しない', completePath('../', croot).length === 0);
+
+  [hits] = complete('@ない場所/x', opts);
+  check('無いフォルダを指されても落ちない', Array.isArray(hits) && hits.length === 0);
+}
+
+console.log('\nTab 補完 — readline に本当に効くか');
+{
+  // 偽の端末を作って、補完の道すじを本物のまま通す。
+  //
+  // complete() を直接呼ぶ検証だけでは、readline に渡し忘れていても気づけない。
+  // 実際、端末でないと readline は Tab を**ただの文字として**行に入れる。
+  const input = new PassThrough();
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  const output = new PassThrough();
+  output.isTTY = true;
+  output.columns = 100;
+  output.rows = 30;
+  const screen = [];
+  output.on('data', (b) => screen.push(b.toString()));
+
+  const croot = path.join(root, 'comp');
+  const rl = readline.createInterface({
+    input,
+    output,
+    terminal: true,
+    completer: makeCompleter({
+      root: croot,
+      commandNames: () => BUILTIN_COMMANDS,
+      modelNames: () => ['gemma4:26b', 'qwythos:latest']
+    })
+  });
+  const typed = [];
+  rl.on('line', (l) => typed.push(l));
+  const type = (t) => new Promise((r) => { input.write(t); setImmediate(r); });
+
+  await type('@src/ag\t');
+  await type('\n');
+  await type('/mod\t');
+  await type('\n');
+  // 候補が複数のときの作法は bash と同じ。
+  //   1回目 … 共通部分まで入る（ここでは @src/a まで）
+  //   2回目 … それ以上伸びないので、候補の一覧が出る
+  await type('@src/a\t');
+  await type('\t');
+  await type('\n');
+  rl.close();
+
+  check('Tab でファイル名が入る', typed[0] === '@src/agent.mjs', JSON.stringify(typed));
+  check('Tab でコマンド名が入る', typed[1] === '/model', JSON.stringify(typed));
+  check('候補が複数なら、2回目の Tab で一覧が出る', /agent\.mjs/.test(screen.join('')) && /app\.mjs/.test(screen.join('')));
+}
+
+console.log('\n貼り付けのまとめ');
+{
+  const got = [];
+  const buf = createPasteBuffer((text) => got.push(text), { enabled: true, windowMs: 20 });
+  buf.push('1行目');
+  buf.push('2行目');
+  buf.push('3行目');
+  await new Promise((r) => setTimeout(r, 60));
+  check('続けざまに届いた行は1つにまとまる', got.length === 1 && got[0] === '1行目\n2行目\n3行目', JSON.stringify(got));
+
+  const typed = [];
+  const slow = createPasteBuffer((text) => typed.push(text), { enabled: true, windowMs: 20 });
+  slow.push('ひとつめ');
+  await new Promise((r) => setTimeout(r, 60));
+  slow.push('ふたつめ');
+  await new Promise((r) => setTimeout(r, 60));
+  check('間が空いた行は、別々の依頼のまま', typed.length === 2, JSON.stringify(typed));
+
+  const piped = [];
+  const off = createPasteBuffer((text) => piped.push(text), { enabled: false });
+  off.push('a');
+  off.push('b');
+  check('パイプ入力ではまとめない（台本が1つに化けない）', piped.length === 2, JSON.stringify(piped));
+
+  const left = [];
+  const closing = createPasteBuffer((text) => left.push(text), { enabled: true, windowMs: 500 });
+  closing.push('溜まったまま');
+  closing.flush();
+  check('入力が閉じても、溜めた行は捨てない', left.length === 1 && left[0] === '溜まったまま', JSON.stringify(left));
+}
+
+console.log('\n待ち時間の内訳');
+{
+  check('速い応答には内訳を出さない', formatTiming({ totalMs: TIMING_FLOOR_MS - 1, evalMs: 400 }) === '');
+  const t = formatTiming({ totalMs: 24600, loadMs: 6400, promptMs: 2100, evalMs: 16100, promptTokens: 12000, outputTokens: 618 });
+  check('読み込み・前処理・生成に分けて出す', /読み込み 6.4s/.test(t) && /前処理 2.1s/.test(t) && /生成 16.1s/.test(t), t);
+  check('生成の速さ（tok/s）を添える', /38.4 tok\/s/.test(t), t);
+  const warm = formatTiming({ totalMs: 5000, loadMs: 0, promptMs: 1200, evalMs: 3600, outputTokens: 100 });
+  check('常駐していれば読み込みの行は出ない', !/読み込み/.test(warm), warm);
+  check('中身が無ければ何も出さない', formatTiming({}) === '' && formatTiming() === '');
 }
 
 fs.rmSync(root, { recursive: true, force: true });

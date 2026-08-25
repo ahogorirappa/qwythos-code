@@ -84,6 +84,15 @@ export class Spinner {
     this.index = 0;
     this.startedAt = 0;
     this.active = false;
+    // 待たせているあいだに添える一言（経過秒を受け取って文字列を返す）。
+    // 何秒経ったかだけでは「進んでいるのか固まったのか」が分からない。
+    this.hintFn = null;
+  }
+
+  /** 経過秒を見て、そのとき出したい一言を返す関数を登録する。 */
+  hint(fn) {
+    this.hintFn = typeof fn === 'function' ? fn : null;
+    return this;
   }
 
   start(text) {
@@ -92,9 +101,16 @@ export class Spinner {
     this.active = true;
     this.startedAt = Date.now();
     this.timer = setInterval(() => {
-      const sec = ((Date.now() - this.startedAt) / 1000).toFixed(0);
+      const elapsed = (Date.now() - this.startedAt) / 1000;
+      const sec = elapsed.toFixed(0);
       const frame = FRAMES[this.index++ % FRAMES.length];
-      process.stdout.write(`\r\x1b[2K${c.magenta(frame)} ${c.gray(`${this.text} (${sec}s)`)}`);
+      let tail = '';
+      try {
+        tail = this.hintFn ? String(this.hintFn(elapsed) || '') : '';
+      } catch {
+        tail = ''; // 一言のために本編を止めない
+      }
+      process.stdout.write(`\r\x1b[2K${c.magenta(frame)} ${c.gray(`${this.text} (${sec}s)${tail}`)}`);
     }, 90);
     if (this.timer.unref) this.timer.unref();
     return this;
@@ -223,6 +239,42 @@ export function renderTodos(todos) {
 // 取り消し線。使えない端末では色だけで区別が付くので、そのまま返す。
 function strikethrough(text) {
   return useColor ? `\x1b[9m${text}\x1b[29m` : text;
+}
+
+// ── かかった時間の内訳 ──────────────────────────────────────
+//
+// ■ なぜ分けて出すか
+//   ローカルのモデルは、待ち時間の大半が**生成ではないところ**で消える。
+//   モデルの読み込み（初回は分単位）と、送った会話を読む前処理（毎ターン payable）が
+//   合わさって「なぜか今日は遅い」になる。ひとまとめの秒数だけ見せても、
+//   広げすぎた文脈が原因なのか、モデルが載り切っていないのかを切り分けられない。
+//
+// ■ いつ出すか
+//   速いときは出さない。1手が2秒で終わる作業に毎回内訳が付くと、ただの雑音になる。
+
+/** これより短い応答には内訳を出さない（ミリ秒）。 */
+export const TIMING_FLOOR_MS = 2000;
+
+export function formatTiming(stats = {}) {
+  const total = stats.totalMs || 0;
+  if (!total || total < TIMING_FLOOR_MS) return '';
+
+  const secs = (ms) => `${(ms / 1000).toFixed(1)}s`;
+  const parts = [];
+  // 読み込みは、起きたときだけ出す（常駐していれば 0 になる）
+  if ((stats.loadMs || 0) >= 100) parts.push(`読み込み ${secs(stats.loadMs)}`);
+  if ((stats.promptMs || 0) >= 100) {
+    const tokens = stats.promptTokens ? `・${stats.promptTokens.toLocaleString()} tok` : '';
+    parts.push(`前処理 ${secs(stats.promptMs)}${tokens}`);
+  }
+  if ((stats.evalMs || 0) >= 100) {
+    const speed = stats.outputTokens && stats.evalMs
+      ? `・${(stats.outputTokens / (stats.evalMs / 1000)).toFixed(1)} tok/s`
+      : '';
+    parts.push(`生成 ${secs(stats.evalMs)}${speed}`);
+  }
+  if (!parts.length) return '';
+  return `⏱ ${secs(total)}  ${parts.join(' / ')}`;
 }
 
 // ── 差分表示 ────────────────────────────────────────────────

@@ -13,7 +13,10 @@ import { startMcp, stopMcp, loadMcpConfig } from '../src/mcp.mjs';
 import { loadApiKey } from '../src/web.mjs';
 import { resolveMentions, buildMentionBlock } from '../src/mentions.mjs';
 import { anyServerAvailable, serverStatus, stopAll as stopLsp } from '../src/lsp.mjs';
-import { loadCommands, renderCommand, isReserved } from '../src/commands.mjs';
+import { loadCommands, renderCommand, isReserved, BUILTIN_COMMANDS } from '../src/commands.mjs';
+import { makeCompleter } from '../src/complete.mjs';
+import { createPasteBuffer } from '../src/paste.mjs';
+import { undoLastTurn, sessionChanges, canUndo } from '../src/edits.mjs';
 import {
   isAvailable as browserAvailable,
   login as browserLogin,
@@ -23,7 +26,10 @@ import {
 } from '../src/browser.mjs';
 import { newSessionId, saveSession, listSessions, loadSession, latestSessionForRoot } from '../src/session.mjs';
 import { loadHarness, undoHarness, describeHarness } from '../src/harness.mjs';
-import { c, line, out, banner, info, warn, error, success, renderTodos, sendDisplayToStderr, Spinner } from '../src/ui.mjs';
+import {
+  c, line, out, banner, info, warn, error, success, renderTodos,
+  sendDisplayToStderr, Spinner, renderDiff, formatTiming
+} from '../src/ui.mjs';
 import { serve, requestTool, emit, ready, turnEnd } from '../src/embed.mjs';
 
 const VERSION = '0.1.0';
@@ -99,7 +105,7 @@ ${c.bold('オプション')}
   -v, --version          バージョン
 
 ${c.bold('対話中に使えるコマンド')}
-  /help /clear /compact /model /think /yolo /accept /tools /stats /files /refine /init /exit
+  /help /clear /compact /model /think /yolo /accept /tools /stats /files /diff /undo /refine /init /exit
   /login /logins /logout   ログインが要るサイトを読めるようにする
 `);
 }
@@ -123,10 +129,15 @@ ${c.bold('  対話中のコマンド')}
   ${c.cyan('/logout')}    保存したログイン状態をすべて消す
   ${c.cyan('/stats')}     使ったトークン数などの記録
   ${c.cyan('/files')}     このセッションで書き換えたファイル
+  ${c.cyan('/diff')}      このセッションの変更を差分でまとめて見る（例: /diff src/app.js）
+  ${c.cyan('/undo')}      直前のお願いでした書き換えを、まとめて元に戻す
   ${c.cyan('/refine')}    いまのやり取りから、覚えておくことを直す（/refine list ・ /refine undo）
   ${c.cyan('/init')}      プロジェクトを調べて QWYTHOS.md を作る
   ${c.cyan('/save')}      いまの設定を次回以降の既定にする
   ${c.cyan('/exit')}      終了（Ctrl+D でも同じ）
+
+  ${c.gray('Tab で補完できます（/コマンド名 ・ @ファイル名 ・ /model のモデル名）。')}
+  ${c.gray('複数行を貼り付けると、1つの依頼としてまとめて受け取ります。')}
 `);
 }
 
@@ -220,12 +231,20 @@ let pendingAsk = null;
 let inputClosed = false;
 const inputQueue = [];
 
-function createReadline() {
+function createReadline({ root, models = () => [] } = {}) {
   rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
     terminal: Boolean(process.stdin.isTTY),
-    historySize: HISTORY_MAX
+    historySize: HISTORY_MAX,
+    completer: root
+      ? makeCompleter({
+          root,
+          // 対話中に足したコマンドも拾えるよう、そのつど読み直す
+          commandNames: () => [...BUILTIN_COMMANDS, ...loadCommands(root).keys()],
+          modelNames: models
+        })
+      : undefined
   });
 
   // 前に打った依頼を、↑ で呼び出せるようにする。
@@ -235,7 +254,7 @@ function createReadline() {
   }
 
   // 作業中に打たれた行も取りこぼさないよう、いったん溜めておく
-  rl.on('line', (text) => {
+  const deliverLine = (text) => {
     if (pendingAsk) {
       const resolve = pendingAsk;
       pendingAsk = null;
@@ -243,10 +262,17 @@ function createReadline() {
     } else {
       inputQueue.push(text);
     }
-  });
+  };
+
+  // 続けざまに届いた行は、貼り付けとみなして1つにまとめる（paste.mjs）
+  const paste = createPasteBuffer(deliverLine, { enabled: Boolean(process.stdin.isTTY) });
+  rl.on('line', (text) => paste.push(text));
 
   // Ctrl+D や入力の終わりで、待っている質問を解いてループを抜けられるようにする
   rl.on('close', () => {
+    // 溜めたままの行を捨てない。貼り付けた直後に Ctrl+D を押されると、
+    // 15ミリ秒の待ちに入っていたぶんが、そのまま消える
+    paste.flush();
     inputClosed = true;
     if (pendingAsk) {
       const resolve = pendingAsk;
@@ -281,6 +307,11 @@ function ask(question, { remember = false } = {}) {
     const deliver = (value) => {
       // パイプ入力は画面に出ないので、記録として自分で書き出す
       if (value !== null && !process.stdin.isTTY) line(value);
+      // 貼り付けをまとめたときは、そう言っておく。
+      // 黙ってまとめると、1行しか送られていないのか全部届いたのか分からない。
+      if (remember && typeof value === 'string' && value.includes('\n')) {
+        info(`${value.split('\n').length} 行を、1つの依頼としてまとめて受け取りました。`);
+      }
       if (!remember) dropFromHistory(value);
       else rememberInput(value);
       resolve(value);
@@ -490,7 +521,7 @@ async function main() {
   }
 
   const isInteractive = !opts.prompt && !opts.embed;
-  if (isInteractive) createReadline();
+  if (isInteractive) createReadline({ root, models: () => models });
 
   const permissions = new PermissionManager(config, ask);
   const sessionId = newSessionId();
@@ -923,12 +954,26 @@ async function handleSlash(text, { agent, config, permissions, root }) {
 
     case 'stats': {
       const s = agent.stats;
+      const secs = (ms) => `${((ms || 0) / 1000).toFixed(1)} 秒`;
       line();
       line(`  ${c.gray('やり取り')}      ${s.turns} 回`);
       line(`  ${c.gray('ツール実行')}    ${s.toolCalls} 回`);
       line(`  ${c.gray('入力トークン')}  ${s.inputTokens.toLocaleString()}`);
       line(`  ${c.gray('出力トークン')}  ${s.outputTokens.toLocaleString()}`);
       line(`  ${c.gray('会話の長さ')}    ${agent.messages.length} 件`);
+      // 待ち時間の内訳。
+      //
+      // 「今日はなぜか遅い」の中身は、たいてい生成ではなく前処理と読み込みにある。
+      // 合計だけ見せても切り分けられないので、3つに割って出す。
+      if (s.totalMs) {
+        line();
+        line(`  ${c.gray('モデルを待った時間')}  ${secs(s.totalMs)}`);
+        line(`    ${c.gray('うち読み込み')}      ${secs(s.loadMs)}`);
+        line(`    ${c.gray('うち前処理')}        ${secs(s.promptMs)} ${c.gray('（送った会話を読む時間）')}`);
+        line(`    ${c.gray('うち生成')}          ${secs(s.evalMs)}${
+          s.evalMs ? c.gray(`（${(s.outputTokens / (s.evalMs / 1000)).toFixed(1)} tok/s）`) : ''
+        }`);
+      }
       line();
       return;
     }
@@ -937,6 +982,73 @@ async function handleSlash(text, { agent, config, permissions, root }) {
       printChanged(agent);
       if (!agent.changedFileList().length) info('まだ何も書き換えていません。');
       return;
+
+    case 'diff': {
+      // 途中の経過ではなく、始める前と今の違いを出す。
+      // 3回直したファイルを3回ぶん見せられても、結局どうなったのかは分からない。
+      const target = arg ? path.resolve(root, arg) : null;
+      const changes = sessionChanges(agent.ctx, target).filter((ch) => ch.changed);
+      if (!changes.length) {
+        info(arg ? `${arg} は、このセッションでは書き換えていません。` : 'このセッションでの書き換えはまだありません。');
+        return;
+      }
+      for (const ch of changes) {
+        const rel = path.relative(root, ch.path) || ch.path;
+        line();
+        if (ch.unreadable) {
+          line(`${c.brightCyan('●')} ${c.bold(rel)} ${c.gray('— いま読めません')}`);
+          continue;
+        }
+        if (ch.big) {
+          line(`${c.brightCyan('●')} ${c.bold(rel)} ${c.gray('— 大きすぎるか、読めない形式のため差分は出せません')}`);
+          continue;
+        }
+        if (ch.removed) {
+          line(`${c.brightCyan('●')} ${c.bold(rel)} ${c.red('— 削除されています')}`);
+          continue;
+        }
+        const label = ch.created ? c.green('新規') : c.gray('変更');
+        line(`${c.brightCyan('●')} ${c.bold(rel)} ${label}`);
+        line(renderDiff(ch.before ?? '', ch.after ?? ''));
+      }
+      line();
+      return;
+    }
+
+    case 'undo': {
+      // 戻すのは「直近の1手」ではなく「直近のお願い」ぶん。
+      // 1回のお願いで3ファイル直したうちの1つだけ戻しても、半端な状態が残る。
+      if (!canUndo(agent.ctx)) {
+        info('戻せる書き換えがありません（このセッションで書き換えたぶんだけ戻せます）。');
+        return;
+      }
+      const result = undoLastTurn(agent.ctx);
+      if (!result) {
+        info('戻せる書き換えがありません。');
+        return;
+      }
+      for (const r of result.restored) {
+        const rel = path.relative(root, r.path) || r.path;
+        success(r.removed ? `${rel} を消しました（新しく作られたファイルです）` : `${rel} を元に戻しました`);
+      }
+      for (const sk of result.skipped) {
+        const rel = path.relative(root, sk.path) || sk.path;
+        warn(`${rel} はそのままにしました — ${sk.reason}`);
+      }
+      if (!result.restored.length && !result.skipped.length) info('戻すものがありませんでした。');
+      // モデルにも伝える。黙って戻すと、直したつもりのまま次の一手を組み立てる
+      if (result.restored.length) {
+        const names = result.restored.map((r) => path.relative(root, r.path) || r.path).join(', ');
+        agent.messages.push({
+          role: 'user',
+          content:
+            `[The user undid your last set of file changes. These files are back to their previous ` +
+            `content: ${names}. Do not assume your edits are still there. Re-read a file before ` +
+            `changing it again, and ask what to do differently instead of repeating the same edit.]`
+        });
+      }
+      return;
+    }
 
     case 'refine': {
       const harness = loadHarness(root);

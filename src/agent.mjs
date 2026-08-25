@@ -6,9 +6,10 @@ import { TOOL_MAP, toolSchemas, truncateOutput } from './tools.mjs';
 import { buildSystemPrompt, COMPACT_PROMPT } from './prompt.mjs';
 import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
 import { PathError } from './paths.mjs';
+import { beginTurn, resetEdits } from './edits.mjs';
 import {
   c, line, out, clearLine, supportsAnsi, Spinner, toolHeader, toolResultLine,
-  formatMarkdown, termWidth, info, warn
+  formatMarkdown, termWidth, info, warn, formatTiming
 } from './ui.mjs';
 
 // 文字数からだいたいのトークン数を見積もる（日本語混じりを想定して 1トークン≒3文字）
@@ -34,7 +35,7 @@ export class Agent {
     // 道具の呼び出しを本文に書いてしまうモデルか。
     // 1度でもそうと分かったら、以後は本文を出す前に必ず見分ける（画面にJSONを漏らさない）。
     this.writesToolCallsAsText = false;
-    this.stats = { turns: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 };
+    this.stats = { turns: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, loadMs: 0, promptMs: 0, evalMs: 0, totalMs: 0 };
     this.ctx = {
       root,
       config,
@@ -51,6 +52,10 @@ export class Agent {
       mutations: 0,
       // いまのやることリスト。todo_write が書き換える。
       todos: [],
+      // 書き換えの控え（`/undo` と `/diff`）。中身は edits.mjs が面倒を見る。
+      editLog: [],
+      editBaseline: new Map(),
+      turnSeq: 0,
       signal: null
     };
   }
@@ -77,6 +82,9 @@ export class Agent {
     this.ctx.editFailures.clear();
     this.ctx.mutations = 0;
     this.ctx.todos = [];
+    // 会話をまっさらにしたのに `/undo` が前の作業を戻せてしまうと、
+    // 画面に何も残っていないぶん、何が起きたのか分からなくなる。
+    resetEdits(this.ctx);
   }
 
   // ── ひとまとまりのお願いを最後まで処理する ────────────────
@@ -97,6 +105,8 @@ export class Agent {
     if (images.length) message.images = images.map((i) => i.data);
     this.messages.push(message);
     this.stats.turns++;
+    // ここから先の書き換えを、ひとまとまりとして控える（`/undo` は1手ではなく1お願い単位で戻す）
+    beginTurn(this.ctx);
     this.running = true;
     this.abortController = new AbortController();
     this.ctx.signal = this.abortController.signal;
@@ -121,7 +131,7 @@ export class Agent {
 
         let result;
         try {
-          result = await this.streamAssistant();
+          result = await this.streamAssistant({ step, maxSteps: this.config.maxSteps });
         } catch (err) {
           if (err.name === 'AbortError') {
             interrupted = true;
@@ -134,6 +144,11 @@ export class Agent {
         if (result.stats) {
           this.stats.inputTokens += result.stats.promptTokens || 0;
           this.stats.outputTokens += result.stats.outputTokens || 0;
+          // 時間も積む。`/stats` で「今日は前処理ばかりに払っている」が見えるようにするため
+          this.stats.loadMs += result.stats.loadMs || 0;
+          this.stats.promptMs += result.stats.promptMs || 0;
+          this.stats.evalMs += result.stats.evalMs || 0;
+          this.stats.totalMs += result.stats.totalMs || 0;
         }
 
         if (!result.toolCalls.length) {
@@ -372,8 +387,25 @@ export class Agent {
   }
 
   // ── モデルの応答を逐次受け取って画面に出す ────────────────
-  async streamAssistant() {
-    const spinner = new Spinner('考えています').start();
+  async streamAssistant(progress = {}) {
+    // 何手目かを添える。
+    //
+    // 同じ「考えています」が何度も出ると、進んでいるのか同じ所を回っているのか分からない。
+    // 上限（既定40）まで見せるのは、どこで打ち切られるかを先に知らせるため。
+    const stepLabel = Number.isInteger(progress.step)
+      ? `考えています ${progress.step + 1}/${progress.maxSteps ?? this.config.maxSteps}手め`
+      : '考えています';
+    const spinner = new Spinner(stepLabel).start();
+    // 待たされているとき、原因の見当を添える。
+    //
+    // 実測では、1文字目までが長いときの中身はほぼ2つしかない。
+    // モデルの読み込み（冷えていると分単位）と、送った会話の前処理。
+    // どちらも「固まった」ではないと分かるだけで、待てるようになる。
+    spinner.hint((sec) => {
+      if (sec >= 45) return ' — モデルの読み込みか前処理の途中です（/stats で内訳が見られます）';
+      if (sec >= 15) return ' — まだ1文字目が来ていません';
+      return '';
+    });
     let phase = 'idle';
     let lineBuffer = '';
     let thinkStart = Date.now();
@@ -498,6 +530,13 @@ export class Agent {
           lineBuffer = '';
         }
         if (phase === 'content') line();
+        // かかった時間の内訳。速いときは formatTiming が空を返すので、何も出ない。
+        // 任された側（サブエージェント）では出さない。1手ごとに増えると、
+        // 誰の作業の話なのか分からないまま行が積み上がる。
+        if (!this.config.isSubagent && this.config.showTiming !== false) {
+          const timing = formatTiming(ev.stats);
+          if (timing) line(c.gray(`  ${timing}`));
+        }
         final = ev;
       }
     }

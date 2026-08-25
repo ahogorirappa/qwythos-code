@@ -12,6 +12,7 @@ import { findDefinition, findReferences, findHover, anyServerAvailable } from '.
 import { runSubagent } from './subagent.mjs';
 import { pendingRules, runAfterEdit } from './rules.mjs';
 import { loadSkills } from './skills.mjs';
+import { recordEdit } from './edits.mjs';
 
 // 長すぎる出力は真ん中を省いて前後を残す
 export function truncateOutput(text, max) {
@@ -163,6 +164,22 @@ const readFile = {
   }
 };
 
+/**
+ * 控えのために、書き換える前の中身を読む。
+ *
+ * 読めなかったときに null を返すのは「無かった」という意味ではない。
+ * 呼ぶ側が `existed` を別に渡しているので、ここは中身だけを返す。
+ */
+function readForUndo(abs) {
+  try {
+    const buf = fs.readFileSync(abs);
+    if (isProbablyBinary(buf)) return null;
+    return buf.toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
 // ── 2. ファイルを丸ごと書く ──────────────────────────────────
 const writeFile = {
   name: 'write_file',
@@ -201,7 +218,11 @@ const writeFile = {
     const content = String(args.content ?? '');
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     const existed = fs.existsSync(abs);
+    // 上書きする前の姿を控える（`/undo` で戻し、`/diff` で通しの差分を出すため）。
+    // 読めない形（画像などを丸ごと置き換える場合）は控えず、戻せないと伝える側に倒す。
+    const before = existed ? readForUndo(abs) : null;
     fs.writeFileSync(abs, content, 'utf8');
+    recordEdit(ctx, { path: abs, before, after: content, existed });
     ctx.changedFiles.add(abs);
     ctx.readFiles.add(abs);
     ctx.mutations = (ctx.mutations || 0) + 1;
@@ -280,6 +301,7 @@ const editFile = {
       return { isError: true, output: result.error, display: '置き換えできませんでした' };
     }
     fs.writeFileSync(abs, result.text, 'utf8');
+    recordEdit(ctx, { path: abs, before, after: result.text, existed: true });
     ctx.changedFiles.add(abs);
     ctx.mutations = (ctx.mutations || 0) + 1;
     return {

@@ -545,6 +545,9 @@ export async function* chatStream({ cfg, messages, tools, signal }) {
           outputTokens: data.eval_count || 0,
           totalMs: Math.round((data.total_duration || 0) / 1e6),
           evalMs: Math.round((data.eval_duration || 0) / 1e6),
+          // 前処理（送った会話を読む時間）。ローカルでは待ち時間の大半がここなので、
+          // 生成と分けて持たないと「なぜ遅いのか」が最後まで分からない。
+          promptMs: Math.round((data.prompt_eval_duration || 0) / 1e6),
           loadMs: Math.round((data.load_duration || 0) / 1e6),
           doneReason: data.done_reason || 'stop'
         };
