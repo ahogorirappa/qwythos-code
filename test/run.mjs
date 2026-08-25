@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { TOOL_MAP, truncateOutput } from '../src/tools.mjs';
+import { TOOL_MAP, truncateOutput, OUTPUT_DRAIN_MS } from '../src/tools.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
@@ -1865,6 +1865,39 @@ console.log('\n待ち時間の内訳');
   const warm = formatTiming({ totalMs: 5000, loadMs: 0, promptMs: 1200, evalMs: 3600, outputTokens: 100 });
   check('常駐していれば読み込みの行は出ない', !/読み込み/.test(warm), warm);
   check('中身が無ければ何も出さない', formatTiming({}) === '' && formatTiming() === '');
+}
+
+console.log('\nrun_command — 確認のあとで固まらない');
+{
+  // 子の標準入力を /dev/null にしていないと、こちらが閉じない書き込み口を子が握ったままになり、
+  // 入力を待つコマンドが時間切れ（既定 120 秒）まで戻らない。
+  // 実機の「確認に y と答えたあと画面が止まる」の正体がこれだった。
+  let t0 = Date.now();
+  let r = await run.run({ command: 'cat', timeout_ms: 6000 }, ctx);
+  let waited = Date.now() - t0;
+  check('入力を待つコマンドで固まらない', waited < 2000 && r.isError === false, `${waited}ms / ${r.display}`);
+
+  t0 = Date.now();
+  r = await run.run({ command: 'read -p "pw: " x', timeout_ms: 6000 }, ctx);
+  waited = Date.now() - t0;
+  check('パスワードを聞くコマンドでも固まらない', waited < 2000, `${waited}ms`);
+
+  // 裏へ回った孫が出力の口を握ったままだと、シェルだけ殺しても close が上がってこない。
+  // 孫まで止めないと、時間切れを過ぎても永久に戻らない（実測で 20 秒待っても戻らなかった）。
+  t0 = Date.now();
+  r = await run.run({ command: 'sleep 60 & echo started', timeout_ms: 1000 }, ctx);
+  waited = Date.now() - t0;
+  check('裏へ回るコマンドでも時間切れで戻る', waited < 1000 + OUTPUT_DRAIN_MS + 1500, `${waited}ms`);
+  check('時間切れはそう伝える', r.display === '時間切れで停止', r.display);
+
+  // 普通のコマンドの扱いは変えていない
+  t0 = Date.now();
+  r = await run.run({ command: 'echo ok', timeout_ms: 6000 }, ctx);
+  waited = Date.now() - t0;
+  check('普通のコマンドはそのまま通る', r.isError === false && r.output.includes('ok') && waited < 2000, `${waited}ms / ${r.output}`);
+
+  r = await run.run({ command: 'seq 1 50000 | tail -1', timeout_ms: 6000 }, ctx);
+  check('出力の多いコマンドも取りこぼさない', r.output.includes('50000'), r.output.slice(-80));
 }
 
 fs.rmSync(root, { recursive: true, force: true });

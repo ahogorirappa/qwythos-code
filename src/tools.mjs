@@ -774,14 +774,30 @@ const runCommand = {
   }
 };
 
+// 止めたコマンドの出力を、どれだけ待ってから諦めるか（ミリ秒）。
+//
+// 本人が終わっても、出力の口を握った孫が残っていると `close` は上がってこない。
+// 普通のコマンドなら終了から数ミリ秒で閉じるので、この長さで足りる。
+export const OUTPUT_DRAIN_MS = 2000;
+
 function runProcess(command, argv, { cwd, timeoutMs, shell = false, signal } = {}) {
   return new Promise((resolve) => {
-    const child = argv
-      ? spawn(command, argv, { cwd })
-      : spawn(command, { cwd, shell: true });
+    // 標準入力は /dev/null につなぐ。
+    //
+    // 既定の 'pipe' のままだと、こちらが閉じない書き込み口を子が握ったままになる。
+    // すると入力を待つコマンド（cat / git commit / ssh / パスワードを聞くもの）が
+    // 永久に読み待ちになり、時間切れまで画面が止まる。実測で `cat` が 120 秒まるごと固まった。
+    // /dev/null なら最初の読みで終端が返るので、待たずに終わる。
+    //
+    // detached を立てるのは、始末するときに孫まで届かせるため。
+    // shell: true の子は `/bin/sh` で、本当のコマンドはその下にいる。
+    // sh だけ殺しても本体は生き残るので、グループごと止められるようにしておく。
+    const options = { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true };
+    const child = argv ? spawn(command, argv, options) : spawn(command, { ...options, shell: true });
     let output = '';
     let timedOut = false;
     let settled = false;
+    let exitCode = null;
 
     const limit = 400000;
     const append = (chunk) => {
@@ -790,21 +806,42 @@ function runProcess(command, argv, { cwd, timeoutMs, shell = false, signal } = {
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);
 
+    // 子とその子孫を、まとめて止める。
+    // detached を立ててあるので子はグループ長になっており、
+    // マイナスの PID を渡すと、そのグループ全員に届く。
+    const killTree = () => {
+      if (!child.pid) return;
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        // グループがもう無いときはここに来る。単体で試して終わり
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* すでに終了している */
+        }
+      }
+    };
+
+    // 止めたのに `close` が来ないことがある。
+    // 出力の口を握った孫が残っていると、そこが閉じるまで `close` は上がってこない
+    // （`npm run dev &` のように裏へ回るコマンドで実際に起きる）。
+    // 待ち続けると対話ごと固まるので、少しだけ待って自分で切り上げる。
+    let drainTimer = null;
+    const drainSoon = () => {
+      if (settled || drainTimer) return;
+      drainTimer = setTimeout(() => finish(exitCode), OUTPUT_DRAIN_MS);
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* すでに終了している */
-      }
+      killTree();
+      drainSoon();
     }, timeoutMs || 120000);
 
     const onAbort = () => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* noop */
-      }
+      killTree();
+      drainSoon();
     };
     signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -812,6 +849,7 @@ function runProcess(command, argv, { cwd, timeoutMs, shell = false, signal } = {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (drainTimer) clearTimeout(drainTimer);
       signal?.removeEventListener('abort', onAbort);
       resolve({ code, output, timedOut });
     };
@@ -820,7 +858,13 @@ function runProcess(command, argv, { cwd, timeoutMs, shell = false, signal } = {
       output += `\n${err.message}`;
       finish(127);
     });
-    child.on('close', (code) => finish(code ?? 0));
+    // exit は本人が終わった時点、close は出力の口が全部閉じた時点。
+    // 孫が残っていると close だけ来ないので、exit を見たら締め切りを用意しておく。
+    child.on('exit', (code, sig) => {
+      exitCode = code ?? (sig ? 137 : 0);
+      drainSoon();
+    });
+    child.on('close', (code) => finish(code ?? exitCode ?? 0));
   });
 }
 
