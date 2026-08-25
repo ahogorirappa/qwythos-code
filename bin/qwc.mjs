@@ -92,7 +92,7 @@ ${c.bold('オプション')}
       --host <URL>       Ollama の場所（既定: http://localhost:11434）
       --ctx <数>         文脈の広さ（既定: 32768）
       --temp <数>        創造性の高さ 0〜1（既定: 0.3）
-      --steps <数>       1回のお願いで許すツール実行の上限（既定: 40）
+      --steps <数>       1回のお願いで許すツール実行の上限（既定: 200）
       --yolo             確認を全部飛ばす（--dangerously-skip-permissions も同じ）
       --confirm          その回だけ確認ありに戻す（--no-yolo も同じ）
       --accept-edits     書き換えだけ確認なしにする（コマンドとネットは確認する）

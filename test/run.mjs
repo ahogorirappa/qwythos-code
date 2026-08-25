@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TOOL_MAP, truncateOutput, OUTPUT_DRAIN_MS } from '../src/tools.mjs';
-import { loadConfig } from '../src/config.mjs';
+import { DEFAULT_CONFIG } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
 import { salvageToolCalls, chatStream } from '../src/ollama.mjs';
@@ -47,9 +47,16 @@ import { PassThrough } from 'node:stream';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-test-'));
+// 検証は「出荷時にどう振る舞うか」を見るものなので、設定は既定値から作る。
+//
+// ここで loadConfig() を使うと **本人の ~/.qwythos-code/config.json を読んでしまう**。
+// 実際 autoApprove を保存したとたん「既定では確認する」等が5件落ちた。
+// 毎回コピーを返すのは、どこかで書き換えられても他へ漏れないようにするため。
+const baseConfig = () => ({ ...DEFAULT_CONFIG });
+
 const ctx = {
   root,
-  config: loadConfig(),
+  config: baseConfig(),
   changedFiles: new Set(),
   readFiles: new Set(),
   signal: null
@@ -251,7 +258,7 @@ console.log('\nコマンド実行');
 
 console.log('\n確認が要るコマンドの判定');
 {
-  const perms = new PermissionManager(loadConfig(), async () => 'n');
+  const perms = new PermissionManager(baseConfig(), async () => 'n');
   const cases = [
     ['ls -la', true], ['git status', true], ['pwd', true], ['cat README.md', true],
     ['rm -rf /', false], ['npm test', false], ['git push', false],
@@ -530,9 +537,9 @@ console.log('\nやったと言い張ったときの促し（ループの往復�
   const mkAgent = (script) =>
     new ScriptedAgent(
       {
-        config: { ...loadConfig(), maxSteps: 6, isSubagent: true },
+        config: { ...baseConfig(), maxSteps: 6, isSubagent: true },
         root,
-        permissions: new PermissionManager(loadConfig(), async () => 'n')
+        permissions: new PermissionManager(baseConfig(), async () => 'n')
       },
       script
     );
@@ -647,7 +654,7 @@ console.log('\nやったと言い張ったときの促し（ループの往復�
 // 全部飛ばす（--yolo）と毎回聞かれるの間に、書き換えだけ飛ばす段階を置いてある。
 console.log('\n確認を飛ばす段階');
 {
-  const mk = (over) => new PermissionManager({ ...loadConfig(), ...over }, async () => 'n');
+  const mk = (over) => new PermissionManager({ ...baseConfig(), ...over }, async () => 'n');
 
   const strict = mk({});
   check('既定では、書き換えもコマンドも確認する', !strict.autoAllowed('edit_file') && !strict.autoAllowed('run_command'));
@@ -665,7 +672,7 @@ console.log('\n確認を飛ばす段階');
 
   // 実際に確認をとる経路でも同じ判断になっているか（判定だけ直して経路が古い、を防ぐ）
   const asked = [];
-  const spy = new PermissionManager({ ...loadConfig(), acceptEdits: true }, async (q) => {
+  const spy = new PermissionManager({ ...baseConfig(), acceptEdits: true }, async (q) => {
     asked.push(q);
     return 'n';
   });
@@ -698,7 +705,7 @@ console.log('\n差分表示');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-diff-'));
     const file = path.join(dir, 'a.txt');
     fs.writeFileSync(file, 'いち\nに\nさん\n', 'utf8');
-    const dctx = { root: dir, config: loadConfig(), changedFiles: new Set(), readFiles: new Set(), signal: null };
+    const dctx = { root: dir, config: baseConfig(), changedFiles: new Set(), readFiles: new Set(), signal: null };
     const before = TOOL_MAP.get('write_file').preview({ path: 'a.txt', content: 'いち\nZZ\nさん\n' }, dctx);
     check('実行前なら、消える行と増える行の両方が出る', /-に/.test(before) && /\+ZZ/.test(before), before);
 
@@ -832,7 +839,7 @@ console.log('\nフォルダごとの決まりごと');
   put('rules/deep/target.js', 'const x = 1;\n');
   put('rules/plain.js', 'const y = 2;\n');
 
-  const rulesCtx = { ...ctx, config: loadConfig(), deliveredRules: new Set() };
+  const rulesCtx = { ...ctx, config: baseConfig(), deliveredRules: new Set() };
 
   let r = await read.run({ path: 'rules/deep/target.js' }, rulesCtx);
   check('近いフォルダの決まりごとを渡す', r.output.includes('ここでは英語で書くこと'), r.output.slice(-200));
@@ -847,7 +854,7 @@ console.log('\nフォルダごとの決まりごと');
 
   // 作業フォルダ直下のものは最初から指示文に入っているので、ここでは渡さない
   put('QWYTHOS.md', 'いちばん上の決まりごと。');
-  const freshCtx = { ...ctx, config: loadConfig(), deliveredRules: new Set() };
+  const freshCtx = { ...ctx, config: baseConfig(), deliveredRules: new Set() };
   r = await read.run({ path: 'rules/plain.js' }, freshCtx);
   check('いちばん上のものは二重に渡さない', !r.output.includes('いちばん上の決まりごと'));
   check('途中のフォルダのものは渡す', r.output.includes('このフォルダは日本語で書くこと'));
@@ -856,7 +863,7 @@ console.log('\nフォルダごとの決まりごと');
 // ── 書き換えたあとに走らせる処理 ────────────────────────────
 console.log('\n書き換えたあとに走らせる処理');
 {
-  const hookCtx = { ...ctx, config: loadConfig(), deliveredRules: new Set() };
+  const hookCtx = { ...ctx, config: baseConfig(), deliveredRules: new Set() };
 
   put('.qwythos/hooks.json', JSON.stringify({ afterEdit: 'echo 整えました $QWC_FILE_RELATIVE' }));
   let r = await write.run({ path: 'hooked.js', content: 'const a = 1;\n' }, hookCtx);
@@ -1966,6 +1973,48 @@ console.log('\n確認なしモードの保存と打ち消し');
   fake.close();
   fs.rmSync(home, { recursive: true, force: true });
   fs.rmSync(work, { recursive: true, force: true });
+}
+
+// ── ツールの往復の上限 ──────────────────────────────────────
+//
+// 40 では実作業で足りず、途中で壁に当たって「続けて」と打ち直すことになっていた。
+// 上限そのものより「どこかに 40 が焼き付いていないか」が怖いので、
+// モデルも道具も台本に差し替えて、ループの往復そのものを数える。
+console.log('\nツールの往復の上限');
+{
+  // ひたすら道具を呼び続けるだけの偽モデル。道具の中身は問わないので実行もしない
+  class LoopingAgent extends Agent {
+    constructor(opts) {
+      super(opts);
+      this.steps = 0;
+    }
+    async streamAssistant() {
+      this.steps++;
+      return {
+        message: { role: 'assistant', content: '' },
+        toolCalls: [{ name: 'list_dir', args: { path: '.' }, id: `c${this.steps}` }],
+        stats: null
+      };
+    }
+    async executeTool() {
+      return { output: 'ok', denied: false };
+    }
+  }
+
+  const stepsUntilStop = async (maxSteps) => {
+    const agent = new LoopingAgent({
+      // isSubagent にしておくと、上限に当たったときの画面向けの警告が出ない
+      config: { ...baseConfig(), maxSteps, isSubagent: true },
+      root,
+      permissions: new PermissionManager(baseConfig(), async () => 'n')
+    });
+    await agent.runTurn('ずっと道具を呼び続けて');
+    return agent.steps;
+  };
+
+  check('既定の上限は 200', baseConfig().maxSteps === 200, String(baseConfig().maxSteps));
+  check('40 手を超えても止まらない', (await stepsUntilStop(50)) === 50);
+  check('上限は config の数どおりに効く', (await stepsUntilStop(7)) === 7);
 }
 
 fs.rmSync(root, { recursive: true, force: true });
