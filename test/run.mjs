@@ -14,6 +14,7 @@ import {
   claimsWorkDone,
   looksLikeFileRewrite,
   recommendsWithoutActing,
+  QUIET_AFTER_MS,
   Agent
 } from '../src/agent.mjs';
 import { TOOLS, activeTools } from '../src/tools.mjs';
@@ -2051,6 +2052,53 @@ console.log('\nツールの往復の上限');
   check('既定の上限は 200', baseConfig().maxSteps === 200, String(baseConfig().maxSteps));
   check('40 手を超えても止まらない', (await stepsUntilStop(50)) === 50);
   check('上限は config の数どおりに効く', (await stepsUntilStop(7)) === 7);
+}
+
+// ── 出はじめたあとの無音 ────────────────────────────────────
+//
+// Ollama は道具の呼び出しを書き終えるまで送ってこないので、途中で長い無音が入る。
+// 1文字目までは spinner が見ているが、そこから先は誰も見ておらず、画面が固まって見えた。
+// 無音のあいだ待ち表示を戻す仕掛けを足したので、それが**中身を壊していない**ことを固定する。
+// （表示そのものは端末でないと出ないため、ここで見るのは素通しになっているかどうか）
+console.log('\n出はじめたあとに黙り込んでも取りこぼさない');
+{
+  const http = await import('node:http');
+
+  const gap = QUIET_AFTER_MS + 300;
+  const slow = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    res.write(`${JSON.stringify({ message: { content: 'こんに' } })}\n`);
+    // ここで黙り込む＝道具を組み立てているあいだに相当する
+    setTimeout(() => {
+      res.write(`${JSON.stringify({ message: { content: 'ちは' } })}\n`);
+      res.end(`${JSON.stringify({ done: true, prompt_eval_count: 5, eval_count: 2 })}\n`);
+    }, gap);
+  });
+  await new Promise((r) => slow.listen(0, '127.0.0.1', r));
+  const port = slow.address().port;
+
+  const agent = new Agent({
+    config: {
+      ...baseConfig(),
+      host: `http://127.0.0.1:${port}`,
+      model: 'x',
+      isSubagent: true,     // 待ち時間の内訳を出さない
+      showThinking: 'off',
+      maxSteps: 2
+    },
+    root,
+    permissions: new PermissionManager(baseConfig(), async () => 'n')
+  });
+
+  const t0 = Date.now();
+  await agent.runTurn('こんにちは');
+  const waited = Date.now() - t0;
+  const said = agent.messages.filter((m) => m.role === 'assistant').map((m) => m.content).join('');
+
+  check('無音をはさんでも本文はつながる', said.includes('こんにちは'), said);
+  check('無音のぶんは待つ（早すぎず）', waited >= gap, `${waited}ms`);
+  check('無音が明けたら普通に終わる', waited < gap + 5000, `${waited}ms`);
+  slow.close();
 }
 
 fs.rmSync(root, { recursive: true, force: true });

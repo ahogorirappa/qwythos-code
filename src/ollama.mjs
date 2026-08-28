@@ -56,6 +56,16 @@ export function postStream({ url, payload, signal, firstTokenMs = FIRST_TOKEN_MS
       }
     );
 
+    // つながりが切れたことに、時間切れを待たずに気づけるようにする。
+    //
+    // **無音そのものは正常**で、Ollama は道具の呼び出しを書き終えるまで
+    // 何も送ってこない。だから「黙っていること」を死んだ証拠にはできない。
+    // 見たいのは「相手がもういないこと」なので、そこは TCP に見張らせる。
+    // Ollama が落ちれば、無音の見切り（stallMs）を待たずにここでエラーになる。
+    req.on('socket', (socket) => {
+      socket.setKeepAlive(true, 30000);
+    });
+
     req.setTimeout(firstTokenMs, () => {
       req.destroy(new OllamaError(waitedTooLong(firstTokenMs)));
     });

@@ -13,6 +13,11 @@ import {
 } from './ui.mjs';
 
 // 文字数からだいたいのトークン数を見積もる（日本語混じりを想定して 1トークン≒3文字）
+// 出はじめたあと、これだけ無音が続いたら待ち表示を戻す。
+// 生成中の普通の切れ目（実測で1秒未満）では出さず、
+// 道具を組み立てている本当の無音だけを拾える長さにしてある。
+export const QUIET_AFTER_MS = 2000;
+
 function estimateTokens(messages) {
   let chars = 0;
   for (const m of messages) {
@@ -422,12 +427,62 @@ export class Agent {
       line(formatMarkdown(text));
     };
 
-    const events = chatStream({
+    const rawEvents = chatStream({
       cfg: this.config,
       messages: this.messages,
       tools: toolSchemas(this.ctx.config),
       signal: this.abortController.signal
     });
+
+    // 出はじめたあとにも、黙り込む区間がある。
+    //
+    // **Ollama は道具の呼び出しを、書き終えるまで送ってこない。**
+    // そのあいだ1バイトも届かないので、画面は本当に止まって見える
+    // （実測で、道具1つ返すだけのやり取りに14秒の無音があった。
+    // 大きなファイルの書き込みなら分単位になる）。
+    // 1文字目までは上の spinner が見ているが、そこから先は誰も見ていなかった。
+    // 静かになったら待ち表示を戻して、生きていることを示す。
+    let quiet = null;
+    let quietTimer = null;
+    const quietStop = () => {
+      if (quietTimer) {
+        clearTimeout(quietTimer);
+        quietTimer = null;
+      }
+      if (quiet) {
+        quiet.stop();
+        quiet = null;
+      }
+    };
+    const events = (async function* () {
+      const iter = rawEvents[Symbol.asyncIterator]();
+      let started = false;
+      try {
+        for (;;) {
+          // 1文字目までは上の spinner の担当。二重に出さない
+          if (started) {
+            quietTimer = setTimeout(() => {
+              quiet = new Spinner('道具を組み立てています').start();
+              quiet.hint((sec) =>
+                sec >= 20 ? ' — 書き終えるまで Ollama は送ってこないので、無音のままです' : ''
+              );
+            }, QUIET_AFTER_MS);
+            if (quietTimer.unref) quietTimer.unref();
+          }
+          let next;
+          try {
+            next = await iter.next();
+          } finally {
+            quietStop();
+          }
+          if (next.done) return;
+          started = true;
+          yield next.value;
+        }
+      } finally {
+        quietStop();
+      }
+    })();
 
     let final = null;
 
@@ -542,6 +597,7 @@ export class Agent {
     }
 
     spinner.stop();
+    quietStop();
     if (!final) throw new Error('モデルからの応答が途中で切れました。');
     return final;
   }
