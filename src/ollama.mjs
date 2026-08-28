@@ -17,7 +17,7 @@ export class OllamaError extends Error {}
 //     文脈枠の取り直しが挟まると、最初の1文字までが分単位になる。そこで踏む。
 //     やり取りが長い2か所だけ node:http で投げ直し、待ち方をこちらで決める。
 const FIRST_TOKEN_MS = 15 * 60 * 1000; // 最初の1文字が出るまで（長い文脈の下ごしらえを待つ）
-const STALL_MS = 3 * 60 * 1000;        // 出はじめたあとで途切れたとき
+const STALL_MS = 10 * 60 * 1000;       // 出はじめたあとで途切れたとき（config.mjs に理由）
 
 /**
  * JSON を POST して、応答を Node の Readable のまま返す。
@@ -107,7 +107,11 @@ async function* withStallTimeout(res, stallMs = STALL_MS) {
 }
 
 function stalled(ms) {
-  return `Ollama からの返事が ${Math.round(ms / 1000)} 秒とぎれたので、待つのをやめました。`;
+  return (
+    `Ollama からの返事が ${Math.round(ms / 60000)} 分とぎれたので、待つのをやめました。` +
+    'Ollama は道具の呼び出しを書き終えるまで送ってこないので、長い引数を組み立てている' +
+    'あいだは無音になります。心当たりがあるなら stallMs を伸ばしてください。'
+  );
 }
 
 /** 応答の中身を最後まで文字列で受け取る */

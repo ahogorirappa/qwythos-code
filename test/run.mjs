@@ -1509,6 +1509,42 @@ console.log('\n返事を待つ時間');
   check('見切るまで待ちすぎない', stallWait < 3000, `${stallWait}ms`);
   check('そこまでに届いた分は受け取れている', partial === 'とちゅう', partial);
 
+  // ここが 2026-08-28 に踏んだところ。
+  // **Ollama は道具の呼び出しを、書き終えるまで送ってこない。**
+  // 組み立てているあいだ1バイトも届かないので、見切りが短いと
+  // 動いている作業のほうを殺す。実測で、正常に終わったやり取りが
+  // Ollama 側では 1m22s〜4m46s かかっていた（3分の見切りでは届かない）。
+  const buffering = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    res.write(`${JSON.stringify({ message: { content: '考えます' } })}\n`);
+    // 道具の引数を組み立てているあいだの無音
+    setTimeout(() => {
+      res.write(
+        `${JSON.stringify({
+          message: { tool_calls: [{ function: { name: 'read_file', arguments: { path: 'a.js' } } }] }
+        })}\n`
+      );
+      res.end(`${JSON.stringify({ done: true })}\n`);
+    }, 500);
+  });
+  await new Promise((r) => buffering.listen(0, '127.0.0.1', r));
+  const bufPort = buffering.address().port;
+
+  let toolName = null;
+  try {
+    for await (const ev of chatStream({
+      cfg: { host: `http://127.0.0.1:${bufPort}`, model: 'x', firstTokenMs: 5000, stallMs: 2000 },
+      messages: [{ role: 'user', content: 'hi' }]
+    })) {
+      if (ev.type === 'done') toolName = ev.toolCalls?.[0]?.name ?? null;
+    }
+  } catch (err) {
+    toolName = `打ち切られた: ${err.message}`;
+  }
+  buffering.close();
+  check('無音が見切りより短ければ、待って受け取る', toolName === 'read_file', String(toolName));
+  check('既定の見切りは10分', DEFAULT_CONFIG.stallMs === 10 * 60 * 1000, String(DEFAULT_CONFIG.stallMs));
+
   // エラーはエラーとして見せる（黙って握りつぶさない）
   const angry = http.createServer((req, res) => {
     res.writeHead(500, { 'Content-Type': 'text/plain' });
