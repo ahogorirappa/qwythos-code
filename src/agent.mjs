@@ -4,6 +4,7 @@ import path from 'node:path';
 import { chatStream, chatOnce } from './ollama.mjs';
 import { TOOL_MAP, toolSchemas, truncateOutput } from './tools.mjs';
 import { buildSystemPrompt, COMPACT_PROMPT } from './prompt.mjs';
+import { classifyInput, SMALL_TALK_HINT } from './smalltalk.mjs';
 import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
 import { PathError } from './paths.mjs';
 import { beginTurn, resetEdits } from './edits.mjs';
@@ -75,6 +76,38 @@ export class Agent {
     if (this.abortController) this.abortController.abort();
   }
 
+  /**
+   * 「手を動かせ」と促してよい場面か。
+   *
+   * 促しは4種類あるが、どれも「言うだけで動かないモデル」を押すためのもので、
+   * 押してよい前提は「作業を頼まれている」こと。雑談にはその前提が無いので、
+   * 押すと頼まれてもいないことを無理にやらせることになる。
+   *
+   * 計画モードと調べもの係の扱いは、これまでどおり促しごとに決める（下の4つ目）。
+   * ここでまとめて外すと、書き換えたと嘘をついたときに誰も正せなくなる。
+   */
+  shouldNudgeToAct() {
+    return !(this.ctx.smallTalk || this.config.chatMode);
+  }
+
+  /**
+   * その道具の呼び出しが、外の世界を変えてしまうか。
+   *
+   * 雑談として受け取った発言でこれに手が伸びたら、その場で人に聞く。
+   * 読むだけの道具（read_file・search_files・web_fetch など）は素通しにする。
+   * 雑談の最中に「あのファイルどうなってた？」と聞けなくなるほうが困るし、
+   * 読むだけなら外したときの実害が無い。
+   */
+  touchesTheWorld(tool, args) {
+    if (tool.name === 'write_file' || tool.name === 'edit_file') return true;
+    if (tool.name === 'run_command') {
+      // 聞く相手がいなければ、読み取り専用かどうかも判断させない（そもそもここへ来ない）
+      if (!this.permissions) return true;
+      return !this.permissions.isSafeCommand(String(args?.command || ''));
+    }
+    return false;
+  }
+
   rebuildSystemPrompt() {
     this.systemPrompt = buildSystemPrompt({ root: this.root, config: this.config });
     this.messages[0] = { role: 'system', content: this.systemPrompt };
@@ -106,7 +139,22 @@ export class Agent {
       if (m.role === 'user' && m.images) delete m.images;
     }
 
-    const message = { role: 'user', content: userInput };
+    // 作業の依頼か、そうでないかを、その場で見分ける。
+    //
+    // 添えるのは**発言の末尾**で、いちばん上の指示文も道具の一覧も動かさない。
+    // 上を動かすと会話を丸ごと読み直すことになり、往復のたびに数秒持っていかれる。
+    // /chat と /plan で自分から入っているときは、人が決めた側を優先して判定しない。
+    // 別のアプリの中で動いているとき（--embed）もしない。
+    // あちらには聞く相手がいない（permissions が無い）ので、外したときに取り返せない。
+    const skipAuto =
+      this.config.chatMode || this.config.planMode || this.config.isSubagent || !this.permissions;
+    const auto = skipAuto ? { smallTalk: false, reason: '' } : classifyInput(userInput);
+    this.ctx.smallTalk = auto.smallTalk;
+    // 一度「作業です」と答えてもらったら、その発言の残りはもう聞かない
+    this.ctx.smallTalkAsked = false;
+    if (auto.smallTalk) info(`雑談として受け取ります（${auto.reason}）。書き換えるときは確認します。`);
+
+    const message = { role: 'user', content: auto.smallTalk ? userInput + SMALL_TALK_HINT : userInput };
     if (images.length) message.images = images.map((i) => i.data);
     this.messages.push(message);
     this.stats.turns++;
@@ -184,7 +232,7 @@ export class Agent {
 
           // 「これからやります」と書くだけで手を動かさないモデルがある。
           // 待っていても永遠に動かないので、その場で促す。
-          if (said && nudges < (this.config.maxNudges ?? 5) && describesIntentWithoutActing(said)) {
+          if (said && this.shouldNudgeToAct() && nudges < (this.config.maxNudges ?? 5) && describesIntentWithoutActing(said)) {
             nudges++;
             info('手順を述べただけで実行していないので、促しました。');
             this.messages.push({
@@ -204,6 +252,7 @@ export class Agent {
           // 実際に書き換え・実行が起きた回数と突き合わせる。数のほうは嘘をつかない。
           if (
             said &&
+            this.shouldNudgeToAct() &&
             nudges < (this.config.maxNudges ?? 5) &&
             (this.ctx.mutations || 0) === mutationsAtStart &&
             claimsWorkDone(said)
@@ -223,7 +272,11 @@ export class Agent {
 
           // 直した全文を画面に貼っただけで、保存していない場合。
           // 上の2つと違い、本人は何も主張しない（コードを出しただけ）ので、文章では捕まらない。
-          if (nudges < (this.config.maxNudges ?? 5) && (this.ctx.mutations || 0) === mutationsAtStart) {
+          if (
+            this.shouldNudgeToAct() &&
+            nudges < (this.config.maxNudges ?? 5) &&
+            (this.ctx.mutations || 0) === mutationsAtStart
+          ) {
             const target = looksLikeFileRewrite(said, this.ctx);
             if (target) {
               nudges++;
@@ -246,6 +299,7 @@ export class Agent {
           // **計画モードと調べもの係では出さない。**あちらは直さないのが仕事なので、
           // 勧めて終わるのが正しい答えになる。ここで催促すると、できないことを強いることになる。
           if (
+            this.shouldNudgeToAct() &&
             nudges < (this.config.maxNudges ?? 5) &&
             !this.config.planMode &&
             !this.config.isSubagent &&
@@ -671,6 +725,60 @@ export class Agent {
       if (problem) {
         toolResultLine('そのままでは適用できません', true);
         return { output: problem, denied: false };
+      }
+    }
+
+    // 雑談として受け取った発言の途中で、外に影響する道具に手が伸びたとき。
+    //
+    // 見分けはルールなので、いつか必ず外す。外したときに黙って書き換えるのが
+    // いちばん困るので、ここで一度だけ人に聞く。y なら「この発言は作業だった」と
+    // みなして、その発言の残りではもう聞かない。
+    //
+    // 確認なしモード（--yolo）でも聞く。あれは「頼んだ作業を任せる」という意味で、
+    // 頼んでもいない雑談でファイルを変えてよい、という意味ではない。
+    if (this.ctx.smallTalk && this.touchesTheWorld(tool, call.args)) {
+      if (this.ctx.smallTalkAsked) {
+        toolResultLine('雑談として受け取っているので実行しません', true);
+        return {
+          output:
+            'The user already said this was not a work request. Do not call this tool again. ' +
+            'Answer in words instead, and say what you would change if they want it done.',
+          denied: true
+        };
+      }
+      this.ctx.smallTalkAsked = true;
+      line();
+      line(`${c.brightYellow('┌')} ${c.bold('作業として進めますか')}`);
+      line(`${c.brightYellow('│')} ${c.gray(`雑談だと思って受け取りましたが、${tool.name} を使おうとしています。`)}`);
+      line(`${c.brightYellow('└')} ${c.gray('y = 作業として進める / n = 答えるだけにしてもらう')}`);
+      // 分からない答えは聞き直す。黙って「やめる」に倒すと、
+      // 「うん」と答えたのに何も起きなかった、という形で伝わる（実際にそうなった）。
+      // 日本語で聞いているので、日本語の返事も受ける。
+      let yes = false;
+      for (;;) {
+        const raw = await this.permissions.ask(`${c.brightYellow('  →')} [y/n] `);
+        // 入力が閉じている（-p など）ときは、聞けないので「やめる」扱い
+        if (raw === null || raw === undefined) break;
+        const answer = String(raw).trim().toLowerCase();
+        if (/^(y|yes|うん|はい|ok|おk|そう|お願い|おねがい)/.test(answer) || answer === '') {
+          yes = true;
+          break;
+        }
+        if (/^(n|no|いや|いいえ|ちがう|違う|やめ)/.test(answer)) break;
+        out(c.gray('  y（作業として進める） か n（答えるだけ） で答えてください。\n'));
+      }
+      if (yes) {
+        // ここから先は普通の作業。書き換えの確認は、いつもどおり別に出る。
+        this.ctx.smallTalk = false;
+        line();
+      } else {
+        toolResultLine('答えるだけにします', true);
+        return {
+          output:
+            'The user says this was not a work request. Do not change anything. ' +
+            'Answer in words, and if a change would be needed, describe it instead of making it.',
+          denied: true
+        };
       }
     }
 

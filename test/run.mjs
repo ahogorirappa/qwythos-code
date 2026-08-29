@@ -35,6 +35,7 @@ import {
 import { parseEdits } from '../src/agent.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
+import { classifyInput, SMALL_TALK_HINT } from '../src/smalltalk.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
 import { startMcp, stopMcp } from '../src/mcp.mjs';
 import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits } from '../src/edits.mjs';
@@ -574,9 +575,31 @@ console.log('\nやったと言い張ったときの促し（ループの往復�
   {
     const a = mkAgent([{ content: '0.08 を 0.1 に変更する必要があります。' }, { content: 'はい。' }]);
     a.config.isSubagent = false;
-    await a.runTurn('税率が古いよ');
+    await a.runTurn('税率が古いから直して');
     const said = a.messages.filter((m) => m.role === 'user' && /did not make it/.test(m.content || ''));
     check('勧めただけで終わったら促す', said.length > 0);
+  }
+
+  // 独り言では促さない。
+  //
+  // ここは元は「税率が古いよ」で促す側に置いていた。頼まれてもいないのに
+  // 「直せ」と押していたわけで、それが実機で勝手な書き換えになっていた。
+  {
+    const a = mkAgent([{ content: '0.08 を 0.1 に変更する必要がありますね。' }, { content: 'はい。' }]);
+    a.config.isSubagent = false;
+    await a.runTurn('税率が古いままだなあ');
+    const said = a.messages.filter((m) => m.role === 'user' && /did not make it/.test(m.content || ''));
+    check('独り言では促さない', said.length === 0);
+  }
+
+  // 雑談モードでも促さない（道具を渡していないので、押しても行き場がない）
+  {
+    const a = mkAgent([{ content: '0.08 を 0.1 に変更する必要があります。' }, { content: 'はい。' }]);
+    a.config.isSubagent = false;
+    a.config.chatMode = true;
+    await a.runTurn('税率が古いから直して');
+    const said = a.messages.filter((m) => m.role === 'user' && /did not make it/.test(m.content || ''));
+    check('雑談モードでは促さない', said.length === 0);
   }
 
   // 計画モードでは促さない。書く道具そのものが外してあり、勧めて終わるのが正しい
@@ -1215,6 +1238,117 @@ console.log('\n雑談モード');
   check('任された側は雑談モードにならない', subChat.includes('research assistant'));
 
   check('/chat は組み込みコマンドとして予約されている', isReserved('chat'));
+}
+
+// ── 雑談か作業かの自動判定 ──────────────────────────────────
+console.log('\n雑談か作業かの自動判定');
+{
+  // 依頼として受け取ってほしいもの。ここを取りこぼすと、毎回よけいな確認が出る
+  const asWork = [
+    'tax.js の税率を10%にして',
+    'じゃあ tax.js の税率もそれに合わせて',
+    '認証まわりをリファクタしたい',
+    '--version フラグを足して',
+    'テストを直して',
+    'この関数のバグを修正',
+    'ログイン機能の追加',
+    'README を更新しといて',
+    'src/app.js を読んで直して',
+    'コミットして',
+    'エラーが出るんだけど直せる？',
+    'npm test 走らせて',
+    'この関数、長いよね。短くして',
+    'ここのインデント揃えてくれる？',
+    'この変数名わかりやすくしてもらえる？',
+    'console.log を全部消して',
+    'ここ見てほしい',
+    'これやって',
+    '元に戻して',
+    'fix the failing test',
+    'add a --json flag'
+  ];
+  for (const t of asWork) {
+    const r = classifyInput(t);
+    check(`作業として受け取る: ${t}`, r.smallTalk === false, r.reason);
+  }
+
+  // 依頼ではないもの。ここを作業と取り違えると、頼んでいないのに書き換わる
+  const asChat = [
+    'こんにちは。今日はいい天気だね',
+    'そういえば消費税っていま10%だよね',
+    'コーヒーと紅茶ならどっち派？',
+    'ありがとう、助かった',
+    'この設計どう思う？',
+    'なるほどね',
+    'TypeScript ってなんで流行ったんだろう',
+    'お疲れさま',
+    '計画モードって便利だな',
+    '最近ローカルLLM流行ってるよね',
+    'tax.js ってどうなってる？',
+    'この関数なにやってるの？',
+    'ちなみにこれ知ってる？',
+    // 伝聞の「って」を依頼のて形と取り違えない（実際に一度間違えた）
+    'そうなんだって',
+    '明日は休みだって',
+    // どちらの形にもならない短い独り言は、安全な側に置く
+    'うーん',
+    '疲れた',
+    'いい天気'
+  ];
+  for (const t of asChat) {
+    const r = classifyInput(t);
+    check(`雑談として受け取る: ${t}`, r.smallTalk === true, r.reason);
+  }
+
+  // 貼り付けたコードやエラーは、見てほしいから貼っている
+  check('コードの貼り付けは作業', classifyInput('```js\nconst a = 1;\n```').smallTalk === false);
+  check('長い貼り付けは作業', classifyInput('a\nb\nc\nd\ne\nf\ng').smallTalk === false);
+  check('空の入力は作業側（判定しない）', classifyInput('').smallTalk === false);
+  check('添える一言はファイルを変えるなと言う', /ファイルは変更しないこと/.test(SMALL_TALK_HINT));
+  check('読む道具は使ってよいと言う', /read_file/.test(SMALL_TALK_HINT));
+
+  // 判定を外したときの受け皿。書き換える道具に手が伸びたら聞く
+  const agent = new Agent({
+    config: { ...DEFAULT_CONFIG, autoApprove: true },
+    root,
+    permissions: new PermissionManager({ ...DEFAULT_CONFIG, autoApprove: true }, async () => 'n')
+  });
+  const writeTool = TOOL_MAP.get('write_file');
+  const readTool = TOOL_MAP.get('read_file');
+  const runTool = TOOL_MAP.get('run_command');
+  check('書き換える道具は聞く対象', agent.touchesTheWorld(writeTool, {}) === true);
+  check('読む道具は素通し', agent.touchesTheWorld(readTool, {}) === false);
+  check('読み取りのコマンドは素通し', agent.touchesTheWorld(runTool, { command: 'ls' }) === false);
+  check('状態を変えるコマンドは聞く対象', agent.touchesTheWorld(runTool, { command: 'rm -rf x' }) === true);
+
+  // 別のアプリの中で動いているとき（--embed）は判定しない。
+  // あちらには聞く相手がいないので、外したときに取り返す手が無い。
+  class Silent extends Agent {
+    async streamAssistant() {
+      return { message: { role: 'assistant', content: 'はい' }, toolCalls: [], stats: null };
+    }
+  }
+  const embedded = new Silent({ config: { ...DEFAULT_CONFIG }, root, permissions: null });
+  await embedded.runTurn('いい天気だね');
+  check('組み込みでは雑談判定をしない', embedded.ctx.smallTalk === false);
+  check('組み込みでも道具の判定で落ちない', embedded.touchesTheWorld(runTool, { command: 'ls' }) === true);
+
+  // ふつうの対話では、同じ発言がちゃんと雑談になる
+  const local = new Silent({
+    config: { ...DEFAULT_CONFIG },
+    root,
+    permissions: new PermissionManager({ ...DEFAULT_CONFIG }, async () => 'n')
+  });
+  await local.runTurn('いい天気だね');
+  check('対話では雑談として受け取る', local.ctx.smallTalk === true);
+
+  // 自分で /chat や /plan に入っているときは、人の決めたほうを優先する
+  const chatAgent = new Agent({
+    config: { ...DEFAULT_CONFIG, chatMode: true },
+    root,
+    permissions: new PermissionManager({ ...DEFAULT_CONFIG }, async () => 'n')
+  });
+  check('雑談モードでは判定そのものをしない', chatAgent.config.chatMode === true);
 }
 
 // ── @ でファイルを添える ────────────────────────────────────
