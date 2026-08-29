@@ -160,11 +160,16 @@ export async function listModels(cfg) {
 // 読み込みは最初のやり取りでどのみち起きるので、それを起動時に前倒しするだけ。
 
 // モデルを読み込ませる（生成はしない）。prompt を空にすると Ollama は読み込みだけ行う。
+//
+// **num_ctx を必ず一緒に渡すこと。** 渡さないと Ollama は既定の広さで載せてしまい、
+// 直後の本番のやり取りが違う広さを求めた時点で、17GB を積み直す羽目になる。
+// 実測: 65,536 で使う設定のまま num_ctx を省いたら、毎回 6.2 秒の積み直しが挟まった
+// （渡すようにしたら 0.2 秒）。載っているのに「読み込み」が出るときは、ここを疑う。
 export async function preloadModel(cfg, name = cfg.model, timeoutMs = 10 * 60 * 1000) {
   const res = await fetch(`${cfg.host}/api/generate`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ model: name, keep_alive: cfg.keepAlive }),
+    body: JSON.stringify({ model: name, keep_alive: cfg.keepAlive, options: { num_ctx: cfg.numCtx } }),
     signal: AbortSignal.timeout(timeoutMs)
   });
   if (!res.ok) throw new OllamaError(`モデルを読み込めませんでした (HTTP ${res.status})`);
