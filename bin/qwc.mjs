@@ -32,7 +32,7 @@ import {
 } from '../src/ui.mjs';
 import { serve, requestTool, emit, ready, turnEnd } from '../src/embed.mjs';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 // ── 起動オプション ──────────────────────────────────────────
 function parseArgs(argv) {

@@ -1,6 +1,6 @@
 {
   "name": "qwythos-code",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A local autonomous coding agent CLI powered by qwythos 9B via Ollama",
   "type": "module",
   "bin": {
