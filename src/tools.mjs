@@ -745,13 +745,17 @@ const runCommand = {
 
     // 計画モードでは、状態を変えうるコマンドは実行しない。
     // 「調べてから提案する」ための時間なので、調べる以外はさせない。
-    if (ctx.config.planMode && !isSafeCommand(command, ctx.config)) {
+    // 雑談モードも同じ扱いにする。話の途中で環境が変わってしまわないように。
+    if ((ctx.config.planMode || ctx.config.chatMode) && !isSafeCommand(command, ctx.config)) {
+      const chatting = ctx.config.chatMode;
       return {
         isError: true,
-        output:
-          'You are in plan mode: only read-only commands are allowed right now. ' +
-          'Finish investigating, then describe what you would run as part of your plan.',
-        display: '計画中なので実行しません'
+        output: chatting
+          ? 'You are in chat mode: only read-only commands are allowed right now. ' +
+            'Tell the user what you would run, and that /chat switches back to working mode.'
+          : 'You are in plan mode: only read-only commands are allowed right now. ' +
+            'Finish investigating, then describe what you would run as part of your plan.',
+        display: chatting ? '雑談中なので実行しません' : '計画中なので実行しません'
       };
     }
 
@@ -1374,14 +1378,17 @@ export function activeTools(config = {}) {
 
   // 計画モードでは、書き換える道具そのものを渡さない。
   // 「使わないでください」と頼むのではなく、無いことにする。
-  const list = config.planMode
+  // 雑談モードも書き換えない点は同じなので、同じ道具立てにする。
+  const readOnly = config.planMode || config.chatMode;
+  const list = readOnly
     ? [readFile, listDir, searchFiles, runCommand]
     : [readFile, writeFile, editFile, listDir, searchFiles, runCommand];
 
   // やることリストは人に見せるためのもの。
   // 任された側の画面は本体の作業の途中に挟まって流れるだけなので、渡しても場所を取るだけ。
   // 渡すと「3手以上なら最初に todo_write」の指示に従って往復を1回よけいに使う。
-  if (!config.isSubagent) list.push(todoWrite);
+  // 雑談にも渡さない。話しているだけの相手に手順表を出されても困る。
+  if (!config.isSubagent && !config.chatMode) list.push(todoWrite);
 
   // 手順書が1つも無いプロジェクトでは、読む道具そのものを渡さない。
   // 渡すと、モデルは「あるはず」と思って呼び、空振りで往復を1回使う。
@@ -1389,11 +1396,13 @@ export function activeTools(config = {}) {
 
   // 言語サーバーが1つも入っていなければ渡さない（呼べない道具を見せない）。
   // 読むだけの道具なので、計画モードでも使える。
-  if (config.lspReady) list.push(findSymbol);
+  // 雑談では渡さない。コードの記号をたどるのは、作業のための道具である。
+  if (config.lspReady && !config.chatMode) list.push(findSymbol);
 
   // 調べものの委譲。ネットは要らないので、切断時でも使える。
   // 任された側には渡さない（入れ子で木が無限に広がるため）。
-  if (!config.isSubagent) list.push(spawnAgent);
+  // 雑談でも渡さない。任された側は作業の続きを前提に動くので、話が噛み合わない。
+  if (!config.isSubagent && !config.chatMode) list.push(spawnAgent);
 
   // 外の道具は、つないだぶんだけ。設定に書いていなければ1つも増えない。
   list.push(...mcpTools);
@@ -1406,8 +1415,8 @@ export function activeTools(config = {}) {
   if (config.browserReady) {
     list.push(browseTool);
     // ログインは人がやる作業だが、モデルから「窓を開ける」ことはできる。
-    // 計画モードでは渡さない（画面を開くのは調べる行為ではない）。
-    if (!config.planMode) list.push(browserLoginTool);
+    // 計画モードと雑談モードでは渡さない（画面を開くのは調べる行為ではない）。
+    if (!readOnly) list.push(browserLoginTool);
   }
   return list;
 }

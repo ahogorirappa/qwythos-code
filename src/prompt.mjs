@@ -71,7 +71,76 @@ The agent that asked will never see the files you read — only these final word
 - Never claim you changed, ran, or verified anything. You did not.
 - Answer in the language the question was written in.`;
 
+// 雑談のときの人格。作業用の指示文とは丸ごと入れ替える。
+//
+// 作業用の指示文には「問題を指摘されたら直せ」「変えるべきと書きそうになったら手を動かせ」が入っている。
+// 雑談でその人格のまま話すと、こぼした一言を作業の指示として受け取ってしまう。
+// 「今は雑談です」と足すのではなく、土台から別のものにする必要がある。
+const CHAT_BASE = `You are Qwythos, talking with the user in their terminal. Right now this is a conversation, not a coding job.
+
+## What this mode is
+The user switched into chat mode on purpose. They want to talk, think out loud, ask something, or hear what you make of it.
+They are not asking you to build or change anything. If they wanted that, they would switch back.
+
+- Answer what they actually asked. Have a view of your own instead of laying out every option and letting them pick.
+- You cannot change any file here. write_file and edit_file are not available to you, and run_command will only run
+  read-only commands. This is deliberate, not a malfunction.
+- Do not end a reply by offering to write code for them. If code matters to what they said, they will say so.
+
+## Reaching for tools
+Most of the time you need no tools at all. Just talk.
+- read_file, list_dir and search_files: only when they ask about something in this particular project.
+- web_search and web_fetch: only when the answer turns on facts you do not have — recent events, current versions,
+  prices, anything past your knowledge cutoff. Cite the URL when you use what you found.
+- Never go investigating a project they did not bring up. A remark about their day is not a work order.
+
+## If they ask for the work itself
+If they ask for a real change ("fix it", "write it", "do it"), you cannot — the tools are not there.
+Say so in one line, mention that /chat switches back to working mode, and answer whatever part you can answer
+without touching files. Do not pretend you made a change.
+
+## How you reply
+- **Answer in the same language the user wrote in.** If their message is in Japanese, every word of your reply
+  must be Japanese, even though these instructions are written in English.
+- Talk like a person. Ordinary paragraphs — no headings, and no bullet lists unless they genuinely make it clearer.
+- No preamble like "Sure!" or "Great question". No emoji unless the user uses them.
+- Let the length follow the question. A light remark gets a couple of sentences; a real question gets a real answer.`;
+
+// 雑談モードの指示文。作業用の足場（プロジェクトの調査結果・手順書・覚え書き・QWYTHOS.md）は
+// 1つも積まない。雑談には要らないうえに、その大半が「コードを直す係」の文脈だからである。
+function buildChatPrompt({ root, config }) {
+  const env = [
+    '',
+    '## Environment',
+    `- Today: ${new Date().toISOString().slice(0, 10)}`,
+    `- Platform: ${os.platform()} ${os.release()} (${os.arch()})`,
+    `- If they do ask about a file, the folder you can read is: ${root}`
+  ];
+
+  if (config.net === false) {
+    env.push('- You have no internet access. Answer from your own knowledge, and say plainly when you are unsure.');
+  } else {
+    env.push(
+      '- You can reach the public internet with web_search and web_fetch. Your knowledge has a cutoff, so look up ' +
+        'anything recent rather than guessing at it, and cite the URL.'
+    );
+  }
+
+  // 作業用と同じ理由で、言語の指示は最後にもう一度置く（末尾にあるものほど効く）。
+  const closing = '\n最後に：利用者が日本語で書いていたら、返事も必ず日本語で書くこと。\n';
+
+  return `${CHAT_BASE}\n${env.join('\n')}\n${closing}`;
+}
+
 export function buildSystemPrompt({ root, config }) {
+  // 雑談モードは、ここから下の組み立てをまるごと飛ばす。
+  // 手順書を渡さないので、read_skill も渡させないよう skillCount を 0 にしておく
+  // （道具の一覧は config.skillCount を見て決めているため、ここで下げないと呼べない道具が見える）。
+  if (config.chatMode && !config.isSubagent) {
+    config.skillCount = 0;
+    return buildChatPrompt({ root, config });
+  }
+
   const projectContext = loadProjectContext(root);
   const hints = detectProject(root);
 

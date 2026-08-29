@@ -131,6 +131,10 @@ export const DEFAULT_CONFIG = {
   // 保存はしない（次回まで持ち越すものではないため）。
   planMode: false,
 
+  // 雑談モード。true のあいだは指示文を雑談用に差し替え、書き換える道具を渡さない。
+  // 計画モードと同じく保存はしない。次に起動したときは作業モードで始まる。
+  chatMode: false,
+
   // 安全まわり
   autoApprove: false,      // true で確認なし（--yolo と同じ）
   allowOutsideRoot: false, // 作業フォルダの外を触れるか

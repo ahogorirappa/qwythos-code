@@ -61,6 +61,7 @@ function parseArgs(argv) {
       case '--allow-outside': opts.overrides.allowOutsideRoot = true; break;
       case '--no-net': opts.overrides.net = false; break;
       case '--plan': opts.overrides.planMode = true; break;
+      case '--chat': opts.overrides.chatMode = true; break;
       case '--embed': opts.embed = true; break;
       case '--cwd': opts.cwd = next(); break;
       case '--resume': opts.resume = argv[i + 1] && !argv[i + 1].startsWith('-') ? next() : 'last'; break;
@@ -103,13 +104,14 @@ ${c.bold('オプション')}
       --allow-outside    作業フォルダの外も触れるようにする
       --no-net           ネット接続を切る（検索とページ取得の道具を渡さない）
       --plan             計画モードで始める（まず調べて方針を出す。書き換えない）
+      --chat             雑談モードで始める（普通に話す。書き換えない）
       --resume [ID]      前の会話を読み込む（IDなしなら直近）
       --sessions         保存済みの会話を一覧する
   -h, --help             このヘルプ
   -v, --version          バージョン
 
 ${c.bold('対話中に使えるコマンド')}
-  /help /clear /compact /model /think /yolo /accept /tools /stats /files /diff /undo /refine /init /exit
+  /help /clear /compact /model /think /yolo /accept /plan /chat /tools /stats /files /diff /undo /refine /init /exit
   /login /logins /logout   ログインが要るサイトを読めるようにする
 `);
 }
@@ -125,6 +127,7 @@ ${c.bold('  対話中のコマンド')}
   ${c.cyan('/yolo')}      確認あり／なしを切り替える（全部飛ばす）
   ${c.cyan('/accept')}    書き換えだけ確認なしにする（コマンドとネットは確認する）
   ${c.cyan('/plan')}      計画モードの出入り（まず調べて方針を出す。書き換えない）
+  ${c.cyan('/chat')}      雑談モードの出入り（普通に話す。書き換えない）
   ${c.cyan('/todo')}      いまのやることリストを見る
   ${c.cyan('/commands')}  自分で作ったコマンドの一覧（.qwythos/commands/*.md）
   ${c.cyan('/tools')}     使える道具の一覧
@@ -664,14 +667,26 @@ async function main() {
         : '確認なしモードです（保存された設定）。書き換えもコマンドもそのまま実行されます。--confirm でこの回だけ戻せます。'
     );
   }
+  if (config.chatMode) {
+    info('雑談モードで始めました（--chat）。書き換えはしません。作業に移るときは /chat。');
+  }
   // 鍵が無ければ検索の道具は渡していない。黙って使えないより、理由が分かるほうがよい。
   if (config.net !== false && !loadApiKey()) {
     warn('ネット検索は使えません（ページ取得は使えます）。' + KEY_HELP.split('\n')[0]);
   }
 
   for (;;) {
-    // ここだけが「本人が打った依頼」。↑ で呼び出せるのはこれだけにする
-    const input = await ask(`${c.magenta('❯')} `, { remember: true });
+    // ここだけが「本人が打った依頼」。↑ で呼び出せるのはこれだけにする。
+    //
+    // いまどのモードにいるかは、打つ場所そのものに出す。
+    // 同じタブで行き来する以上、切り替えたときの一行が流れて見えなくなったあとでも、
+    // 「この一言は作業の指示として受け取られるのか」が分かる必要がある。
+    const mark = config.chatMode
+      ? `${c.cyan('雑談')} ${c.cyan('❯')} `
+      : config.planMode
+        ? `${c.brightYellow('計画')} ${c.brightYellow('❯')} `
+        : `${c.magenta('❯')} `;
+    const input = await ask(mark, { remember: true });
     if (input === null || input === undefined) break;
     let text = input.trim();
     if (!text) continue;
@@ -902,12 +917,31 @@ async function handleSlash(text, { agent, config, permissions, root }) {
 
     case 'plan': {
       config.planMode = !config.planMode;
+      // 計画モードと雑談モードは、どちらも「いま何をする時間か」を決めるもの。
+      // 両方入っていると人格と道具立ての辻褄が合わなくなるので、入った側を残す。
+      if (config.planMode) config.chatMode = false;
       agent.rebuildSystemPrompt();
       if (config.planMode) {
         success('計画モードに入りました。');
         info('書き換えとコマンド実行の道具を外しました。まず調べて、方針を出します。');
       } else {
         success('計画モードを抜けました。');
+      }
+      return;
+    }
+
+    // 雑談モード。同じタブのまま、作業用の人格ごと入れ替える。
+    // 会話そのもの（これまでのやり取り）は残したまま、いちばん上の指示文だけを差し替える。
+    // 話の続きから作業に戻れるようにするためで、ここで会話を消してはいけない。
+    case 'chat': {
+      config.chatMode = !config.chatMode;
+      if (config.chatMode) config.planMode = false;
+      agent.rebuildSystemPrompt();
+      if (config.chatMode) {
+        success('雑談モードに入りました。');
+        info('書き換えの道具を外し、指示文も雑談用に差し替えました。作業に戻るときは、もう一度 /chat。');
+      } else {
+        success('雑談モードを抜けました。ここからは作業モードです。');
       }
       return;
     }

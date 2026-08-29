@@ -1160,6 +1160,63 @@ console.log('\n計画モード');
   check('計画中でも読み取りのコマンドは通す', safe.isError === false, safe.display);
 }
 
+// ── 雑談モード ──────────────────────────────────────────────
+console.log('\n雑談モード');
+{
+  const chatting = activeTools({ net: false, lspReady: true, chatMode: true }).map((t) => t.name);
+  check('書き換える道具を渡さない', !chatting.includes('write_file') && !chatting.includes('edit_file'));
+  check('調べる道具は残す', chatting.includes('read_file') && chatting.includes('search_files'));
+
+  // ここから下は「作業のための道具」。雑談の相手に渡しても噛み合わない
+  check('やることリストは渡さない', !chatting.includes('todo_write'));
+  check('調べものの委譲は渡さない', !chatting.includes('spawn_agent'));
+  check('記号をたどる道具は渡さない', !chatting.includes('find_symbol'));
+
+  const back = activeTools({ net: false, lspReady: true, chatMode: false }).map((t) => t.name);
+  check('抜ければ作業用の道具が戻る', back.includes('write_file') && back.includes('todo_write') && back.includes('spawn_agent'));
+
+  // 話の途中で環境が変わらないよう、状態を変えるコマンドは断る
+  const run = TOOL_MAP.get('run_command');
+  const chatCtx = { ...ctx, config: { ...ctx.config, chatMode: true } };
+  const danger = await run.run({ command: 'rm -rf /tmp/nope' }, chatCtx);
+  check('雑談中は書き換えるコマンドを実行しない', danger.isError === true, danger.display);
+  check('断る理由が雑談モードのものになる', /chat mode/.test(danger.output), danger.output);
+  const safe = await run.run({ command: 'echo ok' }, chatCtx);
+  check('雑談中でも読み取りのコマンドは通す', safe.isError === false, safe.display);
+
+  // 人格そのものを入れ替える。「今は雑談です」を足すだけでは、
+  // 「問題を指摘されたら直せ」という作業用の指示が残ってしまう
+  const chatConfig = { ...ctx.config, chatMode: true };
+  const chatPrompt = buildSystemPrompt({ root, config: chatConfig });
+  check('コーディングエージェントだと名乗らない', !chatPrompt.includes('autonomous coding agent'));
+  check('指摘を作業の指示として受け取らせない', !chatPrompt.includes('If they point out a problem'));
+  check('雑談用の人格になっている', chatPrompt.includes('this is a conversation, not a coding job'));
+  check('日本語の念押しは残す', chatPrompt.includes('返事も必ず日本語で書くこと'));
+  check('戻り方を本人にも言えるようにする', chatPrompt.includes('/chat'));
+
+  // 手順書を渡さない以上、読む道具も見せない（呼べない道具を見せない）
+  check('手順書の数を 0 に下げる', chatConfig.skillCount === 0);
+  check('手順書を読む道具は渡さない', !activeTools(chatConfig).map((t) => t.name).includes('read_skill'));
+
+  // 作業用の足場は積まない。雑談に要らないうえ、その大半が「コードを直す係」の文脈になる
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-chat-'));
+  fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"x","scripts":{"build":"tsc"}}');
+  fs.writeFileSync(path.join(dir, 'QWYTHOS.md'), '# 決まりごと\nここは秘密の合言葉テスト\n');
+  const inProject = buildSystemPrompt({ root: dir, config: { ...ctx.config, chatMode: true } });
+  check('プロジェクトの決まりごとを積まない', !inProject.includes('秘密の合言葉テスト'));
+  check('プロジェクトの調査結果を積まない', !inProject.includes('npm scripts'));
+  const working = buildSystemPrompt({ root: dir, config: { ...ctx.config, chatMode: false } });
+  check('作業モードでは今までどおり積む', working.includes('秘密の合言葉テスト') && working.includes('npm scripts'));
+  check('作業用のほうが指示文は長い', working.length > inProject.length, `${working.length} vs ${inProject.length}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+
+  // 調べものを任された側は、雑談をしに来たのではない
+  const subChat = buildSystemPrompt({ root, config: { ...ctx.config, chatMode: true, isSubagent: true } });
+  check('任された側は雑談モードにならない', subChat.includes('research assistant'));
+
+  check('/chat は組み込みコマンドとして予約されている', isReserved('chat'));
+}
+
 // ── @ でファイルを添える ────────────────────────────────────
 console.log('\n@ でファイルを添える');
 {
