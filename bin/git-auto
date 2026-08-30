@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# git-auto: A simple script to automate git add, commit, and push.
+
+# 1. Check if there are any changes
+if [ -z "$(git status --porcelain)" ]; then
+  echo "No changes detected. Nothing to do."
+  exit 0
+fi
+
+# 2. Stage all changes
+echo "Staging all changes..."
+git add .
+
+# 3. Generate a commit message based on the diff stat
+# We take the first line of git diff --cached --stat which looks like "1 file changed, 1 insertion(+)"
+MESSAGE=$(git diff --cached --stat | head -n 1)
+
+if [ -z "$MESSAGE" ]; then
+  MESSAGE="auto-commit: update files"
+fi
+
+COMMIT_MSG="[git-auto] $MESSAGE"
+
+# 4. Commit the changes
+echo "Committing with message: $COMMIT_MSG"
+git commit -m "$COMMIT_MSG"
+
+# 5. Push the changes
+# Note: In a real automated environment, you might want to check if push is allowed or use --force (carefully!)
+echo "Pushing to remote..."
+if git push; then
+  echo "Successfully pushed changes!"
+else
+  echo "Failed to push changes. Please check your remote configuration."
+  exit 1
+fi
