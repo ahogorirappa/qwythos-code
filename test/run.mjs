@@ -2379,6 +2379,64 @@ console.log('\n降ろされても作業が続く（実機の経路）');
   check('掛け直しは1回で済んでいる', chats === 2, String(chats));
 }
 
+// 思考は、その手の道具を使い終わったら捨てる。
+//
+// 残したままだと、1回のお願い（最大200手）のあいだ過去の思考が全部積み上がり、
+// **毎手それを送り直す**ことになる。gemma4 は考えを長く書くので、ここが効く。
+console.log('\n考えた内容の捨てどき');
+{
+  class Thinker extends Agent {
+    constructor(opts) {
+      super(opts);
+      this.steps = 0;
+      this.sentAtEachStep = [];
+    }
+    async streamAssistant() {
+      // そのつど「送られてきた会話に、思考がいくつ残っているか」を数える
+      this.sentAtEachStep.push(this.messages.filter((m) => m.thinking).length);
+      this.steps++;
+      if (this.steps > 3) {
+        return { message: { role: 'assistant', content: '終わりました', thinking: 'さいごの考え' }, toolCalls: [], stats: null };
+      }
+      return {
+        message: { role: 'assistant', content: '', thinking: `${this.steps}手めの長い考え`.repeat(20) },
+        toolCalls: [{ name: 'list_dir', args: { path: '.' }, id: `t${this.steps}` }],
+        stats: null
+      };
+    }
+    async executeTool() {
+      return { output: 'ok', denied: false };
+    }
+  }
+
+  const troot = path.join(root, 'think');
+  fs.mkdirSync(troot, { recursive: true });
+  const make = (extra = {}) =>
+    new Thinker({
+      config: { ...DEFAULT_CONFIG, autoApprove: true, ...extra },
+      root: troot,
+      permissions: new PermissionManager({ ...DEFAULT_CONFIG, autoApprove: true }, async () => 'y')
+    });
+
+  const a = make();
+  await a.runTurn('やって');
+  check('手が進んでも、思考は積み上がらない', Math.max(...a.sentAtEachStep) <= 1, JSON.stringify(a.sentAtEachStep));
+  check('終わったあとに残る思考は最後の1つだけ',
+    a.messages.filter((m) => m.thinking).length <= 1,
+    String(a.messages.filter((m) => m.thinking).length));
+
+  // 比べる用に、残す設定でも動くこと
+  const b = make({ dropThinkingAfterTools: false });
+  await b.runTurn('やって');
+  check('設定で残すこともできる（比べるため）', Math.max(...b.sentAtEachStep) >= 2, JSON.stringify(b.sentAtEachStep));
+
+  // 次のお願いが来たら、残っていたぶんも消える（前からある振る舞い）
+  await b.runTurn('つぎ');
+  check('次のお願いの頭では、前のぶんが消える', b.sentAtEachStep[b.sentAtEachStep.length - 1] === 0,
+    JSON.stringify(b.sentAtEachStep));
+}
+
+
 // ── ツールの往復の上限 ──────────────────────────────────────
 //
 // 40 では実作業で足りず、途中で壁に当たって「続けて」と打ち直すことになっていた。

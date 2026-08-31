@@ -338,6 +338,22 @@ export class Agent {
           if (outcome.denied) denied = true;
         }
 
+        // **その手の思考は、道具を使い終わった時点で捨てる。**
+        //
+        // 1回のお願いは最大200手まで回る。思考を残したままだと、
+        // 手が進むたびに過去の思考が全部積み上がり、**毎手それを送り直す**ことになる。
+        // gemma4 は考えを長く書くので、ここが会話の大半を占める手も出る。
+        // 道具の呼び出しと、その結果さえ残っていれば、何をしたかは辿れる。
+        //
+        // 前のお願いのぶんは runTurn の頭で落としているが、**同じお願いの中では
+        // 誰も落としていなかった**（2026-08-31 に指摘を受けて追加）。
+        //
+        // 積み直しの都合: 消すのは「いま積んだばかりの1件」なので、
+        // Ollama 側の使い回し（prompt cache）で効いている前半部分は壊さない。
+        if (this.config.dropThinkingAfterTools !== false && result.message.thinking) {
+          delete result.message.thinking;
+        }
+
         if (interrupted) break;
         if (denied) {
           // 断られたことはモデルに伝わっているので、次の一手を考えさせる
