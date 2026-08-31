@@ -19,6 +19,64 @@ export class OllamaError extends Error {}
 const FIRST_TOKEN_MS = 15 * 60 * 1000; // 最初の1文字が出るまで（長い文脈の下ごしらえを待つ）
 const STALL_MS = 10 * 60 * 1000;       // 出はじめたあとで途切れたとき（config.mjs に理由）
 
+// ── 積み直しに巻き込まれたときの掛け直し ────────────────────────
+//
+// **ローカルの Ollama は、こちらの依頼を処理している最中でもモデルを降ろす。**
+// 起こし方は2つある。同じモデルを別の広さ（num_ctx）で誰かが呼ぶと、Ollama にとっては
+// 別物なので先に載っているほうを降ろす。別のモデルを呼ばれても、GPU の枠が足りなければ降ろす。
+// どちらでも、降ろされた側が処理中だった依頼は途中で消え、こちらに返るのは
+// HTTP 500 `{"error":"...unexpected EOF"}` の一行だけになる。
+//
+// 実測 2026-08-31 の朝: 60秒おきの点検（広さ未指定＝32768）が qwc（65536）を降ろし続け、
+// 37,000トークンの前処理に2分かかる本番は **1手も終われずに毎回落ちていた**。
+// 相手を1つずつ直しても、次に増えた道具がまた同じことをする。
+// **こちらが掛け直せることだけが、相手にそろえてもらわなくてよい対策**なので、ここで受ける。
+//
+// 待つ長さを3段にしてあるのは、積み直しが3秒では終わらないため（26B で冷えていれば36秒）。
+const RETRY_WAITS_MS = [3000, 10000, 30000];
+
+/**
+ * 掛け直して意味のある壊れ方か。
+ *
+ * 直るのは「相手の都合で消された」たぐいだけ。依頼そのものが悪いなら何度送っても同じで、
+ * 待つ時間ぶん遅くなるだけになる。中断（AbortError）は本人の意思なので当然掛け直さない。
+ */
+export function isTransientOllamaError(err) {
+  if (!err || err.name === 'AbortError') return false;
+  const msg = String(err.message || '');
+  // 5xx は相手の内部事情。積み直しで消された依頼もここに来る
+  if (/HTTP 5\d\d/.test(msg)) return true;
+  // つなぎ目が切れた（Ollama の入れ替わり・再起動の最中）
+  return /unexpected EOF|EOF\b|ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|つながりません/i.test(msg);
+}
+
+function abortError() {
+  const err = new Error('中断しました');
+  err.name = 'AbortError';
+  return err;
+}
+
+/** 待つ。待っているあいだに中断されたら、待たずに投げ返す。 */
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError());
+    let onAbort = null;
+    // **ここで unref してはいけない。**
+    // 掛け直しを待っているあいだ、他に予定が無ければ Node はそのまま終了する。
+    // 端末では入力が輪をつないでいるので気づかないが、パイプ越し（qwc-async ＝ LINE 経由）だと
+    // 「知らせだけ出して黙って終わる」になる。実測でそうなった。
+    const timer = setTimeout(() => {
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /**
  * JSON を POST して、応答を Node の Readable のまま返す。
  *
@@ -479,7 +537,44 @@ export function salvageToolCalls(text, tools) {
 //   { type: 'thinking', text }   … 考えている途中の文
 //   { type: 'content',  text }   … 本文
 //   { type: 'done', message, stats } … 1回分の応答が完成
+/**
+ * 掛け直しつきの本体。中身は chatStreamOnce（1回ぶん）で、ここは掛け直しだけを見る。
+ *
+ * **一度でも画面に出したあとは掛け直さない。**
+ * 同じ話が二度流れるし、途中まで組み立てた道具の呼び出しが二重に走りうる。
+ * 消えるのはたいてい前処理の最中——つまり1文字も出ていないとき——なので、
+ * ここだけ拾えれば実害はほぼ消える。
+ *
+ * yield されるものが1つ増える:
+ *   { type: 'retry', attempt, total, waitMs, reason } … 掛け直す直前
+ * 黙って掛け直すと、利用者からは「長いだけ」に見えて、何が起きたか残らない。
+ */
 export async function* chatStream({ cfg, messages, tools, signal }) {
+  const waits = Array.isArray(cfg.retryWaitsMs) ? cfg.retryWaitsMs : RETRY_WAITS_MS;
+  for (let attempt = 0; ; attempt++) {
+    let yielded = false;
+    try {
+      for await (const ev of chatStreamOnce({ cfg, messages, tools, signal })) {
+        yielded = true;
+        yield ev;
+      }
+      return;
+    } catch (err) {
+      if (yielded || attempt >= waits.length || !isTransientOllamaError(err)) throw err;
+      const waitMs = waits[attempt];
+      yield {
+        type: 'retry',
+        attempt: attempt + 1,
+        total: waits.length,
+        waitMs,
+        reason: String(err.message || err)
+      };
+      await sleep(waitMs, signal);
+    }
+  }
+}
+
+async function* chatStreamOnce({ cfg, messages, tools, signal }) {
   const body = {
     model: cfg.model,
     messages,
@@ -617,6 +712,20 @@ export async function* chatStream({ cfg, messages, tools, signal }) {
 // ここも node:http で投げる。まとめ直しは会話まるごとを送るので、いちばん長くなる。
 // 文脈が溢れたから要約するのに、その要約が300秒で切られては元も子もない。
 export async function chatOnce({ cfg, messages, signal, temperature = 0.2 }) {
+  // ここも積み直しに巻き込まれる。まとめ直し（/compact）が消えると、
+  // 文脈が溢れたまま次の手に進むことになるので、同じだけ掛け直す。
+  const waits = Array.isArray(cfg.retryWaitsMs) ? cfg.retryWaitsMs : RETRY_WAITS_MS;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await chatOnceRequest({ cfg, messages, signal, temperature });
+    } catch (err) {
+      if (attempt >= waits.length || !isTransientOllamaError(err)) throw err;
+      await sleep(waits[attempt], signal);
+    }
+  }
+}
+
+async function chatOnceRequest({ cfg, messages, signal, temperature = 0.2 }) {
   const res = await postStream({
     url: `${cfg.host}/api/chat`,
     signal,

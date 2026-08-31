@@ -8,7 +8,7 @@ import { TOOL_MAP, truncateOutput, OUTPUT_DRAIN_MS } from '../src/tools.mjs';
 import { DEFAULT_CONFIG } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
-import { salvageToolCalls, chatStream } from '../src/ollama.mjs';
+import { salvageToolCalls, chatStream, isTransientOllamaError } from '../src/ollama.mjs';
 import {
   describesIntentWithoutActing,
   claimsWorkDone,
@@ -1752,16 +1752,115 @@ console.log('\n返事を待つ時間');
   await new Promise((r) => angry.listen(0, '127.0.0.1', r));
   const angryPort = angry.address().port;
   let httpErr = '';
+  let angryRetries = 0;
   try {
-    for await (const _ of chatStream({
-      cfg: { host: `http://127.0.0.1:${angryPort}`, model: 'x' },
+    for await (const ev of chatStream({
+      cfg: { host: `http://127.0.0.1:${angryPort}`, model: 'x', retryWaitsMs: [10, 10, 10] },
       messages: [{ role: 'user', content: 'hi' }]
-    })) { /* 来ない */ }
+    })) {
+      if (ev.type === 'retry') angryRetries++;
+    }
   } catch (err) {
     httpErr = err.message;
   }
   angry.close();
   check('サーバーの言い分をそのまま見せる', httpErr.includes('500') && httpErr.includes('model not found'), httpErr);
+  check('駄目でも掛け直しは回数で打ち切る', angryRetries === 3, String(angryRetries));
+}
+
+
+// 2026-08-31 の朝に踏んだところ。
+// **Ollama は処理中でもモデルを降ろす。** 誰かが同じモデルを別の広さで呼ぶか、
+// 別のモデルに GPU の枠を取られると、こちらの依頼は途中で消えて
+// HTTP 500 "unexpected EOF" だけが返る。前処理に2分かけていても、丸ごと消える。
+// 相手を1つずつ直しても、次に増えた道具がまた同じことをする。だから自分で立ち直る。
+console.log('\n積み直しに巻き込まれたとき');
+{
+  const http = await import('node:http');
+
+  // 1回目だけ 500、2回目からは普通に返す＝積み直しに当たった直後の形
+  let hits = 0;
+  const evicting = http.createServer((req, res) => {
+    hits++;
+    if (hits === 1) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'an error was encountered while running the model: unexpected EOF' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    res.write(`${JSON.stringify({ message: { content: '直りました' } })}\n`);
+    res.end(`${JSON.stringify({ done: true })}\n`);
+  });
+  await new Promise((r) => evicting.listen(0, '127.0.0.1', r));
+  const evictPort = evicting.address().port;
+
+  let text = '';
+  let notice = null;
+  let failed = '';
+  try {
+    for await (const ev of chatStream({
+      cfg: { host: `http://127.0.0.1:${evictPort}`, model: 'x', retryWaitsMs: [10, 10, 10] },
+      messages: [{ role: 'user', content: 'hi' }]
+    })) {
+      if (ev.type === 'retry') notice = ev;
+      if (ev.type === 'content') text += ev.text;
+    }
+  } catch (err) {
+    failed = err.message;
+  }
+  evicting.close();
+
+  check('降ろされても掛け直して最後まで通す', text === '直りました' && !failed, `${text}${failed}`);
+  check('掛け直したことは黙らない', notice?.type === 'retry' && notice.attempt === 1, JSON.stringify(notice));
+  check('掛け直しの知らせに理由が入っている', /unexpected EOF/.test(notice?.reason || ''), notice?.reason);
+  check('2回目で済んでいる（無駄に投げない）', hits === 2, String(hits));
+
+  // 出はじめたあとに切れた場合は掛け直さない。
+  // 同じ話が二度流れるし、途中まで組み立てた道具の呼び出しが二重に走りうる。
+  let midHits = 0;
+  const midway = http.createServer((req, res) => {
+    midHits++;
+    res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    res.write(`${JSON.stringify({ message: { content: 'とちゅうまで' } })}\n`);
+    setTimeout(() => res.destroy(), 30);
+  });
+  await new Promise((r) => midway.listen(0, '127.0.0.1', r));
+  const midPort = midway.address().port;
+
+  let midText = '';
+  let midErr = '';
+  try {
+    for await (const ev of chatStream({
+      cfg: { host: `http://127.0.0.1:${midPort}`, model: 'x', firstTokenMs: 5000, stallMs: 5000, retryWaitsMs: [10, 10, 10] },
+      messages: [{ role: 'user', content: 'hi' }]
+    })) {
+      if (ev.type === 'content') midText += ev.text;
+    }
+  } catch (err) {
+    midErr = err.message;
+  }
+  midway.close();
+  check('出はじめたあとは掛け直さない', midHits === 1, String(midHits));
+  check('そこまでに届いた分は残る', midText === 'とちゅうまで', midText);
+  check('切れたことは伝わる', Boolean(midErr), midErr);
+
+  // 掛け直して意味のある壊れ方かの見分け
+  check(
+    '500 と EOF は掛け直す',
+    isTransientOllamaError(new Error('Ollama がエラーを返しました (HTTP 500): unexpected EOF')) &&
+      isTransientOllamaError(new Error('Ollama につながりません: ECONNREFUSED')),
+    'transient'
+  );
+  check(
+    '依頼が悪いときは掛け直さない',
+    !isTransientOllamaError(new Error('HTTP 400: invalid tool schema')) &&
+      !isTransientOllamaError(new Error('Ollama が 15 分だまったままなので、待つのをやめました。')),
+    'permanent'
+  );
+  const aborted = new Error('中断しました');
+  aborted.name = 'AbortError';
+  check('中断は掛け直さない', !isTransientOllamaError(aborted), 'abort');
+  check('既定は3回まで', DEFAULT_CONFIG.retryWaitsMs.length === 3, String(DEFAULT_CONFIG.retryWaitsMs));
 }
 
 
@@ -2208,6 +2307,76 @@ console.log('\n確認なしモードの保存と打ち消し');
   fake.close();
   fs.rmSync(home, { recursive: true, force: true });
   fs.rmSync(work, { recursive: true, force: true });
+}
+
+// 掛け直しは ollama.mjs の試験で見ているが、そこは「輪の中でどう見えるか」までは通らない。
+// 実際に落ちたときに困るのは、画面に何も出ないまま作業が終わってしまうことなので、
+// 本物の bin/qwc.mjs を偽 Ollama に当てて、知らせと答えの両方が出るところまで通す。
+console.log('\n降ろされても作業が続く（実機の経路）');
+{
+  const http = await import('node:http');
+  const { spawn } = await import('node:child_process');
+  const qwcBin = path.join(here, '..', 'bin', 'qwc.mjs');
+
+  let chats = 0;
+  const evicting = http.createServer((req, res) => {
+    const url = req.url.split('?')[0];
+    if (url !== '/api/chat') {
+      const body = {
+        '/api/version': { version: '0.20.0' },
+        '/api/tags': { models: [{ name: 'gemma4:26b' }] },
+        '/api/show': { capabilities: ['completion', 'tools', 'thinking'], model_info: {} },
+        '/api/ps': { models: [{ name: 'gemma4:26b', size: 100, size_vram: 100 }] },
+        '/api/generate': { done: true }
+      }[url] || { done: true };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+      return;
+    }
+    chats++;
+    if (chats === 1) {
+      // ここが実機で起きていたこと。前処理の途中でモデルごと降ろされた
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'an error was encountered while running the model: unexpected EOF' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+    res.write(`${JSON.stringify({ message: { content: 'ちゃんと答えました' } })}\n`);
+    res.end(`${JSON.stringify({ done: true })}\n`);
+  });
+  await new Promise((r) => evicting.listen(0, '127.0.0.1', r));
+  const host = `http://127.0.0.1:${evicting.address().port}`;
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-home-'));
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-work-'));
+  fs.mkdirSync(path.join(home, '.qwythos-code'), { recursive: true });
+  // 試験では待たない。段数（＝掛け直す回数）は既定のまま
+  fs.writeFileSync(
+    path.join(home, '.qwythos-code', 'config.json'),
+    JSON.stringify({ retryWaitsMs: [10, 10, 10], autoApprove: true })
+  );
+
+  const seen = await new Promise((resolve) => {
+    const proc = spawn(process.execPath, [qwcBin, '--host', host], {
+      cwd: work,
+      env: { ...process.env, HOME: home },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let buf = '';
+    proc.stdout.on('data', (chunk) => { buf += chunk; });
+    proc.stderr.on('data', (chunk) => { buf += chunk; });
+    proc.stdin.end('こんにちは\n/exit\n');
+    const giveUp = setTimeout(() => proc.kill('SIGKILL'), 20000);
+    proc.on('close', () => { clearTimeout(giveUp); resolve(buf); });
+  });
+
+  evicting.close();
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(work, { recursive: true, force: true });
+
+  check('落とされても答えまでたどり着く', /ちゃんと答えました/.test(seen), seen.slice(-400));
+  check('落とされたことは画面に出る', /掛け直します/.test(seen), seen.slice(-400));
+  check('掛け直しは1回で済んでいる', chats === 2, String(chats));
 }
 
 // ── ツールの往復の上限 ──────────────────────────────────────

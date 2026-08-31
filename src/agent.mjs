@@ -530,7 +530,9 @@ export class Agent {
             quietStop();
           }
           if (next.done) return;
-          started = true;
+          // 掛け直しの知らせは「出はじめた」に数えない。
+          // これを数えると、次の1文字目までの長い待ちが無音の見切り側に渡ってしまう。
+          if (next.value?.type !== 'retry') started = true;
           yield next.value;
         }
       } finally {
@@ -541,6 +543,18 @@ export class Agent {
     let final = null;
 
     for await (const ev of events) {
+      // Ollama がこちらの依頼ごとモデルを降ろした。掛け直すので、黙って消えない。
+      // 「なぜか長い」で終わらせると、次に同じことが起きても気づけない。
+      if (ev.type === 'retry') {
+        spinner.stop();
+        warn(
+          `Ollama に依頼を落とされました（${ev.reason.slice(0, 120)}）。` +
+            `${(ev.waitMs / 1000).toFixed(ev.waitMs < 1000 ? 2 : 0)}秒待って掛け直します（${ev.attempt}/${ev.total}回目）。`
+        );
+        spinner.start();
+        continue;
+      }
+
       if (ev.type === 'thinking') {
         if (phase !== 'thinking') {
           spinner.stop();
