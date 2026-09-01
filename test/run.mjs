@@ -2476,6 +2476,63 @@ console.log('\n考えた内容の捨てどき');
 }
 
 
+// 前の依頼で読んだ内容は、次の依頼が来た時点で短くする。
+//
+// 文脈を太らせているのは、ほぼ道具の出力だけだった（実測: 6件頼んだ会話で 0 → 68,247 文字）。
+// `compactAtRatio`(0.7) の圧縮は 45,875 トークンを超えるまで働かず、ふつうの作業では発動しない。
+console.log('\n古い道具の出力の短縮');
+{
+  class Reader extends Agent {
+    constructor(opts) {
+      super(opts);
+      this.calls = 0;
+    }
+    async streamAssistant() {
+      this.calls++;
+      // 依頼ごとに1回だけ道具を呼び、次の手で終わる
+      if (this.calls % 2 === 1) {
+        return {
+          message: { role: 'assistant', content: '' },
+          toolCalls: [{ name: 'read_file', args: { path: 'a.js' }, id: `r${this.calls}` }],
+          stats: null
+        };
+      }
+      return { message: { role: 'assistant', content: '読みました' }, toolCalls: [], stats: null };
+    }
+    async executeTool() {
+      return { output: 'X'.repeat(9000), denied: false };
+    }
+  }
+
+  const sroot = path.join(root, 'shrink');
+  fs.mkdirSync(sroot, { recursive: true });
+  const make = (extra = {}) =>
+    new Reader({
+      config: { ...DEFAULT_CONFIG, autoApprove: true, ...extra },
+      root: sroot,
+      permissions: new PermissionManager({ ...DEFAULT_CONFIG, autoApprove: true }, async () => 'y')
+    });
+
+  const a = make();
+  for (const q of ['1件め', '2件め', '3件め']) await a.runTurn(q);
+  const outs = a.messages.filter((m) => m.role === 'tool').map((m) => m.content.length);
+  check('古い依頼のぶんは短くなる', outs[0] < 700, JSON.stringify(outs));
+  check('直前の依頼のぶんは残る', outs[outs.length - 1] === 9000, JSON.stringify(outs));
+  check('短くしたことはモデルにも書いてある',
+    /EARLIER request/.test(a.messages.filter((m) => m.role === 'tool')[0].content));
+
+  const b = make({ shrinkOldToolOutput: false });
+  for (const q of ['1件め', '2件め', '3件め']) await b.runTurn(q);
+  const kept = b.messages.filter((m) => m.role === 'tool').map((m) => m.content.length);
+  check('設定で切らないこともできる', kept.every((n) => n === 9000), JSON.stringify(kept));
+
+  const c2 = make({ keepFullToolTurns: 0 });
+  for (const q of ['1件め', '2件め']) await c2.runTurn(q);
+  const none = c2.messages.filter((m) => m.role === 'tool').map((m) => m.content.length);
+  check('直前も残さない設定にもできる', none[0] < 700, JSON.stringify(none));
+}
+
+
 // ── ツールの往復の上限 ──────────────────────────────────────
 //
 // 40 では実作業で足りず、途中で壁に当たって「続けて」と打ち直すことになっていた。

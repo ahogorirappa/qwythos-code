@@ -132,6 +132,25 @@ export class Agent {
       if (m.role === 'assistant' && m.thinking) delete m.thinking;
     }
 
+    // 前の依頼で読んだファイルの中身も、ここで短くする。
+    //
+    // **文脈を太らせているのは、ほぼ道具の出力だけ。**
+    // 実測（2026-09-02・同じ会話で6件頼んだとき）: 指示文は 5,773 文字で一定、
+    // 考えは0、本文は 638 文字。伸びていたのは道具の出力だけで 0 → 68,247 文字。
+    // 入力は 2,893 → 35,215 トークン、1手の前処理は 0.9秒 → 53.4秒、
+    // 生成は 37.0 → 21.7 tok/s まで落ちた。
+    //
+    // `maybeCompact()` にも同じ短縮はあるが、**文脈の7割（45,875トークン）を
+    // 超えてからしか働かない**。上の実測は 35,215 で終わっており、一度も発動していない。
+    // ＝仕組みはあるのに、実際の作業では効いていなかった。
+    //
+    // ここでやるのは、**依頼の切れ目という自然な区切り**だから。
+    // 作業中に消すと、いま読んでいるファイルの中身まで消えかねない。
+    const freed = this.shrinkOldToolOutput();
+    if (freed > 2000) {
+      info(`前の依頼で読んだ内容を短くしました（${freed.toLocaleString()} 文字）。必要ならもう一度読みます。`);
+    }
+
     // 画像は Ollama の作法どおり、その発言に添えて送る（base64 の配列）。
     // 前の発言に付いていた画像は落とす。1枚で数十万トークン相当になるため、
     // 残したままだと2枚目を渡した時点で文脈が尽きる。
@@ -333,7 +352,9 @@ export class Agent {
             role: 'tool',
             tool_name: call.name,
             tool_call_id: call.id,
-            content: outcome.output
+            content: outcome.output,
+            // どの依頼で読んだものかを刻んでおく（古くなったら短くするため）
+            turn: this.stats.turns
           });
           if (outcome.denied) denied = true;
         }
@@ -1025,6 +1046,33 @@ export class Agent {
     // いまのセッションにもすぐ効かせる
     if (applied.length) this.rebuildSystemPrompt();
     return { applied, reason: applied.length ? '' : '当てられる変更がありませんでした。' };
+  }
+
+  /**
+   * 前の依頼で読んだ道具の出力を短くする。短くできた文字数を返す。
+   *
+   * 直前の依頼のぶんは残す（「さっきのファイルのここを直して」が普通にあるため）。
+   * 短くしたことは**モデルにも分かる書き方で残す**。黙って消すと、
+   * 読んだつもりのまま話を進めて、ありもしない行を直そうとする。
+   */
+  shrinkOldToolOutput() {
+    if (this.config.shrinkOldToolOutput === false) return 0;
+    const keep = Math.max(0, this.config.keepFullToolTurns ?? 1);
+    const max = Math.max(0, this.config.oldToolOutputChars ?? 400);
+    const cutoff = this.stats.turns - keep;
+    let freed = 0;
+    for (const m of this.messages) {
+      if (m.role !== 'tool' || typeof m.content !== 'string') continue;
+      if (typeof m.turn !== 'number' || m.turn > cutoff) continue;
+      if (m.content.length <= max) continue;
+      const before = m.content.length;
+      m.content =
+        `${m.content.slice(0, max)}\n` +
+        `…[${before - max} characters dropped. This output is from an EARLIER request. ` +
+        'Do not conclude anything about the dropped part. If you need it, read it again.]';
+      freed += before - m.content.length;
+    }
+    return freed;
   }
 
   changedFileList() {
