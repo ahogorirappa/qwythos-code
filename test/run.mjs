@@ -2645,16 +2645,22 @@ console.log('\n考える深さ（/effort）');
   check('off だけ思考なし',
     thinkValueFor('off') === false && thinkValueFor('low') === 'low' && thinkValueFor('high') === 'high');
   check('off には長さの指示を付けない', effortDirective('off') === null);
-  check('段階ごとに違う一文', new Set(['low', 'medium', 'high'].map(effortDirective)).size === 3);
+  check('長さを絞る段は違う一文', effortDirective('low') !== effortDirective('medium'));
+  // high に「深く考えよ」を足すと、深くならないまま答えの形だけ壊れた（2026-09-03 実測）。
+  // ここが null であることは仕様。うっかり足し戻さないよう固めておく。
+  check('high は指示を足さない（素の深さ）', effortDirective('high') === null);
 
   // 指示文の末尾に入るか。**末尾でないと gemma4 は落とす**（言語指示で実測済み）
-  for (const e of ['low', 'medium', 'high']) {
+  for (const e of ['low', 'medium']) {
     const p = buildSystemPrompt({ root, config: { effort: e, skillCount: 0 } });
     check(`${e} の一文が指示文の末尾に入る`, p.trimEnd().endsWith(effortDirective(e)));
   }
   const pOff = buildSystemPrompt({ root, config: { effort: 'off', skillCount: 0 } });
   check('off では一文を足さない',
-    ['low', 'medium', 'high'].every((e) => !pOff.includes(effortDirective(e))));
+    ['low', 'medium'].every((e) => !pOff.includes(effortDirective(e))));
+  const pHigh = buildSystemPrompt({ root, config: { effort: 'high', skillCount: 0 } });
+  check('high でも一文を足さない',
+    ['low', 'medium'].every((e) => !pHigh.includes(effortDirective(e))));
 
   // モデルに合わせる側。思考を持つ／持たないの2通りで立てる
   const serve = (caps) => new Promise((resolve) => {
