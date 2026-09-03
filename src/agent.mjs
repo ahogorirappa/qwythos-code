@@ -132,24 +132,21 @@ export class Agent {
       if (m.role === 'assistant' && m.thinking) delete m.thinking;
     }
 
-    // 前の依頼で読んだファイルの中身も、ここで短くする。
+    // **ここで道具の出力を短くしてはいけない。** 2026-09-02 に一度やって、失敗した。
     //
-    // **文脈を太らせているのは、ほぼ道具の出力だけ。**
-    // 実測（2026-09-02・同じ会話で6件頼んだとき）: 指示文は 5,773 文字で一定、
-    // 考えは0、本文は 638 文字。伸びていたのは道具の出力だけで 0 → 68,247 文字。
-    // 入力は 2,893 → 35,215 トークン、1手の前処理は 0.9秒 → 53.4秒、
-    // 生成は 37.0 → 21.7 tok/s まで落ちた。
+    // 狙いは当たっていた。文脈は 35,215 → 15,978 トークンに収まり、生成は3割速くなった。
+    // だが **前処理が 87秒 → 193秒 と倍になった**。
     //
-    // `maybeCompact()` にも同じ短縮はあるが、**文脈の7割（45,875トークン）を
-    // 超えてからしか働かない**。上の実測は 35,215 で終わっており、一度も発動していない。
-    // ＝仕組みはあるのに、実際の作業では効いていなかった。
+    // 理由は llama.cpp の prompt cache が**先頭からの一致でしか再利用できない**こと。
+    // 履歴を後から書き換えると、そこから先の cache が丸ごと無効になる。
+    // しかも Gemma 4 は SWA を使うので checkpoint 1件が 106MiB あり（0.104MiB/token × n_swa 1024）、
+    // 8GiB の枠に 35件しか入らない。**死んだ 106MiB を毎ターン1個ずつ投入していた。**
+    // ログには `forcing full prompt re-processing due to lack of cache data` が並び、
+    // その全件が `cache size limit reached, removing oldest entry` の直後だった。
     //
-    // ここでやるのは、**依頼の切れ目という自然な区切り**だから。
-    // 作業中に消すと、いま読んでいるファイルの中身まで消えかねない。
-    const freed = this.shrinkOldToolOutput();
-    if (freed > 2000) {
-      info(`前の依頼で読んだ内容を短くしました（${freed.toLocaleString()} 文字）。必要ならもう一度読みます。`);
-    }
+    // いまは2段構えにしてある:
+    //   A-1 追記時に切る（tools.mjs の truncateOutput・maxToolChars）… 一度も書き換えない
+    //   A-2 閾値を超えたときだけ1回まとめて圧縮（maybeCompact）      … 発動は数十ターンに1回
 
     // 画像は Ollama の作法どおり、その発言に添えて送る（base64 の配列）。
     // 前の発言に付いていた画像は落とす。1枚で数十万トークン相当になるため、
@@ -904,16 +901,14 @@ export class Agent {
     const limit = Math.floor(this.config.numCtx * this.config.compactAtRatio);
     if (estimateTokens(this.messages) < limit) return;
 
-    // まず古いツール出力を短くする（これだけで足りることが多い）
-    const cutoff = this.messages.length - 8;
-    for (let i = 1; i < cutoff; i++) {
-      const m = this.messages[i];
-      if (m.role === 'tool' && m.content && m.content.length > 400) {
-        m.content = `${m.content.slice(0, 300)}\n…[古い出力のため省略]`;
-      }
-    }
+    // まず古いツール出力を短くする（これだけで足りることが多い）。
+    // **これは1回きりの出来事**で、毎ターン走らせてはいけない（runTurn の注記を参照）。
+    const freed = this.compactToolOutputOnce();
     if (estimateTokens(this.messages) < limit) {
-      info('古いツール出力を短くして文脈を空けました。');
+      if (freed) {
+        info(`古い道具の出力をまとめて短くしました（${freed.toLocaleString()} 文字）。` +
+             'この1回だけ読み直しが入りますが、以後は元に戻ります。');
+      }
       return;
     }
 
@@ -1049,13 +1044,21 @@ export class Agent {
   }
 
   /**
-   * 前の依頼で読んだ道具の出力を短くする。短くできた文字数を返す。
+   * 古い道具の出力をまとめて短くする。短くできた文字数を返す。
+   *
+   * **毎ターン呼んではいけない。** 呼ぶのは `maybeCompact()` から、
+   * 文脈が `numCtx × compactAtRatio` を超えたときだけ。理由は runTurn の注記に書いた
+   * （履歴を書き換えるたびに 106MiB の死んだ checkpoint が cache 枠を1つ潰す）。
+   *
+   * 一度短くした要素には `frozen` を立て、**二度と触らない**。
+   * これが無いと、閾値の前後を行き来するたびに同じ場所を書き換え続けて、
+   * 「1回きり」のはずの出費が毎ターンに戻る。
    *
    * 直前の依頼のぶんは残す（「さっきのファイルのここを直して」が普通にあるため）。
    * 短くしたことは**モデルにも分かる書き方で残す**。黙って消すと、
    * 読んだつもりのまま話を進めて、ありもしない行を直そうとする。
    */
-  shrinkOldToolOutput() {
+  compactToolOutputOnce() {
     if (this.config.shrinkOldToolOutput === false) return 0;
     const keep = Math.max(0, this.config.keepFullToolTurns ?? 1);
     const max = Math.max(0, this.config.oldToolOutputChars ?? 400);
@@ -1063,6 +1066,7 @@ export class Agent {
     let freed = 0;
     for (const m of this.messages) {
       if (m.role !== 'tool' || typeof m.content !== 'string') continue;
+      if (m.frozen) continue;                       // 一度短くしたものは触らない
       if (typeof m.turn !== 'number' || m.turn > cutoff) continue;
       if (m.content.length <= max) continue;
       const before = m.content.length;
@@ -1070,6 +1074,7 @@ export class Agent {
         `${m.content.slice(0, max)}\n` +
         `…[${before - max} characters dropped. This output is from an EARLIER request. ` +
         'Do not conclude anything about the dropped part. If you need it, read it again.]';
+      m.frozen = true;
       freed += before - m.content.length;
     }
     return freed;

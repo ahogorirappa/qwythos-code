@@ -130,7 +130,17 @@ export const DEFAULT_CONFIG = {
   //   - Ctrl+C（ctx.signal で実行中のコマンドごと止まる）
   // なので、ここは「本当に何かがおかしいときの最後の網」として大きく取る。
   maxSteps: 200,
-  maxToolChars: 12000,    // ツールの出力をこれ以上は切り詰める
+  // 道具の出力を、**履歴に入れる瞬間に**この長さで切る（freeze-on-write）。
+  //
+  // 12,000 から 4,000 に下げた（2026-09-03）。切るのは追記時の一度だけで、
+  // **以後この文字列には二度と触らない。** 後から書き換えると llama.cpp の
+  // prompt cache が先頭一致を失い、Gemma 4 では 106MiB の checkpoint が
+  // 死んだまま枠を占有する（agent.mjs の runTurn の注記を参照）。
+  //
+  // 4,000 にした根拠: 12,000 で実測したとき 1手の前処理が 12〜27秒だったのに対し、
+  // 4,000 では 0.3〜13秒で、キャッシュ命中（315ms / 378ms）も観測できた。
+  // 切った箇所には read_file の offset/limit で読み直せることを書いてある（truncateOutput）。
+  maxToolChars: 4000,
   maxFileBytes: 400000,   // これより大きいファイルは丸ごと読まない
   commandTimeoutMs: 120000,
   compactAtRatio: 0.7,    // 文脈がこの割合を超えたら自動で要約圧縮

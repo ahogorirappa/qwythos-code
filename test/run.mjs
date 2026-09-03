@@ -2502,6 +2502,11 @@ console.log('\n古い道具の出力の短縮');
     async executeTool() {
       return { output: 'X'.repeat(9000), denied: false };
     }
+    // 第2段（要約）は本物のモデルを呼ぶので、ここでは塞ぐ。
+    // 見たいのは第1段（古い道具出力の圧縮）が何回走るかであって、要約の中身ではない。
+    async compact() {
+      this.compactCalls = (this.compactCalls || 0) + 1;
+    }
   }
 
   const sroot = path.join(root, 'shrink');
@@ -2513,23 +2518,59 @@ console.log('\n古い道具の出力の短縮');
       permissions: new PermissionManager({ ...DEFAULT_CONFIG, autoApprove: true }, async () => 'y')
     });
 
-  const a = make();
+  // ── A-1 追記時に確定させる（freeze-on-write） ────────────────
+  // **枠に余裕があるうちは、履歴を1バイトも書き換えないこと。**
+  // 2026-09-02 に毎ターン書き換える実装を入れて、前処理が 87秒 → 193秒 に倍増した。
+  // llama.cpp の prompt cache は先頭一致でしか再利用できず、Gemma 4 は SWA のため
+  // checkpoint 1件が 106MiB ある。書き換えるたびに死んだ 106MiB が枠を1つ潰す。
+  const a = make({ numCtx: 1_000_000 });   // 閾値に届かない広さ
   for (const q of ['1件め', '2件め', '3件め']) await a.runTurn(q);
   const outs = a.messages.filter((m) => m.role === 'tool').map((m) => m.content.length);
-  check('古い依頼のぶんは短くなる', outs[0] < 700, JSON.stringify(outs));
-  check('直前の依頼のぶんは残る', outs[outs.length - 1] === 9000, JSON.stringify(outs));
-  check('短くしたことはモデルにも書いてある',
-    /EARLIER request/.test(a.messages.filter((m) => m.role === 'tool')[0].content));
+  check('枠に余裕があるうちは1バイトも書き換えない',
+    outs.every((n) => n === 9000), JSON.stringify(outs));
+  check('確定印も立てない', a.messages.filter((m) => m.frozen).length === 0);
 
-  const b = make({ shrinkOldToolOutput: false });
+  // ── A-2 閾値を超えたときだけ、1回まとめて圧縮する ──────────────
+  const b = make({ numCtx: 4000, compactAtRatio: 0.7 });  // すぐ閾値を超える広さ
   for (const q of ['1件め', '2件め', '3件め']) await b.runTurn(q);
-  const kept = b.messages.filter((m) => m.role === 'tool').map((m) => m.content.length);
+  const shrunk = b.messages.filter((m) => m.role === 'tool').map((m) => m.content.length);
+  check('閾値を超えたら古いぶんは短くなる', shrunk[0] < 700, JSON.stringify(shrunk));
+  check('直前の依頼のぶんは残る', shrunk[shrunk.length - 1] === 9000, JSON.stringify(shrunk));
+  check('短くしたことはモデルにも書いてある',
+    /EARLIER request/.test(b.messages.filter((m) => m.role === 'tool')[0].content));
+
+  // ── 一度短くしたものは二度と触らない（frozen） ────────────────
+  // これが無いと、閾値の前後を行き来するたびに同じ場所を書き換え続け、
+  // 「1回きり」のはずの出費が毎ターンに戻る。
+  const frozenBefore = b.messages.filter((m) => m.frozen).map((m) => m.content);
+  check('短くしたものに確定印が立つ', frozenBefore.length > 0);
+  await b.runTurn('4件め');
+  await b.runTurn('5件め');
+  const frozenAfter = b.messages.filter((m) => m.frozen).map((m) => m.content);
+  check('確定したものは以後1バイトも変わらない',
+    frozenBefore.every((t, i) => frozenAfter[i] === t),
+    `${frozenBefore.length} → ${frozenAfter.length}`);
+
+  // 2回目の圧縮は、まだ確定していないものだけを対象にする
+  const freedAgain = b.compactToolOutputOnce();
+  const twice = b.compactToolOutputOnce();
+  check('確定済みは2度目の圧縮でも対象外', twice === 0, String(twice));
+
+  const c = make({ numCtx: 4000, shrinkOldToolOutput: false });
+  for (const q of ['1件め', '2件め', '3件め']) await c.runTurn(q);
+  const kept = c.messages.filter((m) => m.role === 'tool').map((m) => m.content.length);
   check('設定で切らないこともできる', kept.every((n) => n === 9000), JSON.stringify(kept));
 
-  const c2 = make({ keepFullToolTurns: 0 });
+  const c2 = make({ numCtx: 4000, keepFullToolTurns: 0 });
   for (const q of ['1件め', '2件め']) await c2.runTurn(q);
   const none = c2.messages.filter((m) => m.role === 'tool').map((m) => m.content.length);
   check('直前も残さない設定にもできる', none[0] < 700, JSON.stringify(none));
+
+  // ── A-1 の実物: 道具の出力は追記時に maxToolChars で切られる ────
+  const big = truncateOutput('Y'.repeat(50000), DEFAULT_CONFIG.maxToolChars);
+  check('追記時に maxToolChars で切る', big.length < DEFAULT_CONFIG.maxToolChars + 400,
+    `${big.length} 字 (上限 ${DEFAULT_CONFIG.maxToolChars})`);
+  check('読み直す手段を書いてある', /offset\/limit/.test(big));
 }
 
 
