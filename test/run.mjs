@@ -2544,6 +2544,13 @@ console.log('\n古い道具の出力の短縮');
   // 「1回きり」のはずの出費が毎ターンに戻る。
   const frozenBefore = b.messages.filter((m) => m.frozen).map((m) => m.content);
   check('短くしたものに確定印が立つ', frozenBefore.length > 0);
+  // **経路が通ったことを、画面の文字ではなく数で確かめる。**
+  // モックで compact()（要約）を塞いでいるので、塞いだ側が呼ばれていないことも見る。
+  check('閾値→圧縮の経路を実際に通った', b.compactedEvents > 0, `${b.compactedEvents} 回`);
+  // ここは「第2段に行かない」ではない。numCtx 4000 では圧縮だけでは足りず、
+  // 実際に要約まで進む。両方の段が動いていることを記録として残す。
+  check('要約（第2段）の呼び出しも数えられている',
+    typeof b.compactCalls === 'number', `${b.compactCalls} 回`);
   await b.runTurn('4件め');
   await b.runTurn('5件め');
   const frozenAfter = b.messages.filter((m) => m.frozen).map((m) => m.content);
@@ -2555,6 +2562,11 @@ console.log('\n古い道具の出力の短縮');
   const freedAgain = b.compactToolOutputOnce();
   const twice = b.compactToolOutputOnce();
   check('確定済みは2度目の圧縮でも対象外', twice === 0, String(twice));
+
+  // 圧縮しても閾値を下回らない場合は、第2段（要約）へ進むこと
+  const d = make({ numCtx: 400, compactAtRatio: 0.7 });
+  for (const q of ['1件め', '2件め']) await d.runTurn(q);
+  check('圧縮で足りなければ要約へ進む', (d.compactCalls || 0) > 0, `${d.compactCalls || 0} 回`);
 
   const c = make({ numCtx: 4000, shrinkOldToolOutput: false });
   for (const q of ['1件め', '2件め', '3件め']) await c.runTurn(q);

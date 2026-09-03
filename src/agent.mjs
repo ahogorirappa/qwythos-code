@@ -904,6 +904,7 @@ export class Agent {
     // まず古いツール出力を短くする（これだけで足りることが多い）。
     // **これは1回きりの出来事**で、毎ターン走らせてはいけない（runTurn の注記を参照）。
     const freed = this.compactToolOutputOnce();
+    if (freed) this.compactedEvents = (this.compactedEvents || 0) + 1;
     if (estimateTokens(this.messages) < limit) {
       if (freed) {
         info(`古い道具の出力をまとめて短くしました（${freed.toLocaleString()} 文字）。` +
