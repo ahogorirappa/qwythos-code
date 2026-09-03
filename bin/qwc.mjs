@@ -31,6 +31,7 @@ import {
   sendDisplayToStderr, Spinner, renderDiff, formatTiming
 } from '../src/ui.mjs';
 import { serve, requestTool, emit, ready, turnEnd } from '../src/embed.mjs';
+import { EFFORT_LEVELS, EFFORT_ORDER, DEFAULT_EFFORT, normalizeEffort } from '../src/effort.mjs';
 
 const VERSION = '0.2.0';
 
@@ -55,7 +56,8 @@ function parseArgs(argv) {
       // 保存できるようにした以上、抜け道が無いと危ない作業のときに困る。
       case '--confirm': case '--no-yolo': opts.overrides.autoApprove = false; break;
       case '--accept-edits': opts.overrides.acceptEdits = true; break;
-      case '--no-think': opts.overrides.think = false; break;
+      case '--no-think': opts.overrides.effort = 'off'; break;
+      case '--effort': opts.overrides.effort = next(); break;
       case '--show-thinking': opts.overrides.showThinking = 'full'; break;
       case '--quiet-thinking': opts.overrides.showThinking = 'off'; break;
       case '--allow-outside': opts.overrides.allowOutsideRoot = true; break;
@@ -98,6 +100,7 @@ ${c.bold('オプション')}
       --confirm          その回だけ確認ありに戻す（--no-yolo も同じ）
       --accept-edits     書き換えだけ確認なしにする（コマンドとネットは確認する）
       --no-think         思考モードを切る（速くなるが精度は落ちる）
+      --effort <段階>    考える深さ（off / low / medium / high・既定 medium）
       --show-thinking    考えている内容を全部表示する
       --quiet-thinking   考えている様子を表示しない
       --cwd <フォルダ>   作業フォルダを指定する
@@ -111,7 +114,7 @@ ${c.bold('オプション')}
   -v, --version          バージョン
 
 ${c.bold('対話中に使えるコマンド')}
-  /help /clear /compact /model /think /yolo /accept /plan /chat /tools /stats /files /diff /undo /refine /init /exit
+  /help /clear /compact /model /think /effort /yolo /accept /plan /chat /tools /stats /files /diff /undo /refine /init /exit
   /login /logins /logout   ログインが要るサイトを読めるようにする
 `);
 }
@@ -123,7 +126,8 @@ ${c.bold('  対話中のコマンド')}
   ${c.cyan('/clear')}     会話をまっさらにする（作業フォルダはそのまま）
   ${c.cyan('/compact')}   会話をいますぐ要約して短くする
   ${c.cyan('/model')}     モデルを見る・切り替える（例: /model qwen3:14b-q4_K_M）
-  ${c.cyan('/think')}     思考モードの切り替え（on / off / full / compact）
+  ${c.cyan('/think')}     考えさせるか＋考えている様子の出し方（on / off / compact / full / quiet）
+  ${c.cyan('/effort')}    考える深さ（off / low / medium / high）
   ${c.cyan('/yolo')}      確認あり／なしを切り替える（全部飛ばす）
   ${c.cyan('/accept')}    書き換えだけ確認なしにする（コマンドとネットは確認する）
   ${c.cyan('/plan')}      計画モードの出入り（まず調べて方針を出す。書き換えない）
@@ -187,6 +191,44 @@ async function showThinkState(config) {
     line(`  ${c.gray('※ 考えてはいますが、様子は画面に出していません（/think compact で出せます）。')}`);
   }
   line(`  ${c.gray('変えるには: /think on | off | compact | full | quiet')}`);
+  line();
+}
+
+/**
+ * いまの「考える深さ」を出す。
+ *
+ * **効いていないものを「効いています」と書かないこと。** `/think` で一度これをやっている
+ * （compact は表示を変えるだけなのに、思考を浅くするものだと読める名前だった）。
+ *
+ * 深さの効かせ方は2つあり、モデルによって効く側が違う。
+ *   1. ollama の think 段階  … 段階を持つモデルだけ（gemma4:26b は無視する。2026-09-03 実測）
+ *   2. system プロンプトの一文 … 言うことを聞くモデルだけ
+ * どちらが今このモデルに効いているかは断言できないので、**送っている中身をそのまま見せる**。
+ */
+function showEffortState(config) {
+  const cur = normalizeEffort(config.effort) ?? DEFAULT_EFFORT;
+  // 全角は2桁ぶんの幅を取る。padEnd は文字数で数えるので、そのままだと列がずれる
+  //（`/think` の表示でも同じ手当てをしている）。
+  const wide = (t) => [...t].reduce((w, ch) => w + (/[^\x00-\xff]/.test(ch) ? 2 : 1), 0);
+  const pad = (t, w) => t + ' '.repeat(Math.max(0, w - wide(t)));
+
+  line();
+  for (const key of EFFORT_ORDER) {
+    const lv = EFFORT_LEVELS[key];
+    const here = key === cur;
+    const mark = here ? c.green('●') : c.gray('○');
+    const name = pad(key, 8);
+    const label = pad(lv.label, 10);
+    line(`  ${mark} ${here ? c.green(name) : c.gray(name)}${c.gray(label)}${c.gray(lv.hint)}`);
+  }
+  line();
+  line(`  ${c.gray('ollama に送る think')} ${c.cyan(String(config.think))}`);
+  const depth = EFFORT_LEVELS[cur].directive;
+  line(`  ${c.gray('指示文に足す一文　')} ${depth ? c.cyan(depth) : c.gray('（なし）')}`);
+  if (config.thinkPreference && config.think === false) {
+    line(`  ${c.yellow('※')} ${config.model} は思考モードを持たないので、深さの指定は効きません。`);
+  }
+  line(`  ${c.gray('変えるには: /effort off | low | medium | high')}`);
   line();
 }
 
@@ -820,18 +862,21 @@ async function handleSlash(text, { agent, config, permissions, root }) {
         return;
       }
 
+      // 深さの持ち主は config.effort ひとつ（src/effort.mjs）。
+      // ここで thinkPreference を直に触ると、次の adaptToModel が effort から上書きして元に戻る。
+      const wake = () => { if (config.effort === 'off') config.effort = DEFAULT_EFFORT; };
       if (arg === 'off') {
-        config.thinkPreference = false;
+        config.effort = 'off';
       } else if (arg === 'on') {
-        config.thinkPreference = true;
+        wake();
         config.showThinking = config.showThinking === 'off' ? 'compact' : config.showThinking;
       } else if (arg === 'full' || arg === 'compact') {
-        config.thinkPreference = true;
+        wake();
         config.showThinking = arg;
       } else if (arg === 'quiet') {
         // 考えさせるが、様子は画面に出さない（--quiet-thinking と同じ）。
         // これまで対話中から戻す手段が無かった。
-        config.thinkPreference = true;
+        wake();
         config.showThinking = 'off';
       } else {
         info('使い方: /think            いまの状態を見る');
@@ -848,6 +893,32 @@ async function handleSlash(text, { agent, config, permissions, root }) {
       for (const note of adapted.notes || []) info(note.text);
       agent.rebuildSystemPrompt();
       await showThinkState(config);
+      return;
+    }
+
+    case 'effort': {
+      // 引数なしは状態を見るだけ。`/think` が「見るつもりで打つと切り替わる」で困ったので、
+      // 同じ轍を踏まない。
+      if (arg === '') {
+        showEffortState(config);
+        return;
+      }
+      const want = normalizeEffort(arg);
+      if (want === null) {
+        info('使い方: /effort              いまの深さを見る');
+        info('        /effort off        考えさせない（道具を選ぶだけの作業。実測で約5倍速い）');
+        info('        /effort low        浅く考える');
+        info('        /effort medium     ふつう（既定）');
+        info('        /effort high       深く考える（実測で6〜24倍の時間）');
+        return;
+      }
+      config.effort = want;
+      // モデルが思考モードを持たなければ、ここで config.think が false に戻る。
+      // 指示文にも深さの一文が入るので、プロンプトも組み直す。
+      const done = await adaptToModel(config);
+      for (const note of done.notes || []) info(note.text);
+      agent.rebuildSystemPrompt();
+      showEffortState(config);
       return;
     }
 

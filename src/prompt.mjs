@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { effortDirective } from './effort.mjs';
 import { statSafe } from './paths.mjs';
 import { loadSkills, skillsBlock } from './skills.mjs';
 import { loadHarness, harnessBlock } from './harness.mjs';
@@ -305,6 +306,12 @@ The user will be asked to approve. If they approve, you get the write tools back
   if (projectContext) {
     prompt += `\n## Project instructions (from ${projectContext.name}) — follow these, they override the defaults above\n${projectContext.text.trim()}\n`;
   }
+
+  // 考える深さの指示。**末尾に置くこと。**
+  // gemma4 は上のほうに書いた指示を落とす（言語指示で実測済み・258行目の注記と同じ理由）。
+  // ollama の think 段階を見ないモデルでは、これだけが深さを変える手段になる。
+  const depth = effortDirective(config.effort);
+  if (depth) prompt += `\n${depth}\n`;
 
   return prompt;
 }

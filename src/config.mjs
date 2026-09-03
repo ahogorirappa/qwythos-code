@@ -39,6 +39,10 @@ export const DEFAULT_CONFIG = {
   keepAlive: '30m',
   think: true,
 
+  // 考える深さ（off / low / medium / high）。/effort で変える。
+  // 深さの意味と実測値は src/effort.mjs にまとめてある。
+  effort: 'medium',
+
   // モデルの返事をどれだけ待つか。
   //
   // モデルの読み込みや文脈枠の取り直しが挟まると、最初の1文字までが分単位になる。

@@ -1,6 +1,7 @@
 // Ollama の /api/chat と話す部分。逐次（ストリーミング）で受け取る。
 import http from 'node:http';
 import https from 'node:https';
+import { thinkValueFor, normalizeEffort, DEFAULT_EFFORT } from './effort.mjs';
 
 const jsonHeaders = { 'Content-Type': 'application/json' };
 
@@ -338,9 +339,17 @@ export async function adaptToModel(cfg) {
   const canVision = info.capabilities.includes('vision');
   cfg.vision = canVision;
 
-  // 利用者の希望（thinkPreference）は残したまま、実際に送る値だけモデルに合わせる
-  if (cfg.thinkPreference === undefined) cfg.thinkPreference = Boolean(cfg.think);
-  cfg.think = cfg.thinkPreference && canThink;
+  // **考える深さの持ち主は cfg.effort ただ1つ。** think と thinkPreference は毎回そこから作り直す。
+  //
+  // 持ち主を2つにすると `/think off` と `/effort high` が互いを打ち消し、
+  // どちらが効いているのか誰にも分からなくなる。深さを変える道は effort だけに寄せてある。
+  // ここを `cfg.thinkPreference && canThink` と書くと、段階（'low'）が true に潰れる。
+  //
+  // 保存済みの設定には think:false だけが入っていることがあるので、そこからも拾う。
+  if (cfg.effort === undefined && cfg.think === false) cfg.effort = 'off';
+  cfg.effort = normalizeEffort(cfg.effort) ?? DEFAULT_EFFORT;
+  cfg.think = canThink ? thinkValueFor(cfg.effort) : false;
+  cfg.thinkPreference = cfg.effort !== 'off';
   if (cfg.thinkPreference && !canThink) {
     notes.push({ level: 'info', text: `${cfg.model} は思考モードを持たないので、思考なしで動かします。` });
   }
@@ -579,7 +588,8 @@ async function* chatStreamOnce({ cfg, messages, tools, signal }) {
     model: cfg.model,
     messages,
     stream: true,
-    think: Boolean(cfg.think),
+    // 段階を持つモデルには段階のまま渡す。Boolean() で潰すと 'low' が true になる
+    think: cfg.think === false || cfg.think === undefined ? false : cfg.think,
     keep_alive: cfg.keepAlive,
     options: buildOptions(cfg)
   };

@@ -2622,6 +2622,118 @@ console.log('\n出はじめたあとに黙り込んでも取りこぼさない')
   slow.close();
 }
 
+
+// ── 考える深さ（/effort） ────────────────────────────────
+//
+// 2026-09-03 の実測で、考える／考えないの差は「道具選びでは無意味・論理では正誤が分かれる」だった。
+// 深さを選べるようにしたが、**壊れ方が静か**なので固めておく。
+//   ・段階が Boolean() で true に潰れると、high を頼んでも medium と同じものが飛ぶ
+//   ・深さの持ち主を2つ持つと、/think off と /effort high が互いを打ち消す
+console.log('\n考える深さ（/effort）');
+{
+  const { normalizeEffort, thinkValueFor, effortDirective, EFFORT_ORDER, DEFAULT_EFFORT } =
+    await import('../src/effort.mjs');
+  const { adaptToModel } = await import('../src/ollama.mjs');
+  const http = await import('node:http');
+
+  check('4段階ある', EFFORT_ORDER.length === 4, EFFORT_ORDER.join(','));
+  check('既定は medium', DEFAULT_EFFORT === 'medium', DEFAULT_EFFORT);
+  check('大文字でも通る', normalizeEffort('HIGH') === 'high');
+  check('数字でも通る', normalizeEffort('0') === 'off' && normalizeEffort('3') === 'high');
+  check('古い true/false も拾う', normalizeEffort(false) === 'off' && normalizeEffort(true) === 'medium');
+  check('知らない語は null（使い方を出すため）', normalizeEffort('ぬるぽ') === null);
+  check('off だけ思考なし',
+    thinkValueFor('off') === false && thinkValueFor('low') === 'low' && thinkValueFor('high') === 'high');
+  check('off には長さの指示を付けない', effortDirective('off') === null);
+  check('段階ごとに違う一文', new Set(['low', 'medium', 'high'].map(effortDirective)).size === 3);
+
+  // 指示文の末尾に入るか。**末尾でないと gemma4 は落とす**（言語指示で実測済み）
+  for (const e of ['low', 'medium', 'high']) {
+    const p = buildSystemPrompt({ root, config: { effort: e, skillCount: 0 } });
+    check(`${e} の一文が指示文の末尾に入る`, p.trimEnd().endsWith(effortDirective(e)));
+  }
+  const pOff = buildSystemPrompt({ root, config: { effort: 'off', skillCount: 0 } });
+  check('off では一文を足さない',
+    ['low', 'medium', 'high'].every((e) => !pOff.includes(effortDirective(e))));
+
+  // モデルに合わせる側。思考を持つ／持たないの2通りで立てる
+  const serve = (caps) => new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      const body = {
+        '/api/version': { version: '0.32.1' },
+        '/api/tags': { models: [{ name: 'm' }] },
+        '/api/show': { capabilities: caps, model_info: {} },
+        '/api/ps': { models: [] }
+      }[req.url.split('?')[0]] || { done: true };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
+    srv.listen(0, '127.0.0.1', () => resolve(srv));
+  });
+
+  const thinker = await serve(['completion', 'tools', 'thinking']);
+  const hostT = `http://127.0.0.1:${thinker.address().port}`;
+
+  const cfgHigh = { ...baseConfig(), host: hostT, model: 'm', effort: 'high' };
+  await adaptToModel(cfgHigh);
+  check('段階が潰れずに残る（Boolean 化の再発防止）', cfgHigh.think === 'high', String(cfgHigh.think));
+
+  const cfgOff = { ...baseConfig(), host: hostT, model: 'm', effort: 'off' };
+  await adaptToModel(cfgOff);
+  check('off なら think は false', cfgOff.think === false, String(cfgOff.think));
+  check('off なら thinkPreference も倒れる', cfgOff.thinkPreference === false);
+
+  // 深さの持ち主は effort ひとつ。think:true が残っていても effort が勝つ
+  const cfgFight = { ...baseConfig(), host: hostT, model: 'm', think: true, effort: 'off' };
+  await adaptToModel(cfgFight);
+  check('effort が think より強い（持ち主はひとつ）', cfgFight.think === false, String(cfgFight.think));
+
+  // 保存済みの設定に think:false だけが入っている場合の引き継ぎ
+  const cfgOld = { ...baseConfig(), host: hostT, model: 'm', think: false };
+  delete cfgOld.effort;
+  await adaptToModel(cfgOld);
+  check('古い think:false は off として引き継ぐ', cfgOld.effort === 'off', String(cfgOld.effort));
+
+  thinker.close();
+
+  const plain = await serve(['completion', 'tools']);
+  const cfgNo = { ...baseConfig(), host: `http://127.0.0.1:${plain.address().port}`, model: 'm', effort: 'high' };
+  const res = await adaptToModel(cfgNo);
+  check('思考を持たないモデルには段階を送らない', cfgNo.think === false, String(cfgNo.think));
+  check('その旨を知らせる', (res.notes || []).some((n) => /思考モード/.test(n.text)));
+  check('希望は残す（モデルを戻せば効く）', cfgNo.effort === 'high', String(cfgNo.effort));
+  plain.close();
+
+  // 実際に送る中身。ここが本丸で、body.think が 'high' のまま出ていること
+  let seen = null;
+  const cap = http.createServer((req, res) => {
+    if (req.url.startsWith('/api/chat')) {
+      let raw = '';
+      req.on('data', (d) => (raw += d));
+      req.on('end', () => {
+        seen = JSON.parse(raw);
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        res.end(JSON.stringify({ message: { content: 'ok' }, done: true }) + '\n');
+      });
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ done: true }));
+  });
+  await new Promise((r) => cap.listen(0, '127.0.0.1', r));
+  const capCfg = { ...baseConfig(), host: `http://127.0.0.1:${cap.address().port}`, model: 'm', think: 'high' };
+  for await (const _ of chatStream({ cfg: capCfg, messages: [{ role: 'user', content: 'hi' }] })) { /* 読み切る */ }
+  check('ollama への body に段階がそのまま乗る', seen && seen.think === 'high', JSON.stringify(seen?.think));
+
+  seen = null;
+  const capOff = { ...baseConfig(), host: `http://127.0.0.1:${cap.address().port}`, model: 'm', think: false };
+  for await (const _ of chatStream({ cfg: capOff, messages: [{ role: 'user', content: 'hi' }] })) { /* 読み切る */ }
+  check('off のときは false を送る', seen && seen.think === false, JSON.stringify(seen?.think));
+  cap.close();
+
+  check('/effort は予約語（同名の自作コマンドを作らせない）', isReserved('effort'));
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(`\n合計: ${passed} 件成功 / ${failed} 件失敗\n`);

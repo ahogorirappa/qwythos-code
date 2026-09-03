@@ -87,7 +87,7 @@ export function renderCommand(command, args) {
  * 2か所に別々の一覧を置くと、コマンドを足したときに片方だけ古いままになる。
  */
 export const BUILTIN_COMMANDS = [
-  'help', 'clear', 'compact', 'model', 'think', 'yolo', 'accept', 'plan', 'chat',
+  'help', 'clear', 'compact', 'model', 'think', 'effort', 'yolo', 'accept', 'plan', 'chat',
   'todo', 'todos', 'commands', 'tools', 'stats', 'files', 'diff', 'undo',
   'refine', 'login', 'logins', 'logout', 'init', 'save', 'exit', 'quit'
 ];
