@@ -2,7 +2,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chatStream, chatOnce } from './ollama.mjs';
+import { createHash } from 'node:crypto';
 import { TOOL_MAP, toolSchemas, truncateOutput } from './tools.mjs';
+
+// 中身が同じかどうかだけ分かればよいので、短い指紋で足りる。
+// 全文を持ち回すと、送信する JSON がそのぶん太る。
+function hashText(text) {
+  return createHash('sha1').update(text).digest('hex').slice(0, 16);
+}
 import { buildSystemPrompt, COMPACT_PROMPT } from './prompt.mjs';
 import { classifyInput, SMALL_TALK_HINT } from './smalltalk.mjs';
 import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
@@ -349,7 +356,9 @@ export class Agent {
             role: 'tool',
             tool_name: call.name,
             tool_call_id: call.id,
-            content: outcome.output,
+            // 同じ中身が既に履歴にあるなら、短い覚え書きに差し替えて積む。
+            // 差し替えるのは**これから積む1件だけ**で、過去は一切触らない。
+            ...this.dedupeOnAppend(outcome),
             // どの依頼で読んだものかを刻んでおく（古くなったら短くするため）
             turn: this.stats.turns
           });
@@ -892,7 +901,8 @@ export class Agent {
 
       return {
         output: truncateOutput(String(res.output ?? ''), this.config.maxToolChars),
-        denied: false
+        denied: false,
+        dedupeLabel: res.dedupeLabel || null
       };
     } catch (err) {
       const message = err instanceof PathError ? err.message : `${err.name}: ${err.message}`;
@@ -963,6 +973,7 @@ export class Agent {
     if (!summary.trim()) {
       // 要約できなければ古い部分を捨てるだけにする
       this.messages = [head, ...tail];
+      this.repairDedupePointers();
       warn('要約に失敗したので、古いやり取りを切り捨てました。');
       return;
     }
@@ -986,6 +997,8 @@ export class Agent {
       { role: 'assistant', content: 'Understood. Continuing from there.' },
       ...tail
     ];
+    // 要約に差し替えたことで、覚え書きの差し先が消えていることがある
+    this.repairDedupePointers();
     info('文脈が長くなったので、これまでの内容を要約して続けます。');
   }
 
@@ -1064,6 +1077,68 @@ export class Agent {
    * 短くしたことは**モデルにも分かる書き方で残す**。黙って消すと、
    * 読んだつもりのまま話を進めて、ありもしない行を直そうとする。
    */
+  /**
+   * 同じ中身を二度積まない。返すのは、積むメッセージに載せる分だけ。
+   *
+   * ■ なぜ「末尾だけ」なのか
+   *   過去のメッセージを書き換えると、そこから後ろのプレフィックスキャッシュが全部死ぬ。
+   *   9/3 の計測では、毎ターン書き換える版が 310秒 → 520秒（1.68倍）に落ちた。
+   *   ここで触るのは**これから積む1件**だけなので、過去のキャッシュは無傷のまま。
+   *
+   * ■ 判定は推測を挟まない
+   *   条件は「出力が一字一句同じで、その写しがいま履歴に残っている」の1つだけ。
+   *   ファイルが変わっていれば文字列が変わるので、変更の検知は自動で付いてくる。
+   *   圧縮で写しが短くされていれば、これも文字列が変わるので一致しない。
+   *   つまり「あるはずだ」と思い込む余地が無い。
+   *
+   * ■ 覚え書きが宙に浮く場合
+   *   圧縮は古い側から短くする／捨てるので、写しのほうが先に消える。
+   *   そのときは repairDedupePointers() が覚え書きを「読み直せ」に書き換える。
+   */
+  dedupeOnAppend(outcome) {
+    const text = String(outcome.output ?? '');
+    const base = { content: text, outHash: hashText(text) };
+    if (this.config.dedupeToolOutput === false) return base;
+    if (!outcome.dedupeLabel) return base;
+    if (text.length < (this.config.dedupeMinChars ?? 800)) return base;
+
+    const hit = this.messages.some((m) => m.role === 'tool' && m.outHash === base.outHash);
+    if (!hit) return base;
+
+    this.stats.dedupedChars = (this.stats.dedupedChars || 0) + text.length;
+    return {
+      content:
+        `[read_file ${outcome.dedupeLabel}: identical to an earlier read_file output that is ` +
+        'still in this conversation above. The file has not changed since. Nothing is omitted — ' +
+        'use that earlier output.]',
+      outHash: null,
+      dedupeRef: { label: outcome.dedupeLabel, hash: base.outHash }
+    };
+  }
+
+  /**
+   * 差し先を失った覚え書きを直す。
+   *
+   * 圧縮を通ったあとに必ず呼ぶ。圧縮は古いほうから短くする／捨てるので、
+   * 覚え書きより先に写しが消える。放っておくと「上にあります」と言い続けて、
+   * モデルは**読んだつもりのまま**ありもしない行を直そうとする。
+   * 消えたことは、消えた側と同じ言い方で伝える。
+   */
+  repairDedupePointers() {
+    let repaired = 0;
+    for (const m of this.messages) {
+      if (!m.dedupeRef) continue;
+      const alive = this.messages.some((o) => o.role === 'tool' && o.outHash === m.dedupeRef.hash);
+      if (alive) continue;
+      m.content =
+        `[read_file ${m.dedupeRef.label}: the earlier copy of this output is no longer in the ` +
+        'conversation. Do not assume anything about its contents. Read the file again if you need it.]';
+      delete m.dedupeRef;
+      repaired++;
+    }
+    return repaired;
+  }
+
   compactToolOutputOnce() {
     if (this.config.shrinkOldToolOutput === false) return 0;
     const keep = Math.max(0, this.config.keepFullToolTurns ?? 1);
@@ -1081,8 +1156,10 @@ export class Agent {
         `…[${before - max} characters dropped. This output is from an EARLIER request. ` +
         'Do not conclude anything about the dropped part. If you need it, read it again.]';
       m.frozen = true;
+      m.outHash = null;   // 中身が変わったので、覚え書きの差し先ではなくなる
       freed += before - m.content.length;
     }
+    if (freed) this.repairDedupePointers();
     return freed;
   }
 

@@ -239,6 +239,72 @@ console.log('\nedit_file — 失敗したときの出力の大きさ');
   check('1回目の失敗出力は短い', once.length < 1000, String(once.length));
 }
 
+console.log('\n同じファイルの読み直し — 二度積まない');
+{
+  // 実測（198セッション）: 間に編集を挟まない読み直しが 149,292 字、全文脈の 10.4%。
+  const mk = () => new Agent({
+    config: { ...DEFAULT_CONFIG, autoApprove: true },
+    root,
+    permissions: new PermissionManager({ ...DEFAULT_CONFIG, autoApprove: true }, async () => 'y')
+  });
+  const big = 'const x = 1;\n'.repeat(200);   // 2,600 字
+  const outcome = (text, label = 'src/app.js') => ({ output: text, dedupeLabel: label });
+
+  let agent = mk();
+  const first = agent.dedupeOnAppend(outcome(big));
+  agent.messages.push({ role: 'tool', tool_name: 'read_file', ...first, turn: 1 });
+  check('1回目は全文がそのまま積まれる', first.content === big, String(first.content.length));
+
+  // 積む前の履歴を控えておく（過去が1バイトも動かないことを見るため）
+  const before = JSON.stringify(agent.messages);
+  const second = agent.dedupeOnAppend(outcome(big));
+  check('2回目は覚え書きに置き換わる',
+    second.content !== big && /identical to an earlier read_file output/.test(second.content),
+    second.content.slice(0, 80));
+  check('覚え書きは元より十分短い', second.content.length < big.length / 5,
+    `${second.content.length} / ${big.length}`);
+  check('過去のメッセージは1バイトも変わっていない', JSON.stringify(agent.messages) === before);
+
+  // 中身が変われば別物として全文が積まれる
+  const changed = big + 'const y = 2;\n';
+  const third = agent.dedupeOnAppend(outcome(changed));
+  check('中身が変わっていれば全文を積む', third.content === changed, String(third.content.length));
+
+  // 短い出力は触らない
+  const small = 'hello\n';
+  agent.messages.push({ role: 'tool', tool_name: 'read_file', ...agent.dedupeOnAppend(outcome(small)), turn: 1 });
+  check('短い出力は置き換えない', agent.dedupeOnAppend(outcome(small)).content === small);
+
+  // 覚え書きの差し先が消えたら、覚え書きも直る
+  agent = mk();
+  agent.stats.turns = 5;
+  const origMsg = { role: 'tool', tool_name: 'read_file', ...agent.dedupeOnAppend(outcome(big)), turn: 1 };
+  agent.messages.push(origMsg);
+  const ptrMsg = { role: 'tool', tool_name: 'read_file', ...agent.dedupeOnAppend(outcome(big)), turn: 5 };
+  agent.messages.push(ptrMsg);
+  check('置き換えが起きている（前提の確認）', /identical to an earlier/.test(ptrMsg.content),
+    ptrMsg.content.slice(0, 80));
+
+  const freed = agent.compactToolOutputOnce();   // 古い写しが短くされる
+  check('古い写しが短くなった', freed > 0 && origMsg.content.length < big.length,
+    `${freed} / ${origMsg.content.length}`);
+  check('宙に浮いた覚え書きが「読み直せ」に変わる',
+    /no longer in the conversation/.test(ptrMsg.content), ptrMsg.content.slice(0, 90));
+  check('「上にあります」と言い続けない',
+    !/still in this conversation above/.test(ptrMsg.content));
+
+  // 古い部分がまるごと捨てられた場合も同じ
+  agent = mk();
+  const o2 = { role: 'tool', tool_name: 'read_file', ...agent.dedupeOnAppend(outcome(big)), turn: 1 };
+  agent.messages.push(o2);
+  const p2 = { role: 'tool', tool_name: 'read_file', ...agent.dedupeOnAppend(outcome(big)), turn: 2 };
+  agent.messages.push(p2);
+  agent.messages = agent.messages.filter((m) => m !== o2);   // 要約で写しが消えた状況
+  agent.repairDedupePointers();
+  check('履歴ごと消えた場合も覚え書きが直る',
+    /no longer in the conversation/.test(p2.content), p2.content.slice(0, 90));
+}
+
 console.log('\nパスの扱い');
 {
   put('src/deep.js', 'x\n');

@@ -159,7 +159,11 @@ const readFile = {
     // 触りもしないフォルダの作法まで最初から全部送ると、そのぶん文脈を食う。
     return {
       output: truncateOutput(shown + more, ctx.config.maxToolChars) + pendingRules(abs, ctx),
-      display: `${slice.length} 行を読み込み`
+      display: `${slice.length} 行を読み込み`,
+      // 同じ中身を二度積まないための目印（agent.mjs が使う）。
+      // 副作用の無い読み取りにだけ付ける。run_command のように毎回中身が変わりうる
+      // ものに付けると、「前と同じ」が意味を持つかどうかの判断が要る。
+      dedupeLabel: displayPath(abs, ctx)
     };
   }
 };

@@ -1090,6 +1090,13 @@ async function handleSlash(text, { agent, config, permissions, root }) {
       line(`  ${c.gray('入力トークン')}  ${s.inputTokens.toLocaleString()}`);
       line(`  ${c.gray('出力トークン')}  ${s.outputTokens.toLocaleString()}`);
       line(`  ${c.gray('会話の長さ')}    ${agent.messages.length} 件`);
+      // 同じファイルを読み直したときに、二度積まずに済んだ量。
+      // どれだけ起きるかは記録から推定できなかった（保存されるのは圧縮後の履歴のため）ので、
+      // 実際に使いながら数える。0 が続くなら、この機構は要らない。
+      if (s.dedupedChars) {
+        line(`  ${c.gray('読み直しの重複')}  ${s.dedupedChars.toLocaleString()} 字を省いた ${
+          c.gray(`（約 ${Math.round(s.dedupedChars / 3.5).toLocaleString()} トークン）`)}`);
+      }
       // 待ち時間の内訳。
       //
       // 「今日はなぜか遅い」の中身は、たいてい生成ではなく前処理と読み込みにある。
