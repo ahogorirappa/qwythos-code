@@ -40,7 +40,7 @@ import { loadSkills, skillsBlock } from '../src/skills.mjs';
 import { startMcp, stopMcp } from '../src/mcp.mjs';
 import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits } from '../src/edits.mjs';
 import { complete, completePath } from '../src/complete.mjs';
-import { createPasteBuffer } from '../src/paste.mjs';
+import { createPasteBuffer, attachBracketedPaste, MAX_PASTE_CHARS } from '../src/paste.mjs';
 import { formatTiming, TIMING_FLOOR_MS } from '../src/ui.mjs';
 import { BUILTIN_COMMANDS } from '../src/commands.mjs';
 import { makeCompleter } from '../src/complete.mjs';
@@ -2341,6 +2341,126 @@ console.log('\n貼り付けのまとめ');
   closing.push('溜まったまま');
   closing.flush();
   check('入力が閉じても、溜めた行は捨てない', left.length === 1 && left[0] === '溜まったまま', JSON.stringify(left));
+}
+
+console.log('\n貼り付け — エンターを押していないのに飛ばないか');
+{
+  // 偽の端末を作って、貼り付けの道すじを本物のまま通す。
+  //
+  // 「印を見分けられるか」を関数だけで確かめても、readline に繋ぎ忘れていたら
+  // 気づけない。実際、繋ぐ前は3行貼っただけで依頼が3回飛んでいた。
+  const makeTerm = () => {
+    const input = new PassThrough();
+    input.isTTY = true;
+    input.setRawMode = () => {};
+    const output = new PassThrough();
+    output.isTTY = true;
+    output.columns = 100;
+    output.rows = 30;
+    const screen = [];
+    output.on('data', (b) => screen.push(b.toString()));
+    const rl = readline.createInterface({ input, output, terminal: true });
+    const sent = [];
+    const notes = [];
+    const bp = attachBracketedPaste(rl, { output, onNote: (m) => notes.push(m) });
+    rl.on('line', (l) => sent.push(bp.expand(l)));
+    const type = (t) => new Promise((r) => { input.write(t); setImmediate(r); });
+    // 端末が貼り付けを包んで送ってくる形。この印は端末が付ける
+    const pasteIn = (t) => type(`\x1b[200~${t}\x1b[201~`);
+    return { rl, bp, sent, notes, screen, type, pasteIn };
+  };
+
+  {
+    const t = makeTerm();
+    await t.pasteIn('1行目\n2行目\n3行目');
+    check('複数行を貼っただけでは送らない', t.sent.length === 0, JSON.stringify(t.sent));
+    check('入力欄には札が入る', /\[貼り付け1: 3行\]/.test(t.rl.line), JSON.stringify(t.rl.line));
+
+    await t.type('\r');
+    check(
+      'エンターで、札が中身に戻って1つの依頼になる',
+      t.sent.length === 1 && t.sent[0] === '1行目\n2行目\n3行目',
+      JSON.stringify(t.sent)
+    );
+    t.rl.close();
+  }
+
+  {
+    const t = makeTerm();
+    await t.pasteIn('Error: なんとか\n  at どこか');
+    await t.type(' を直して');
+    await t.type('\r');
+    check(
+      '貼ったあとに打ち足した文も、いっしょに届く',
+      t.sent.length === 1 && t.sent[0] === 'Error: なんとか\n  at どこか を直して',
+      JSON.stringify(t.sent)
+    );
+    t.rl.close();
+  }
+
+  {
+    const t = makeTerm();
+    // 行を丸ごとコピーすると、末尾に改行が付いてくる。これは「送れ」の合図ではない
+    await t.pasteIn('src/agent.mjs\n');
+    check('1行＋末尾の改行でも送らない', t.sent.length === 0, JSON.stringify(t.sent));
+    check('1行なら札にせず、そのまま入る', t.rl.line === 'src/agent.mjs', JSON.stringify(t.rl.line));
+    await t.type('\r');
+    check('そのあとエンターを押せば届く', t.sent.length === 1 && t.sent[0] === 'src/agent.mjs', JSON.stringify(t.sent));
+    t.rl.close();
+  }
+
+  {
+    const t = makeTerm();
+    // 貼り付けの中の Tab は補完ではなく、ただの字下げ
+    await t.pasteIn('function f() {\n\treturn 1;\n}');
+    await t.type('\r');
+    check(
+      '貼り付けの中の Tab は補完を起こさず、字下げのまま残る',
+      t.sent.length === 1 && t.sent[0] === 'function f() {\n\treturn 1;\n}',
+      JSON.stringify(t.sent)
+    );
+    t.rl.close();
+  }
+
+  {
+    const t = makeTerm();
+    await t.type('自分で打った文');
+    await t.type('\r');
+    check('印の外のエンターは、今までどおり確定する', t.sent.length === 1 && t.sent[0] === '自分で打った文', JSON.stringify(t.sent));
+    t.rl.close();
+  }
+
+  {
+    const t = makeTerm();
+    const huge = `${'あ'.repeat(MAX_PASTE_CHARS + 500)}\nおしまい`;
+    await t.pasteIn(huge);
+    await t.type('\r');
+    check('長すぎる貼り付けは上限で切る', t.sent.length === 1 && t.sent[0].length === MAX_PASTE_CHARS, String(t.sent[0]?.length));
+    check('切ったことは黙らずに伝える', t.notes.length === 1 && /切りました/.test(t.notes[0]), JSON.stringify(t.notes));
+    t.rl.close();
+  }
+
+  {
+    const t = makeTerm();
+    await t.pasteIn('あ\nい');
+    await t.pasteIn('う\nえ');
+    await t.type('\r');
+    check(
+      '貼り付けが2つあっても、それぞれの中身に戻る',
+      t.sent.length === 1 && t.sent[0] === 'あ\nいう\nえ',
+      JSON.stringify(t.sent)
+    );
+    t.rl.close();
+  }
+
+  {
+    // 元に戻せること。戻したあとは readline の普段どおりに動く
+    const t = makeTerm();
+    t.bp.detach();
+    await t.pasteIn('あ\nい');
+    check('detach すれば元の readline に戻る', t.sent.length >= 1, JSON.stringify(t.sent));
+    t.rl.close();
+  }
 }
 
 console.log('\n待ち時間の内訳');

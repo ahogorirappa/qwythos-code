@@ -15,7 +15,7 @@ import { resolveMentions, buildMentionBlock } from '../src/mentions.mjs';
 import { anyServerAvailable, serverStatus, stopAll as stopLsp } from '../src/lsp.mjs';
 import { loadCommands, renderCommand, isReserved, BUILTIN_COMMANDS } from '../src/commands.mjs';
 import { makeCompleter } from '../src/complete.mjs';
-import { createPasteBuffer } from '../src/paste.mjs';
+import { createPasteBuffer, attachBracketedPaste } from '../src/paste.mjs';
 import { undoLastTurn, sessionChanges, canUndo } from '../src/edits.mjs';
 import {
   isAvailable as browserAvailable,
@@ -276,6 +276,7 @@ function dropFromHistory(text) {
 
 // ── 対話の入力受け付け ──────────────────────────────────────
 let rl = null;
+let bracketedPaste = null;
 let pendingAsk = null;
 let inputClosed = false;
 const inputQueue = [];
@@ -313,12 +314,34 @@ function createReadline({ root, models = () => [] } = {}) {
     }
   };
 
+  // 貼り付けの最中の改行を、行の確定として扱わせない（paste.mjs）。
+  // これが無いと、複数行を貼っただけでエンターを押さずに依頼が飛ぶ。
+  bracketedPaste = process.stdin.isTTY
+    ? attachBracketedPaste(rl, {
+        output: process.stdout,
+        onNote: (msg) => {
+          line();
+          warn(msg);
+          // 書いたぶん画面がずれるので、入力欄を引き直す（打ちかけの文は残す）
+          rl.prompt(true);
+        }
+      })
+    : null;
+  if (bracketedPaste) {
+    bracketedPaste.enable();
+    // 印を出させたまま終わると、そのあとのシェルに残る。必ず消す
+    process.on('exit', () => bracketedPaste?.disable());
+  }
+
+  // 印に対応していない端末むけの保険。
   // 続けざまに届いた行は、貼り付けとみなして1つにまとめる（paste.mjs）
   const paste = createPasteBuffer(deliverLine, { enabled: Boolean(process.stdin.isTTY) });
-  rl.on('line', (text) => paste.push(text));
+  // 入力欄の札（[貼り付け1: 12行]）を、貼られた中身に戻してから受け取る
+  rl.on('line', (text) => paste.push(bracketedPaste ? bracketedPaste.expand(text) : text));
 
   // Ctrl+D や入力の終わりで、待っている質問を解いてループを抜けられるようにする
   rl.on('close', () => {
+    bracketedPaste?.disable();
     // 溜めたままの行を捨てない。貼り付けた直後に Ctrl+D を押されると、
     // 15ミリ秒の待ちに入っていたぶんが、そのまま消える
     paste.flush();
@@ -334,6 +357,9 @@ function createReadline({ root, models = () => [] } = {}) {
 
 function showPrompt(question) {
   if (rl && process.stdin.isTTY) {
+    // 道具で走らせた子プロセス（vim など）が終わると、貼り付けの印が消えることがある。
+    // 入力を待つたびにかけ直す。7バイト書くだけなので、毎回でも損はない
+    bracketedPaste?.enable();
     rl.setPrompt(question);
     rl.prompt();
   } else {
