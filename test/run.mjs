@@ -198,6 +198,47 @@ console.log('\nedit_file — 置き換えの正しさ');
   check('確認前の検査は成立する編集を通す', edit.validate({ path: 'f.js', old_string: 'const y = 2;', new_string: 'const y = 3;' }, ctx) === null);
 }
 
+console.log('\nedit_file — 失敗したときの出力の大きさ');
+{
+  // 失敗の理由は validate() が返す。ここは run() ではなく validate() を通る経路で、
+  // 2026-09-05 まで道具出力の上限を通っていなかった（実測 13,609 字）。
+  const max = ctx.config.maxToolChars;
+  const fctx = { ...ctx, editFailures: new Map() };
+
+  // 短いファイル：2回外したら全文を貼って write_file へ誘導する（これは残す挙動）
+  put('short.js', 'const a = 1;\n'.repeat(20));
+  let out = '';
+  for (let i = 0; i < 2; i++) {
+    out = edit.validate({ path: 'short.js', old_string: 'まったく無い文字列', new_string: 'x' }, fctx);
+  }
+  check('短いファイルでは全文を貼って write_file へ誘導する',
+    /Stop using edit_file on this file/.test(out) && out.includes('const a = 1;'), out.slice(0, 120));
+  check('短いファイルの失敗出力は上限に収まる', out.length <= max, `${out.length} > ${max}`);
+
+  // 長い行のファイル：400行未満でも文字数では上限を超える。ここが穴だった。
+  const fat = ('x'.repeat(400) + '\n').repeat(60); // 60行だが 24,000 字
+  put('fat.js', fat);
+  fctx.editFailures = new Map();
+  for (let i = 0; i < 2; i++) {
+    out = edit.validate({ path: 'fat.js', old_string: 'まったく無い文字列', new_string: 'x' }, fctx);
+  }
+  check('行数は少なくても字数が大きいファイルは全文を貼らない',
+    !/Stop using edit_file on this file/.test(out) && /read_file using offset and limit/.test(out),
+    out.slice(0, 160));
+  check('その失敗出力も上限に収まる', out.length <= max, `${out.length} > ${max}`);
+
+  // 全文を貼るときは、真ん中を抜かない。
+  // 抜かれた全文に「丸ごとコピーして送れ」と言うと、穴の空いたファイルが書かれる。
+  check('貼った全文が途中で省略されていない',
+    !/characters omitted from the middle/.test(out), out.slice(-160));
+
+  // 1回目では発動しない（2回続けて外したときだけ）
+  fctx.editFailures = new Map();
+  const once = edit.validate({ path: 'short.js', old_string: 'まったく無い文字列', new_string: 'x' }, fctx);
+  check('1回目では全文を貼らない', !/times in a row/.test(once), once.slice(0, 120));
+  check('1回目の失敗出力は短い', once.length < 1000, String(once.length));
+}
+
 console.log('\nパスの扱い');
 {
   put('src/deep.js', 'x\n');

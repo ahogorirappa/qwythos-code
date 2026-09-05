@@ -270,19 +270,19 @@ const editFile = {
       return `File not found: ${args.path}${suggestPaths(args.path, ctx)}`;
     }
     const before = fs.readFileSync(abs, 'utf8');
-    const result = applyEdit(before, args);
+    const result = applyEdit(before, args, ctx?.config?.maxToolChars);
     if (!result.error) {
       // 通ったら数えを消す。次に詰まったときは、また最初から数える
       ctx.editFailures?.delete(abs);
       return null;
     }
-    return result.error + escalateAfterRepeatedFailure(abs, before, ctx);
+    return result.error + escalateAfterRepeatedFailure(abs, before, ctx, result.error.length);
   },
   preview(args, ctx) {
     const abs = resolveSafe(args.path, ctx);
     if (!fs.existsSync(abs)) return c.red('  (ファイルが存在しません)');
     const before = fs.readFileSync(abs, 'utf8');
-    const after = applyEdit(before, args);
+    const after = applyEdit(before, args, ctx?.config?.maxToolChars);
     if (after.error) return c.red(`  ${after.error}`);
     return renderDiff(before, after.text);
   },
@@ -296,7 +296,7 @@ const editFile = {
       };
     }
     const before = fs.readFileSync(abs, 'utf8');
-    const result = applyEdit(before, args);
+    const result = applyEdit(before, args, ctx?.config?.maxToolChars);
     if (result.error) {
       return { isError: true, output: result.error, display: '置き換えできませんでした' };
     }
@@ -320,6 +320,9 @@ const EDIT_FAILURE_LIMIT = 2;
 /** 差し替えの案内に添えられるファイルの上限。これを超えるものは丸ごと書き直させない */
 const REWRITE_MAX_LINES = 400;
 
+/** 上限が取れなかったときに使う既定値（config.mjs の maxToolChars と同じ） */
+const FALLBACK_MAX_CHARS = 4000;
+
 /**
  * 同じファイルで edit_file が続けて失敗したときに、道を変えさせる。
  *
@@ -331,8 +334,13 @@ const REWRITE_MAX_LINES = 400;
  * ■ 何をするか
  *   2回続けて外したら「その道はもう通らない」と伝え、**現物の全文を渡して write_file に切り替えさせる**。
  *   長すぎるファイルでは丸ごと書き直させない（別の壊し方になるため）。そのときは範囲を狭めさせる。
+ *
+ * ■ 全文を貼るかどうかは文字数の予算で決める
+ *   この戻り値は validate() の経路を通るので、道具出力の上限（maxToolChars）に収まっている
+ *   必要がある。収まらないものを貼って後から切ると、真ん中が抜けた全文を
+ *   「丸ごと送れ」と指示することになり、ファイルが壊れる。
  */
-function escalateAfterRepeatedFailure(abs, before, ctx) {
+function escalateAfterRepeatedFailure(abs, before, ctx, errorLen = 0) {
   if (!ctx.editFailures) ctx.editFailures = new Map();
   const count = (ctx.editFailures.get(abs) || 0) + 1;
   ctx.editFailures.set(abs, count);
@@ -341,20 +349,32 @@ function escalateAfterRepeatedFailure(abs, before, ctx) {
   const lines = before.split('\n');
   const rel = displayPath(abs, ctx);
 
-  if (lines.length > REWRITE_MAX_LINES) {
-    return (
-      `\n\nYou have now failed to edit ${rel} ${count} times in a row. Stop guessing at old_string.\n` +
-      'Read a small part of the file with read_file using offset and limit, so you see one screen of ' +
-      'exact text, then copy old_string from that. Do not send an old_string you have not just read.'
-    );
-  }
+  // 狭めさせる案内。ファイルは貼らない。
+  const narrow =
+    `\n\nYou have now failed to edit ${rel} ${count} times in a row. Stop guessing at old_string.\n` +
+    'Read a small part of the file with read_file using offset and limit, so you see one screen of ' +
+    'exact text, then copy old_string from that. Do not send an old_string you have not just read.';
 
-  return (
+  // 全文を貼って write_file に切り替えさせる案内。
+  const whole =
     `\n\nYou have now failed to edit ${rel} ${count} times in a row. **Stop using edit_file on this file.**\n` +
     'Call write_file with the complete new content instead. Below is the file exactly as it is on disk ' +
     'right now, with no line numbers. Copy it, apply your change to your copy, and send the whole thing:\n\n' +
-    before
-  );
+    before;
+
+  // どちらを返すかは、行数ではなく**文字数の予算**で決める。
+  //
+  // 行数で決めていたときの穴：400行でも1行が長ければ4000字を軽く超える。
+  // 実測では 13,609 字の失敗出力が出ていた（2026-09-05 のセッション）。
+  //
+  // そして「超えたぶんを切る」で済ませてはいけない。この文面は
+  // 「これを丸ごとコピーして write_file で送れ」と言っているので、
+  // 貼った全文の真ん中を抜かれると、モデルは**穴の空いたファイルを書く**。
+  // 入るときだけ貼り、入らないなら最初から貼らない。
+  const max = Number(ctx?.config?.maxToolChars) || FALLBACK_MAX_CHARS;
+  if (lines.length > REWRITE_MAX_LINES) return narrow;
+  if (errorLen + whole.length > max) return narrow;
+  return whole;
 }
 
 // read_file は行番号つきで返すので、それをそのまま貼ってきた場合に剥がす
@@ -367,7 +387,43 @@ function stripLineNumbers(text) {
   return text;
 }
 
-function applyEdit(before, args) {
+/**
+ * 見せる行を、字数の予算に収まるまで**行数を減らして**合わせる。
+ *
+ * 行そのものを途中で切ってはいけない。この出力からモデルは old_string を写すので、
+ * 切れた行を写せば当然また一致せず、同じ失敗を繰り返すことになる。
+ * 減らすのは行数のほう。中心（狙った場所）から遠い行から落とす。
+ *
+ * 行数だけで上限を決めていたのが元の穴だった。1行が長いファイルでは
+ * 60行が 24,000 字になり、上限 4,000 字を6倍超えていた。
+ *
+ * @param {string[]} lines  ファイル全体の行
+ * @param {number} from     見せ始める行（0始まり）
+ * @param {number} to       見せ終わる行（0始まり・含まない）
+ * @param {number} maxChars 予算
+ * @param {number|null} center 残したい中心の行
+ */
+function numberedWithinBudget(lines, from, to, maxChars, center = null) {
+  let s = Math.max(0, from);
+  let e = Math.min(lines.length, to);
+  if (e <= s) return { text: '', dropped: 0, tooWide: false };
+
+  const render = () => numberLines(lines.slice(s, e).join('\n'), s + 1);
+  let text = render();
+  while (text.length > maxChars && e - s > 1) {
+    if (center !== null && center - s > e - 1 - center) s++;
+    else e--;
+    text = render();
+  }
+  // 1行まで削っても収まらない＝その1行が長すぎる。
+  // 途中で切った行を見せると写し間違いを誘うので、見せずに読み方を教える。
+  if (text.length > maxChars) {
+    return { text: '', dropped: to - from, tooWide: true, line: s + 1 };
+  }
+  return { text, dropped: (from < s ? s - from : 0) + (to > e ? to - e : 0), tooWide: false };
+}
+
+function applyEdit(before, args, maxChars = FALLBACK_MAX_CHARS) {
   const rawOld = String(args.old_string ?? '');
   const rawNew = String(args.new_string ?? '');
 
@@ -431,29 +487,50 @@ function applyEdit(before, args) {
   // いちばん近い場所を探して、その周りだけを出す。
   const near = nearestRegion(before, oldStr);
   const lines = before.split('\n');
+  // 出力の上限のうち、現物を見せるのに使ってよい分。
+  // 残りは失敗が続いたときの案内（escalateAfterRepeatedFailure）に取っておく。
+  const showBudget = Math.max(600, Math.floor(maxChars * 0.55));
+
   if (near) {
-    const from = Math.max(0, near.start - 6);
-    const to = Math.min(lines.length, near.end + 6);
-    const shown = numberLines(lines.slice(from, to).join('\n'), from + 1);
+    const fit = numberedWithinBudget(
+      lines, Math.max(0, near.start - 6), Math.min(lines.length, near.end + 6),
+      showBudget, near.start
+    );
+    const head =
+      'old_string was not found in the file. It must match the file text exactly.\n' +
+      `The closest place is around line ${near.start + 1} ` +
+      `(${near.matched} of your ${near.total} lines appear there).\n`;
+    if (fit.tooWide) {
+      return {
+        error:
+          head +
+          `Line ${fit.line} is too long to show here. Read it with read_file using offset and limit, ` +
+          'then copy old_string from what you read.'
+      };
+    }
     return {
       error:
-        'old_string was not found in the file. It must match the file text exactly.\n' +
-        `The closest place is around line ${near.start + 1} ` +
-        `(${near.matched} of your ${near.total} lines appear there).\n` +
+        head +
         'Here is what the file actually contains there. Copy from this, without the line numbers:\n\n' +
-        shown
+        fit.text +
+        (fit.dropped ? `\n…[${fit.dropped} nearby lines not shown; read them with read_file if needed]` : '')
     };
   }
 
-  // 近いところが1つも無い＝そもそも別のファイルを見ている可能性が高い
-  const head = numberLines(lines.slice(0, 60).join('\n'));
-  const more = lines.length > 60 ? `\n…[${lines.length - 60} more lines]` : '';
+  // 近いところが1つも無い＝そもそも別のファイルを見ている可能性が高い。
+  // ここは場所を写させるためではなく「見ているファイルが違う」と気づかせるための材料。
+  const fit = numberedWithinBudget(lines, 0, Math.min(60, lines.length), showBudget, 0);
+  const shownTo = 60 - (fit.dropped || 0);
+  const rest = lines.length - Math.max(0, shownTo);
+  const intro =
+    'old_string was not found in the file, and nothing in it resembles what you sent. ' +
+    'You may be editing the wrong file, or working from an old copy of it. ' +
+    'Read the file again before trying another edit.\n\n';
+  if (fit.tooWide) {
+    return { error: intro + `(${lines.length} lines; the first line is too long to show here.)` };
+  }
   return {
-    error:
-      'old_string was not found in the file, and nothing in it resembles what you sent. ' +
-      'You may be editing the wrong file, or working from an old copy of it. ' +
-      'Read the file again before trying another edit.\n\n' +
-      `${head}${more}`
+    error: intro + fit.text + (rest > 0 ? `\n…[${rest} more lines]` : '')
   };
 }
 

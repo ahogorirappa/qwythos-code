@@ -772,7 +772,12 @@ export class Agent {
       }
       if (problem) {
         toolResultLine('そのままでは適用できません', true);
-        return { output: problem, denied: false };
+        // 失敗の理由も道具の出力なので、成功時と同じ上限で切って確定させる。
+        // ここだけ上限を通っておらず、edit_file の失敗が 13,609 字まで伸びていた。
+        // なお、上限に触れないよう作るのは呼び出し側の責任（tools.mjs の
+        // escalateAfterRepeatedFailure）。ここは最後の歯止めで、
+        // 通常は何も切らずに素通りする。
+        return { output: truncateOutput(problem, this.config.maxToolChars), denied: false };
       }
     }
 
