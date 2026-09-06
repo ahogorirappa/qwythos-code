@@ -7,7 +7,8 @@ import fs from 'node:fs';
 import { loadConfig, saveConfig, HOME_DIR } from '../src/config.mjs';
 import { checkServer, listModels, adaptToModel, pickBestModel, checkGpuFit } from '../src/ollama.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
-import { Agent } from '../src/agent.mjs';
+import { Agent, estimateTokens } from '../src/agent.mjs';
+import { contextLine } from '../src/ctxcost.mjs';
 import { TOOLS, activeTools, setMcpTools, KEY_HELP } from '../src/tools.mjs';
 import { startMcp, stopMcp, loadMcpConfig } from '../src/mcp.mjs';
 import { loadApiKey } from '../src/web.mjs';
@@ -1116,6 +1117,8 @@ async function handleSlash(text, { agent, config, permissions, root }) {
       line(`  ${c.gray('入力トークン')}  ${s.inputTokens.toLocaleString()}`);
       line(`  ${c.gray('出力トークン')}  ${s.outputTokens.toLocaleString()}`);
       line(`  ${c.gray('会話の長さ')}    ${agent.messages.length} 件`);
+      // トークン数と、その長さでの速度。実測値は src/ctxcost.mjs。
+      line(`  ${c.gray('文脈')}          ${contextLine(estimateTokens(agent.messages), config.numCtx)}`);
       // 同じファイルを読み直したときに、二度積まずに済んだ量。
       // どれだけ起きるかは記録から推定できなかった（保存されるのは圧縮後の履歴のため）ので、
       // 実際に使いながら数える。0 が続くなら、この機構は要らない。

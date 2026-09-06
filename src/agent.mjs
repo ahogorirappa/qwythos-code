@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { chatStream, chatOnce } from './ollama.mjs';
 import { createHash } from 'node:crypto';
+import { contextNotice } from './ctxcost.mjs';
 import { TOOL_MAP, toolSchemas, truncateOutput } from './tools.mjs';
 
 // 中身が同じかどうかだけ分かればよいので、短い指紋で足りる。
@@ -26,7 +27,7 @@ import {
 // 道具を組み立てている本当の無音だけを拾える長さにしてある。
 export const QUIET_AFTER_MS = 2000;
 
-function estimateTokens(messages) {
+export function estimateTokens(messages) {
   let chars = 0;
   for (const m of messages) {
     chars += (m.content || '').length + (m.thinking || '').length;
@@ -122,6 +123,7 @@ export class Agent {
 
   clear() {
     this.messages = [{ role: 'system', content: this.systemPrompt }];
+    this.ctxNoticed = new Set();   // 長さの知らせは、切ったらまた最初から
     this.ctx.changedFiles.clear();
     this.ctx.readFiles.clear();
     this.ctx.editFailures.clear();
@@ -913,8 +915,25 @@ export class Agent {
 
   // ── 文脈が長くなりすぎたら要約して詰める ──────────────────
   async maybeCompact() {
+    const tokens = estimateTokens(this.messages);
+
+    // 長くなったことを知らせる。**圧縮はしない。**
+    //
+    // 会話が伸びると生成が遅くなるが、画面には何も出ないので気づけない。
+    // ここで効く手は「切る」ことだけで、圧縮ではない。圧縮は履歴を書き換えるため、
+    // 書き換えた場所から後ろのキャッシュが死ぬ（実測で2.2倍の悪化）。
+    // gemma4 は SWA なので --cache-reuse による救済も効かない（実測で確認）。
+    if (this.config.contextNotice !== false) {
+      if (!this.ctxNoticed) this.ctxNoticed = new Set();
+      const notice = contextNotice(tokens, this.ctxNoticed);
+      if (notice) {
+        this.ctxNoticed.add(notice.threshold);
+        info(notice.text);
+      }
+    }
+
     const limit = Math.floor(this.config.numCtx * this.config.compactAtRatio);
-    if (estimateTokens(this.messages) < limit) return;
+    if (tokens < limit) return;
 
     // まず古いツール出力を短くする（これだけで足りることが多い）。
     // **これは1回きりの出来事**で、毎ターン走らせてはいけない（runTurn の注記を参照）。

@@ -44,6 +44,7 @@ import { createPasteBuffer, attachBracketedPaste, MAX_PASTE_CHARS } from '../src
 import { formatTiming, TIMING_FLOOR_MS } from '../src/ui.mjs';
 import { BUILTIN_COMMANDS } from '../src/commands.mjs';
 import { makeCompleter } from '../src/complete.mjs';
+import { decodeSpeedAt, speedRatio, contextNotice, contextLine, NOTICE_THRESHOLDS } from '../src/ctxcost.mjs';
 import readline from 'node:readline';
 import { PassThrough } from 'node:stream';
 
@@ -303,6 +304,44 @@ console.log('\n同じファイルの読み直し — 二度積まない');
   agent.repairDedupePointers();
   check('履歴ごと消えた場合も覚え書きが直る',
     /no longer in the conversation/.test(p2.content), p2.content.slice(0, 90));
+}
+
+console.log('\n文脈の長さと速度 — 実測値を利用者に見せる');
+{
+  // 数字の出どころは 2026-09-03 のアームログ5本。
+  // ~/文脈ゲートウェイ/計測の記録/解析/手順4-結果.md に集計がある。
+  check('長いほど遅い（単調に落ちる）', (() => {
+    let prev = Infinity;
+    for (const t of [0, 4000, 8000, 12000, 16000, 20000, 24000, 32000]) {
+      const v = decodeSpeedAt(t);
+      if (v > prev) return false;
+      prev = v;
+    }
+    return true;
+  })());
+
+  check('まっさらを100%とする', Math.round(speedRatio(0) * 100) === 100, String(speedRatio(0)));
+  check('16kで約74%、24kで約67%（実測どおり）',
+    Math.round(speedRatio(17000) * 100) === 74 && Math.round(speedRatio(25000) * 100) === 67,
+    `${Math.round(speedRatio(17000) * 100)} / ${Math.round(speedRatio(25000) * 100)}`);
+
+  // 知らせは区切りを跨いだときだけ、1回。毎ターン出すと雑音になる。
+  const seen = new Set();
+  check('短いうちは何も言わない', contextNotice(9000, seen) === null);
+  const n1 = contextNotice(17000, seen);
+  check('16kを跨いだら知らせる', n1 !== null && /74%/.test(n1.text), n1 && n1.text);
+  seen.add(n1.threshold);
+  check('同じ区切りでは二度言わない', contextNotice(18000, seen) === null);
+  const n2 = contextNotice(25000, seen);
+  check('次の区切りでまた知らせる', n2 !== null && n2.threshold === 24000, n2 && String(n2.threshold));
+
+  check('知らせは「切る」を勧める（圧縮ではない）',
+    /\/clear/.test(n1.text) && !/compact/.test(n1.text), n1.text);
+  check('区切りは3つとも上りになっている',
+    NOTICE_THRESHOLDS.every((t, i, a) => i === 0 || t > a[i - 1]));
+  check('/stats の一行に長さと速度が入る',
+    /トークン/.test(contextLine(17000, 32768)) && /74%/.test(contextLine(17000, 32768)),
+    contextLine(17000, 32768));
 }
 
 console.log('\nパスの扱い');
