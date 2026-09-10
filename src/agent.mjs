@@ -1635,21 +1635,40 @@ export function turnEvidence(messages, turn) {
 export function removalClaimsNotRemoved(text, evidence) {
   if (evidence == null) return [];
   const missing = [];
-  for (const s of String(text).split(/(?<=[。.!?！？])\s*|\n+/)) {
-    const m = /^([\s\S]*?)(を削除しました|を取り除きました|を削除済み)/.exec(s);
-    if (!m) continue;
-    const names = [...m[1].matchAll(/`([^`\n]{1,60})`/g)].map((x) => x[1]);
-    if (!names.length) continue;
-    const name = names[names.length - 1];
-    const bare = name.replace(/\(\)$/, '');
+  const 足す = (name) => {
+    const bare = String(name).replace(/\(\)$/, '');
+    if (!bare) return;
     if (!evidence.includes(bare) && !missing.includes(name)) missing.push(name);
+  };
+
+  for (const s of String(text).split(/(?<=[。.!?！？])\s*|\n+/)) {
+    // ── 日本語：目的語は動詞の**前**にある ──
+    //   「… `X` の呼び出しを削除しました」→ 動詞より前の最後の `…` が X。
+    //   全部の `…` を見てはいけない。同じ文にファイル名や関数名が混ざっていて、
+    //   そのどれか1つが証拠にあるだけで嘘が通る（実機の 21:28 がそれ）。
+    const ja = /^([\s\S]*?)(を削除しました|を取り除きました|を消しました|を消去しました|を削除済み|を削りました)/.exec(s);
+    if (ja) {
+      const names = [...ja[1].matchAll(/`([^`\n]{1,60})`/g)].map((x) => x[1]);
+      if (names.length) 足す(names[names.length - 1]);
+    }
+
+    // ── 英語：目的語は動詞の**後ろ**にある ──
+    //   「I removed the call to `X`」「I have deleted `X`」。
+    //   日本語と同じ「前を見る」やり方だと**丸ごと素通りする**。
+    //   実機の20本のうち6本が英語で答えていて、そこは一度も見張れていなかった。
+    const en = /\b(?:I (?:have |just |already )?(?:removed|deleted|dropped|stripped)|took out)\b([^`\n]{0,80})`([^`\n]{1,60})`/i.exec(s);
+    if (en) 足す(en[2]);
+
+    // 受け身の言い方は、名前が動詞より前に来る。「`X` has been removed」
+    const passive = /`([^`\n]{1,60})`[^`\n]{0,60}\b(?:has|have|was|were|is|are)\s+(?:been\s+)?(?:removed|deleted|dropped|stripped)\b/i.exec(s);
+    if (passive) 足す(passive[1]);
   }
   return missing;
 }
 
 export function claimsWorkDone(text) {
   const claim =
-    /(\bI (have |already |just )?(changed|edited|fixed|created|updated|added|removed|deleted|replaced|renamed|wrote|implemented|applied)\b|\bhas been (changed|edited|fixed|created|updated|added|removed|replaced|applied)\b|\bthe (fix|change|edit) (is|has been) applied\b|修正しました|直しました|変更しました|書き換えました|作成しました|追加しました|削除しました|更新しました|置き換えました|実装しました|反映しました|修正済み|変更済み)/i;
+    /(\bI (have |already |just )?(changed|edited|fixed|created|updated|added|removed|deleted|replaced|renamed|wrote|implemented|applied)\b|\bhas been (changed|edited|fixed|created|updated|added|removed|replaced|applied)\b|\bthe (fix|change|edit) (is|has been) applied\b|修正しました|直しました|変更しました|書き換えました|作成しました|追加しました|削除しました|更新しました|置き換えました|実装しました|反映しました|消しました|消去しました|削りました|修正済み|変更済み)/i;
 
   // 打ち消しの言い回しは除く。
   // 「まだ修正していません」「修正しませんでした」を完了報告として拾うと、
