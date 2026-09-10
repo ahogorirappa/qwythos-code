@@ -58,6 +58,28 @@ export function isSafeCommand(command, config) {
   });
 }
 
+/**
+ * その返事は「はい」か。
+ *
+ * ■ 閉じた入力は「はい」ではない
+ *   Ctrl+D やパイプの終わりで `ask()` は null を返す。これを `?? ''` で受けて
+ *   空入力と同じ枝に入れると、**「終わりたい」の合図が「進めてよい」に化ける**。
+ *   実際、計画モードの確認がそうなっていて、Ctrl+D を押すと計画がそのまま実行されていた
+ *   （`--yolo` が入っていれば書き換えまで確認なしで通る）。
+ *
+ * ■ 空入力をどちらに倒すかは、聞く場所ごとに決める
+ *   戻せない操作の承認（`request`）は「やめる」。いちばん押されやすいキーは、
+ *   いちばん戻せない側に倒してはいけない。
+ *   「この方針で進めますか」のように、後段で改めて確認が挟まるものは「はい」でよい。
+ *   **どちらに倒すにせよ、閉じた入力だけは常に「いいえ」**。そこは場所によらない。
+ */
+export function saysYes(raw, { emptyMeansYes = false } = {}) {
+  if (raw === null || raw === undefined) return false;
+  const answer = String(raw).trim().toLowerCase();
+  if (answer === '') return emptyMeansYes;
+  return answer === 'y' || answer === 'yes';
+}
+
 export class PermissionManager {
   constructor(config, ask) {
     this.config = config;
