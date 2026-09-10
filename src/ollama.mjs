@@ -353,6 +353,37 @@ export async function adaptToModel(cfg) {
   if (cfg.thinkPreference && !canThink) {
     notes.push({ level: 'info', text: `${cfg.model} は思考モードを持たないので、思考なしで動かします。` });
   }
+  // 文脈の広さが、そのモデルの上限を超えていないか。
+  //
+  // ■ 知らせるだけ。**詰めない・断らない。**
+  //   詰めると会話が早く溢れるようになるが、それを掲示する先が無い。
+  //   症状は「なぜか物忘れが早い」としてしか出ず、原因に辿り着けない。
+  //   （思考モードを黙って落とすのが許されているのは、`/think` と `/effort` に
+  //     「効きません」と出す先があるから。numCtx にはそれが無い。）
+  //   断らないのは、モデルを差し替えたときに「起動できない」が先に来ると、
+  //   何が悪いのか分かりにくくなるため。
+  //
+  // ■ 放っておくとどうなるか
+  //   大きすぎる num_ctx で ollama が 5xx を返すと isTransientOllamaError が
+  //   「積み直しに巻き込まれた」と判定し、retryWaitsMs [3000, 10000, 30000] で
+  //   3回掛け直す。**毎ターン43秒待ってから失敗する。**設定を直すまでずっと。
+  //
+  // ■ 上限は最初から手元にあった
+  //   showModel が model_info から contextLength を返していたのに、
+  //   どこからも読まれていなかった（2026-09-10 に気づいた。gemma4:26b は 262,144）。
+  const 上限 = Number(info.contextLength);
+  if (Number.isFinite(上限) && 上限 > 0 && Number(cfg.numCtx) > 上限) {
+    notes.push({
+      level: 'info',
+      text:
+        `${cfg.model} が扱えるのは ${上限.toLocaleString()} トークンまでですが、` +
+        `いまの設定は ${Number(cfg.numCtx).toLocaleString()} です。` +
+        'そのまま起動します。モデルが受け取れなかった場合は、' +
+        '毎回 43 秒ぶん掛け直してから失敗します' +
+        '（--ctx か ~/.qwythos-code/config.json の numCtx で直せます）。'
+    });
+  }
+
   if (!canTools) {
     notes.push({
       level: 'error',

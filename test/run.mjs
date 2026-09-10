@@ -3762,6 +3762,43 @@ console.log('\n会話が長くなったときの知らせ');
 }
 
 
+
+// ── 文脈の広さが、モデルの上限を超えていたら知らせる ────────────
+//
+// 上限は最初から手元にあった。showModel が model_info から contextLength を
+// 返していたのに、どこからも読まれていなかった（gemma4:26b は 262,144）。
+//
+// **知らせるだけ。詰めない・断らない。**
+// 詰めると会話が早く溢れるが、それを掲示する先が無い。症状は
+// 「なぜか物忘れが早い」としてしか出ず、原因に辿り着けない。
+// （思考モードを黙って落とすのが許されているのは、/think と /effort に
+//   「効きません」と出す先があるから。numCtx にはそれが無い。）
+console.log('\n文脈の広さがモデルの上限を超えたとき');
+{
+  const 立てる = (info, numCtx) => {
+    const cfg = { model: 'testmodel', numCtx, effort: 'off' };
+    // adaptToModel の中身のうち、上限を見る部分だけを同じ条件で組み立てる
+    const notes = [];
+    const 上限 = Number(info.contextLength);
+    if (Number.isFinite(上限) && 上限 > 0 && Number(cfg.numCtx) > 上限) {
+      notes.push({ level: 'info', text: `${cfg.model} が扱えるのは ${上限.toLocaleString()} トークンまで` });
+    }
+    return { notes, numCtx: cfg.numCtx };
+  };
+
+  const 超えた = 立てる({ contextLength: 262144 }, 999999999);
+  check('上限を超えたら知らせる', 超えた.notes.length === 1);
+  check('知らせは info（起動は止めない）', 超えた.notes[0].level === 'info');
+  check('**詰めない**（設定はそのまま）', 超えた.numCtx === 999999999);
+  check('上限の数字を出す', /262,144/.test(超えた.notes[0].text));
+
+  check('ふつうの指定では黙る', 立てる({ contextLength: 262144 }, 32768).notes.length === 0);
+  check('ちょうど上限でも黙る', 立てる({ contextLength: 262144 }, 262144).notes.length === 0);
+  // 上限が取れないモデルもある。取れないことを「超えている」と扱わない。
+  check('上限が分からなければ黙る', 立てる({ contextLength: null }, 999999999).notes.length === 0);
+  check('上限が 0 でも黙る', 立てる({ contextLength: 0 }, 999999999).notes.length === 0);
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(`\n合計: ${passed} 件成功 / ${failed} 件失敗\n`);
