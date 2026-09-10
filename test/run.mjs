@@ -3144,6 +3144,35 @@ console.log('\n直したという報告を、数で確かめる');
     '中身を控えていない大きなファイルが混ざったら、確かめずに null を返す',
     removedTextThisTurn({ turnSeq: 1, editLog: [{ turn: 1, before: null, after: null, big: true }] }) === null
   );
+
+  // 実機（2026-09-10）で出た抜け道。
+  // 無い関数を消せと言われたモデルが、**自分で書き足してから消した**。
+  // 1回ごとの差分を足すと、2回目の消えた行に名前が入っていて嘘が通る。
+  // 差し引き（始まりと終わりだけ）で見れば、何も消えていないと分かる。
+  const 自作自演 = {
+    turnSeq: 1,
+    editLog: [
+      { turn: 1, path: '/x/g', big: false, before: 'def f():\n    s = 1\n', after: 'def f():\n    _typo_round_two()\n    s = 1\n' },
+      { turn: 1, path: '/x/g', big: false, before: 'def f():\n    _typo_round_two()\n    s = 1\n', after: 'def f():\n    s = 1\n' }
+    ]
+  };
+  check('書き足してから消しても、消したことにはならない', removedTextThisTurn(自作自演) === '');
+  check(
+    '自分で書き足してから消した「削除しました」を捕まえる',
+    removalClaimsNotRemoved('`_typo_round_two()` を削除しました。', removedTextThisTurn(自作自演)).join() === '_typo_round_two()'
+  );
+  // 同じファイルを何度も直した末に本当に消えていれば、鳴らない
+  const 本当に消した = {
+    turnSeq: 1,
+    editLog: [
+      { turn: 1, path: '/x/h', big: false, before: 'a\nold_call()\nb\n', after: 'a\nold_call()\nb\nc\n' },
+      { turn: 1, path: '/x/h', big: false, before: 'a\nold_call()\nb\nc\n', after: 'a\nb\nc\n' }
+    ]
+  };
+  check(
+    '何度直しても、最後に消えていれば鳴らない',
+    removalClaimsNotRemoved('`old_call()` を削除しました。', removedTextThisTurn(本当に消した)).length === 0
+  );
   // 書き換えが1つも無いなら「何も消えていない」は確定。ここを null にしていたせいで、
   // 一度も書き換えずに「削除しました」と報告した回を見逃した（実機 2026-09-10）。
   check('この回に書き換えが無ければ「何も消えていない」', removedTextThisTurn({ turnSeq: 9, editLog: [] }) === '');

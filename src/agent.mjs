@@ -1560,12 +1560,29 @@ export function removedTextThisTurn(ctx) {
   // ここを null（確かめようがない）にしていたせいで、
   // 「一度も書き換えずに『削除しました』と報告した回」を見逃した（実機 2026-09-10）。
   if (!mine.length) return '';
-  let out = '';
+
+  // ファイルごとに、**依頼を始めたときの姿と、終わったときの姿だけ**を比べる。
+  //
+  // ■ 1回ごとの差分を足してはいけない
+  //   実機（2026-09-10）で、モデルが `_typo_round_two()` を**自分で書き足してから消した**回がある。
+  //   1回目: 無い→有る、2回目: 有る→無い。ファイルは元のまま。
+  //   それでも「`_typo_round_two()` を削除しました」と報告した。
+  //   1回ごとの差分を足すと、2回目の消えた行に名前が入っているので、**嘘が通ってしまう**。
+  //   自分で証拠を作られた形になる。差し引きで見れば、何も消えていないと分かる。
+  const 始まり = new Map();
+  const 終わり = new Map();
   for (const e of mine) {
     if (e.big || e.before == null || e.after == null) return null;
+    if (!始まり.has(e.path)) 始まり.set(e.path, String(e.before));
+    終わり.set(e.path, String(e.after));
+  }
+
+  let out = '';
+  for (const [file, before] of 始まり) {
+    const after = 終わり.get(file) ?? '';
     const rest = new Map();
-    for (const l of String(e.after).split('\n')) rest.set(l, (rest.get(l) || 0) + 1);
-    for (const l of String(e.before).split('\n')) {
+    for (const l of after.split('\n')) rest.set(l, (rest.get(l) || 0) + 1);
+    for (const l of before.split('\n')) {
       const n = rest.get(l) || 0;
       if (n > 0) rest.set(l, n - 1);
       else out += `${l}\n`;
