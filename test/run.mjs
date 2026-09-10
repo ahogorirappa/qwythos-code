@@ -202,16 +202,24 @@ console.log('\nedit_file — 置き換えの正しさ');
     edit.validate({ path: 'guardish', old_string: 'nope1', new_string: 'x' }, realCtx);
     const realSecond = edit.validate({ path: 'guardish', old_string: 'nope2', new_string: 'x' }, realCtx);
     check('写しきれない大きさ（440行・13,000字）は丸ごと渡さない', !/Stop using edit_file/.test(realSecond), realSecond.slice(0, 120));
+    // 6,000字で16行、8,000字で28行が勝手に化けた（2026-09-10 の実測）。4,000字を境にする。
+    const mid = [];
+    for (let i = 0; i < 200; i++) mid.push(`    self.v${i} = compute(${i})`);
+    put('midish', `#!/usr/bin/env python3\n${mid.join('\n')}\n`);
+    const midCtx = { ...ctx, editFailures: new Map() };
+    edit.validate({ path: 'midish', old_string: 'nope1', new_string: 'x' }, midCtx);
+    const midSecond = edit.validate({ path: 'midish', old_string: 'nope2', new_string: 'x' }, midCtx);
+    check('4,000字を超えたら渡さない（200行・5,600字）', !/Stop using edit_file/.test(midSecond));
 
     // 成功が確認できている大きさ（8,000字以内）は渡す。
     // 過去の実測: 1,524字 / 6,726字 / 8,429字 はどれも直後の書き換えに成功している。
     const small = [];
-    for (let i = 0; i < 150; i++) small.push(`    self.v${i} = compute(${i})`);
+    for (let i = 0; i < 120; i++) small.push(`    self.v${i} = compute(${i})`);
     put('smallish', `#!/usr/bin/env python3\n${small.join('\n')}\n`);
     const smallCtx = { ...ctx, editFailures: new Map() };
     edit.validate({ path: 'smallish', old_string: 'nope1', new_string: 'x' }, smallCtx);
     const smallSecond = edit.validate({ path: 'smallish', old_string: 'nope2', new_string: 'x' }, smallCtx);
-    check('成功が確認できている大きさ（150行・4,200字）は丸ごと渡す', /Stop using edit_file/.test(smallSecond), smallSecond.slice(0, 120));
+    check('正確に写せる大きさ（120行・3,300字）は丸ごと渡す', /Stop using edit_file/.test(smallSecond), smallSecond.slice(0, 120));
 
     // その全文を、道具出力の上限で切ってはいけない（穴の空いたファイルを書かせる）
     const kept = truncateProblem(smallSecond, 4000);

@@ -413,19 +413,33 @@ const REWRITE_MAX_LINES = 400;
  *   A の枠も一緒に縮んだ。**A は 9/5 を最後に一度も出ていない**（以後 B が11回）。
  *   いま A を出せるのは src/ の18%、~/bin の4%だけになっていた。
  *
- * ■ 8,000 にした根拠（2026-09-10 に実測でここまで下げた）
- *   過去に A が出た4件の payload と結果:
- *       1,524字 → 成功 ／ 6,726字 → 成功 ／ 8,429字 → 成功 ／ 13,434字 → **壊した**
- *   13,434字（442行）を渡した回では、gemma4 が全文を写しきれず、
- *   全角ピリオド（U+FF0E）を混ぜたうえ、**コード111行を落とした**。
- *   しかも構文は通るので、書いた直後の構文検査でも捕まらない。**静かに消える。**
- *   一度 20,000 まで広げてこれを起こしたので、成功が確認できている範囲まで戻した。
+ * ■ 4,000 にした根拠（2026-09-10 に大きさ別で実測した）
+ *   同じ依頼（1か所だけ直して、ほかは1文字も変えない）を大きさ別に14本走らせた結果:
+ *
+ *       2,000字   完全一致 ○     頼んでいない行の変化 0
+ *       4,000字   完全一致 ○     頼んでいない行の変化 0
+ *       6,000字   完全一致 ×     **16 行が勝手に変わった**
+ *       8,000字   完全一致 ×     **28 行**
+ *      16,000字   完全一致 ×     **75 行**
+ *
+ *   変わっていたのは全部 `return` 文——計算式そのものだった。
+ *   不規則な定数を、モデルが「連番だろう」と推測して置き換えている。
+ *   **行数は保たれ、構文も通り、全角も混ざらない。**動かして初めて分かる壊れ方で、
+ *   縮み検知（shrinkGuard）にも構文検査にも掛からない。
+ *
+ *   別の回（442行・13,434字）では、逆にコード111行が消えた。
+ *   壊れ方は一定しないが、**4,000字を超えると必ず何かが化ける**。
+ *
+ * ■ これは「効く手を潰す」ことではない
+ *   2026-09-03 に maxToolChars を 12,000→4,000 にしたとき、この枠も一緒に縮んだ。
+ *   当時それを「効く手を巻き添えで潰した」と書いたが、**半分誤り**だった。
+ *   効く手ではあるが、大きいファイルでは**静かにコードを書き換える手**でもあった。
  *
  * ■ 元のコードの注記は正しかった
  *   「長すぎるファイルでは丸ごと書き直させない（別の壊し方になるため）」——
  *   これは実機で確かめられた。上限を上げるなら、その大きさで写せることを先に測ること。
  */
-export const REWRITE_MAX_CHARS = 8000;
+export const REWRITE_MAX_CHARS = 4000;
 
 /** 全文を渡す案内の目印。これを含む出力は maxToolChars で切ってはいけない */
 export const WHOLE_FILE_HANDOFF = 'Stop using edit_file on this file.';
@@ -436,7 +450,8 @@ export const WHOLE_FILE_HANDOFF = 'Stop using edit_file on this file.';
  */
 export function truncateProblem(text, max) {
   const s = String(text ?? '');
-  if (s.includes(WHOLE_FILE_HANDOFF)) return truncateOutput(s, Math.max(max, REWRITE_MAX_CHARS + 2000));
+  // 全文の受け渡しは、失敗メッセージのぶんも含めて通す（切ると穴の空いたファイルを書かせる）
+  if (s.includes(WHOLE_FILE_HANDOFF)) return truncateOutput(s, Math.max(max, REWRITE_MAX_CHARS + 4000));
   return truncateOutput(s, max);
 }
 
@@ -513,8 +528,11 @@ function escalateAfterRepeatedFailure(abs, before, ctx, errorLen = 0) {
   // 入るときだけ貼り、入らないなら最初から貼らない。
   // 全文を渡すかどうかは `maxToolChars` ではなく、専用の枠で決める。
   // ここを maxToolChars に縛ると、効くほうの手が出せなくなる（上の注記を参照）。
+  // 写せる大きさかどうかは、**ファイルの中身の大きさ**で決める。
+  // 失敗メッセージの長さは写しの正確さに関係しないので、同じ枠から引かない
+  // （引いていたせいで、4,000 の枠が実質 1,500 字ぶんしか使えていなかった）。
   if (lines.length > REWRITE_MAX_LINES) return narrow;
-  if (errorLen + whole.length > REWRITE_MAX_CHARS) return narrow;
+  if (before.length > REWRITE_MAX_CHARS) return narrow;
   // 現物の全文をここで渡した。以後 write_file を「読まずに上書き」で止めないようにする。
   ctx?.readFiles?.add(abs);
   return whole;
