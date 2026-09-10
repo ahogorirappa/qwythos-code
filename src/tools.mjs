@@ -1041,9 +1041,24 @@ function runProcess(command, argv, { cwd, timeoutMs, shell = false, signal } = {
     let settled = false;
     let exitCode = null;
 
+    // 塊ごとに文字へ直さない。**塊の切れ目が文字の途中に落ちると壊れる。**
+    //
+    // `chunk.toString()` を塊ごとに呼んでいたので、64KiB の切れ目ごとに1文字化けていた。
+    // 実測（2026-09-10）: 日本語の多い出力で 300〜420KB につき 23〜31 文字が U+FFFD になった。
+    //   cat（1行が長い）  300,028字 → 23  /  cat（普通の行）419,680字 → 31
+    //   grep              419,685字 → 31  /  python3         415,094字 → 31
+    // 壊れたほうをモデルが読むので、その行を直そうとすると当然おかしくなる。
+    //
+    // setEncoding を立てると Node 側（StringDecoder）が切れ目をまたいで組み立ててくれる。
+    // stdout と stderr は別々に立てる。1つにまとめると、
+    // 片方の途中で他方が割り込んだときに同じ壊れ方をする。
+    // 逐次で受け取っている ollama.mjs が TextDecoder でやっているのと同じ手当て。
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+
     const limit = 400000;
-    const append = (chunk) => {
-      if (output.length < limit) output += chunk.toString();
+    const append = (text) => {
+      if (output.length < limit) output += text;
     };
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);

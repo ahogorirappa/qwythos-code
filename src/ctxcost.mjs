@@ -53,16 +53,27 @@ export function speedRatio(tokens) {
  */
 export const NOTICE_THRESHOLDS = [16000, 24000, 32000];
 
-/** 区切りを跨いだときに出す一行。跨いでいなければ null。 */
+/**
+ * 区切りを跨いだときに出す一行。跨いでいなければ null。
+ *
+ * ■ 跨いだ区切りを**全部**返す
+ *   ここは一番上の区切り1つだけを返していた。呼び出し側（agent.mjs）はその1つしか
+ *   「知らせた」と記録できないので、2つ以上まとめて跨ぐと、次のターンで下の区切りがまた鳴る。
+ *   実測（2026-09-10）: 33,000 トークンの状態から始めると、会話の大きさは変わらないのに
+ *       1回目 → 区切り 32000 / 2回目 → 24000 / 3回目 → 16000
+ *   と、同じ見た目の知らせが3回続けて出た（文中の数字は毎回「いまの長さ」なので、同じ文になる）。
+ *   `--resume` で長い会話を読み込んだ直後がちょうどこれに当たる。
+ *   「跨いだときに1回だけ」を守るには、跨いだものを全部渡して全部記録させる必要がある。
+ */
 export function contextNotice(tokens, alreadyNoticed = new Set()) {
-  let hit = null;
-  for (const t of NOTICE_THRESHOLDS) {
-    if (tokens >= t && !alreadyNoticed.has(t)) hit = t;
-  }
-  if (hit === null) return null;
+  const crossed = NOTICE_THRESHOLDS.filter((t) => tokens >= t && !alreadyNoticed.has(t));
+  if (!crossed.length) return null;
   const pct = Math.round(speedRatio(tokens) * 100);
   return {
-    threshold: hit,
+    // 画面に出す文はいちばん上の区切りで決まる（NOTICE_THRESHOLDS は小さい順）
+    threshold: crossed[crossed.length - 1],
+    // 記録するのはこちら。**呼び出し側はこれを全部 add すること。**
+    thresholds: crossed,
     text:
       `会話が ${Math.round(tokens / 1000)}k トークンになりました。` +
       `この長さでは生成がまっさらなときの約 ${pct}% の速さです（実測）。` +

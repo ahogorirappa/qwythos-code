@@ -31,8 +31,46 @@ export const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 function ensure(ctx) {
   if (!Array.isArray(ctx.editLog)) ctx.editLog = [];
   if (!(ctx.editBaseline instanceof Map)) ctx.editBaseline = new Map();
+  if (!(ctx.editDropped instanceof Map)) ctx.editDropped = new Map();
   if (typeof ctx.turnSeq !== 'number') ctx.turnSeq = 0;
   return ctx;
+}
+
+/**
+ * 上限を超えたぶんを捨てる。**捨てる順番が肝心。**
+ *
+ * ■ 何が起きていたか
+ *   ここは無条件に先頭（＝いちばん古い1件）から捨てていた。ところが1回のお願いは
+ *   最大200手まで回るので（config.mjs の maxSteps）、**進行中のお願いの最初の書き換え**が
+ *   真っ先に捨てられる。実測: 1回のお願いで70ファイル直してから `/undo` すると、
+ *   10件が戻らないまま残り、しかも `/undo` は60件ぜんぶ「元に戻しました」と報告した。
+ *   警告も、戻せなかった一覧も出ない。**最後の安全網が黙って嘘をつく。**
+ *
+ * ■ どう直すか
+ *   上限（MAX_ENTRIES）は動かさない。持ち回る量の歯止めなので、緩めるのは筋が違う。
+ *   1回のお願いだけで上限を超えたら、捨てるしかない。**捨てたこと自体は避けられない。**
+ *   避けられるのは「捨てたのに、戻したと報告すること」のほうなので、件数を控えておいて
+ *   `/undo` に言わせる（bin/qwc.mjs）。戻せないことより、
+ *   戻せていないのに戻したと言うことのほうが害が大きい。
+ *
+ * ■ 「古いお願いから捨てる」は、いまは念のため
+ *   控えは追記順（＝お願い順）なので、先頭から捨てれば自然と古いお願いから消える。
+ *   つまりこの探し方は、いまの呼ばれ方では `shift()` と同じ結果になる。
+ *   **これは不具合を直している部分ではない。** 並びが崩れる直し方が将来入っても、
+ *   直近のお願いだけは最後まで残る——という性質を、ここで明示して固定しておくためのもの。
+ *   agent.mjs の removedTextThisTurn が、その回の「始まりの姿」を必要とする。
+ */
+function trimLog(ctx) {
+  while (ctx.editLog.length > MAX_ENTRIES) {
+    const newest = ctx.editLog[ctx.editLog.length - 1].turn;
+    // 終わったお願いのぶんを探す。無ければ（全部が進行中のお願い）先頭を捨てるしかない
+    let at = ctx.editLog.findIndex((e) => e.turn !== newest);
+    if (at < 0) at = 0;
+    const [gone] = ctx.editLog.splice(at, 1);
+    if (gone.turn === newest) {
+      ctx.editDropped.set(newest, (ctx.editDropped.get(newest) || 0) + 1);
+    }
+  }
 }
 
 /** 新しいお願いが始まった。ここから先の書き換えを、ひとまとまりとして数える。 */
@@ -48,6 +86,7 @@ export function resetEdits(ctx) {
   ensure(ctx);
   ctx.editLog.length = 0;
   ctx.editBaseline.clear();
+  ctx.editDropped.clear();
   ctx.turnSeq = 0;
 }
 
@@ -87,7 +126,7 @@ export function recordEdit(ctx, { path: file, before, after, existed }) {
     big
   };
   ctx.editLog.push(entry);
-  while (ctx.editLog.length > MAX_ENTRIES) ctx.editLog.shift();
+  trimLog(ctx);
   return entry;
 }
 
@@ -116,6 +155,11 @@ export function undoLastTurn(ctx) {
 
   const batch = [];
   while (log.length && log[log.length - 1].turn === turn) batch.push(log.pop());
+
+  // このお願いのぶんが、控えの上限に当たって捨てられていたか。
+  // 捨てられていたら「全部戻した」とは言えない（trimLog の注記を参照）。
+  const dropped = ctx.editDropped.get(turn) || 0;
+  ctx.editDropped.delete(turn);
 
   // ■ 報告はファイル単位にまとめる
   //   同じファイルを3回直していれば、戻すのも3手になる。
@@ -175,7 +219,7 @@ export function undoLastTurn(ctx) {
     }
   }
 
-  return { turn, restored: [...restored.values()], skipped: [...skipped.values()] };
+  return { turn, restored: [...restored.values()], skipped: [...skipped.values()], dropped };
 }
 
 /**

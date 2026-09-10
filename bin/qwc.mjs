@@ -6,7 +6,7 @@ import process from 'node:process';
 import fs from 'node:fs';
 import { loadConfig, saveConfig, HOME_DIR } from '../src/config.mjs';
 import { checkServer, listModels, adaptToModel, pickBestModel, checkGpuFit } from '../src/ollama.mjs';
-import { PermissionManager } from '../src/permissions.mjs';
+import { PermissionManager, saysYes } from '../src/permissions.mjs';
 import { Agent, estimateTokens } from '../src/agent.mjs';
 import { contextLine } from '../src/ctxcost.mjs';
 import { TOOLS, activeTools, setMcpTools, KEY_HELP } from '../src/tools.mjs';
@@ -17,7 +17,7 @@ import { anyServerAvailable, serverStatus, stopAll as stopLsp } from '../src/lsp
 import { loadCommands, renderCommand, isReserved, BUILTIN_COMMANDS } from '../src/commands.mjs';
 import { makeCompleter } from '../src/complete.mjs';
 import { createPasteBuffer, attachBracketedPaste } from '../src/paste.mjs';
-import { undoLastTurn, sessionChanges, canUndo } from '../src/edits.mjs';
+import { undoLastTurn, sessionChanges, canUndo, MAX_ENTRIES } from '../src/edits.mjs';
 import {
   isAvailable as browserAvailable,
   login as browserLogin,
@@ -40,6 +40,33 @@ const VERSION = '0.2.0';
 function parseArgs(argv) {
   const opts = { prompt: null, resume: null, cwd: null, overrides: {}, listSessions: false };
   const rest = [];
+
+  /**
+   * 数で受け取る旗を、受け取ったその場で確かめる。
+   *
+   * ■ 素通ししていたせいで何が起きるか
+   *   `--ctx 32k` や値の書き忘れは `Number()` が NaN を返し、そのまま設定に入っていた。
+   *   すると文脈のしきい値（numCtx × compactAtRatio・agent.mjs）も NaN になる。
+   *   **NaN との大小はいつも false** なので「まだ短い」と一度も判定されず、
+   *   会話が9件を超えた時点から**毎ターン要約が走る**。
+   *   毎ターンの圧縮は履歴を書き換えるので、実測で 310秒 → 520秒（1.68倍）に落ちる経路そのもの。
+   *
+   * ■ しかも黙って居座る
+   *   その状態で `/save` すると、JSON に NaN は書けないので `null` が残る。
+   *   `null` は既定値を上書きするので、**次に起動してもずっと毎ターン圧縮のまま**になる。
+   *   画面には最後まで何も出ない。だから通す前に止める。
+   */
+  const asNumber = (flag, raw, { integer = true, min = 1, max = Infinity } = {}) => {
+    const v = Number(raw);
+    const ok = Number.isFinite(v) && v >= min && v <= max && (!integer || Number.isInteger(v));
+    if (!ok) {
+      const range = max === Infinity ? `${min} 以上` : `${min}〜${max}`;
+      error(`${flag} には${integer ? '整数' : '数'}を指定してください（${range}）。受け取った値: ${raw === undefined ? '（なし）' : raw}`);
+      process.exit(1);
+    }
+    return v;
+  };
+
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -49,9 +76,9 @@ function parseArgs(argv) {
       case '-p': case '--print': opts.prompt = next(); break;
       case '-m': case '--model': opts.overrides.model = next(); break;
       case '--host': opts.overrides.host = next(); break;
-      case '--ctx': opts.overrides.numCtx = Number(next()); break;
-      case '--temp': opts.overrides.temperature = Number(next()); break;
-      case '--steps': opts.overrides.maxSteps = Number(next()); break;
+      case '--ctx': opts.overrides.numCtx = asNumber('--ctx', next()); break;
+      case '--temp': opts.overrides.temperature = asNumber('--temp', next(), { integer: false, min: 0, max: 2 }); break;
+      case '--steps': opts.overrides.maxSteps = asNumber('--steps', next()); break;
       case '--yolo': case '--dangerously-skip-permissions': opts.overrides.autoApprove = true; break;
       // 「確認なし」を既定として保存してあるとき、その回だけ確認ありに戻すため。
       // 保存できるようにした以上、抜け道が無いと危ない作業のときに困る。
@@ -791,8 +818,12 @@ async function main() {
         line();
         line(`${c.brightYellow('┌')} ${c.bold('この方針で進めますか')}`);
         line(`${c.brightYellow('└')} ${c.gray('y = 実行に移る / n = このまま相談を続ける')}`);
-        const answer = String((await ask(`${c.brightYellow('  →')} [y/n] `)) ?? '').trim().toLowerCase();
-        if (answer === 'y' || answer === 'yes' || answer === '') {
+        // そのまま Enter は「進める」でよい（この先の書き換えには改めて確認が出る）。
+        // ただし**閉じた入力（Ctrl+D）は進めない**。ここは `?? ''` で受けていたので、
+        // 「やっぱりやめよう」の合図で計画がそのまま実行されていた。
+        // 聞き方の作法は permissions.mjs の saysYes に寄せてある。
+        const raw = await ask(`${c.brightYellow('  →')} [y/n] `);
+        if (saysYes(raw, { emptyMeansYes: true })) {
           config.planMode = false;
           agent.rebuildSystemPrompt();
           success('計画モードを抜けました。いまの方針で進めます。');
@@ -1200,6 +1231,15 @@ async function handleSlash(text, { agent, config, permissions, root }) {
         const rel = path.relative(root, sk.path) || sk.path;
         warn(`${rel} はそのままにしました — ${sk.reason}`);
       }
+      // 控えの上限に当たって捨てたぶんがあれば、必ず言う。
+      // 黙っていると「元に戻しました」だけが画面に残り、実際には書き換えが残る。
+      if (result.dropped) {
+        warn(
+          `このお願いは書き換えが多く、控えの上限（${MAX_ENTRIES} 件）を超えました。` +
+          `早いほうの ${result.dropped} 件は控えが残っておらず、戻せていません。` +
+          'そのぶんの書き換えはファイルに残ったままです（/diff で見られます）。'
+        );
+      }
       if (!result.restored.length && !result.skipped.length) info('戻すものがありませんでした。');
       // モデルにも伝える。黙って戻すと、直したつもりのまま次の一手を組み立てる
       if (result.restored.length) {
@@ -1269,6 +1309,12 @@ async function handleSlash(text, { agent, config, permissions, root }) {
         host: config.host,
         numCtx: config.numCtx,
         temperature: config.temperature,
+        // 深さの持ち主は effort ただ1つ（src/effort.mjs）。**ここに無かった。**
+        // think だけを保存しても、次の起動では DEFAULT_CONFIG の effort:'medium' が
+        // 必ず入っているので、ollama.mjs の逃げ道（effort が undefined のときだけ think を見る）に
+        // 一度も入らない。実測: `/effort off` して `/save` しても、次の起動で medium に戻る。
+        effort: config.effort,
+        // 古い qwc が読めるように、think も併せて残す（読む側は config.mjs が effort へ寄せる）
         think: config.thinkPreference ?? config.think,
         showThinking: config.showThinking,
         maxSteps: config.maxSteps,

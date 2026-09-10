@@ -74,10 +74,42 @@ export const KEY_HELP =
 // 手元のサービスを叩けてしまう。既定で塞ぐ。
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', '[::1]']);
 
+/**
+ * IPv4 を内側に持つ IPv6 の形。
+ *
+ * ■ ここが抜けていた（2026-09-10 実測）
+ *   `http://[::ffff:127.0.0.1]/` は URL のパーサが `[::ffff:7f00:1]` に畳む。
+ *   下の判定はどれにも当たらないので**素通しになり、実際に手元のサーバーを読めた**。
+ *   同じ書き方で 169.254.169.254（クラウドの覚え書き）も 192.168.x も通る。
+ *   人が見ても localhost に見えないぶん、確認欄に出しても気づけない。
+ *
+ *   なお10進・16進・短縮の IPv4（`2130706433` `0x7f000001` `127.1`）は
+ *   パーサが `127.0.0.1` に直してくれるので、そちらは元から塞がっていた。
+ *
+ * ■ 4つの形を見る
+ *   ::ffff:7f00:1      IPv4射影（いちばん普通）
+ *   ::ffff:0:7f00:1    IPv4変換（RFC 2765）
+ *   64:ff9b::7f00:1    NAT64 の決められた前置き
+ *   ::7f00:1           IPv4互換（廃止されているが、まだ解決する環境がある）
+ */
+const V4_IN_V6 = /^(?:::ffff:(?:0:)?|64:ff9b::|::)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i;
+
+function embeddedIPv4(h) {
+  const m = V4_IN_V6.exec(h);
+  if (!m) return null;
+  const hi = parseInt(m[1], 16);
+  const lo = parseInt(m[2], 16);
+  return [hi >> 8, hi & 255, lo >> 8, lo & 255].join('.');
+}
+
 function isPrivateAddress(hostname) {
   const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (LOCAL_HOSTS.has(h)) return true;
   if (h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.localhost')) return true;
+
+  // 内側に IPv4 を抱えている形は、その IPv4 を同じ物差しで見る
+  const inner = embeddedIPv4(h);
+  if (inner) return isPrivateAddress(inner);
 
   // IPv4 の私有アドレス
   const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);

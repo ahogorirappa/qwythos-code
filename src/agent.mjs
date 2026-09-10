@@ -1223,7 +1223,9 @@ export class Agent {
       if (!this.ctxNoticed) this.ctxNoticed = new Set();
       const notice = contextNotice(tokens, this.ctxNoticed);
       if (notice) {
-        this.ctxNoticed.add(notice.threshold);
+        // 跨いだ区切りは**全部**記録する。いちばん上の1つだけを記録していたので、
+        // 2つ以上まとめて跨いだあと、下の区切りぶんだけ同じ知らせが繰り返し出ていた。
+        for (const t of notice.thresholds) this.ctxNoticed.add(t);
         info(notice.text);
       }
     }

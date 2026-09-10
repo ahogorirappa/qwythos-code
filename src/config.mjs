@@ -209,12 +209,63 @@ function ensureHomeDir() {
   try { fs.chmodSync(SESSION_DIR, 0o700); } catch { /* 締められなくても止めない */ }
 }
 
+/**
+ * 数で入っているべき設定のうち、**壊れていたら既定に戻す**もの。
+ *
+ * `--ctx 32k` のように数にならない値を渡すと NaN になり、`/save` すると JSON には
+ * `null` が残る。`null` は既定値を上書きするので、以後ずっと居座る。
+ * numCtx が壊れると文脈のしきい値も壊れ、毎ターン要約が走る（bin/qwc.mjs の asNumber を参照）。
+ * 旗のほうは通す前に止めるようにしたが、**すでに壊れて保存されているものは、ここで拾う**。
+ */
+const NUMERIC_KEYS = [
+  'numCtx', 'temperature', 'topP', 'topK', 'repeatPenalty',
+  'maxSteps', 'maxToolChars', 'maxFileBytes', 'commandTimeoutMs', 'compactAtRatio',
+  'duplicateLimit', 'maxNudges', 'todoHintAfter', 'exploreLimit',
+  'netTimeoutMs', 'maxFetchBytes', 'browseTimeoutMs', 'firstTokenMs', 'stallMs',
+  'dedupeMinChars', 'keepFullToolTurns', 'oldToolOutputChars'
+];
+
+/**
+ * 保存された設定を、使える形に直してから既定に重ねる。
+ *
+ * 直すのは2つだけ。どちらも「黙って居座る」たぐいの壊れ方をする。
+ *   ・数として読めない値  … `--ctx 32k` を `/save` すると null が残り、既定を上書きし続ける
+ *   ・古い `think` だけの形 … 深さの持ち主は effort なので、そちらへ移す
+ */
+export function normalizeStoredConfig(fromFile, { warn = (m) => process.stderr.write(m) } = {}) {
+  const out = dropBrokenNumbers(fromFile, warn);
+  // 古い設定ファイルには `think` しか入っていない。
+  //
+  // ollama.mjs にも逃げ道はあるが、そこは `cfg.effort === undefined` を条件にしていて、
+  // DEFAULT_CONFIG が必ず effort を入れる以上**一度も通らない**。だから読む側で直す。
+  if (out.effort === undefined && out.think !== undefined) {
+    out.effort = out.think === false ? 'off' : DEFAULT_CONFIG.effort;
+  }
+  return out;
+}
+
+function dropBrokenNumbers(source, warn) {
+  const out = { ...source };
+  for (const key of NUMERIC_KEYS) {
+    if (!(key in out)) continue;
+    const v = Number(out[key]);
+    // 0 と負の数もここでは壊れている扱い。この一覧の既定値は全部 0 より大きい。
+    if (Number.isFinite(v) && v > 0) continue;
+    warn(
+      `設定の ${key} が数として読めません（${JSON.stringify(out[key])}）。` +
+      `既定値 ${DEFAULT_CONFIG[key]} を使います: ${CONFIG_PATH}\n`
+    );
+    delete out[key];
+  }
+  return out;
+}
+
 export function loadConfig() {
   ensureHomeDir();
   let fromFile = {};
   if (fs.existsSync(CONFIG_PATH)) {
     try {
-      fromFile = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+      fromFile = normalizeStoredConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')));
     } catch (err) {
       process.stderr.write(`設定ファイルが読めませんでした (${CONFIG_PATH}): ${err.message}\n`);
     }

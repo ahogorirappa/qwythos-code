@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { TOOL_MAP, truncateOutput, truncateProblem, OUTPUT_DRAIN_MS } from '../src/tools.mjs';
 import { runAfterEdit } from '../src/rules.mjs';
 import { stripControlMarks } from '../src/ollama.mjs';
-import { DEFAULT_CONFIG } from '../src/config.mjs';
-import { PermissionManager } from '../src/permissions.mjs';
+import { DEFAULT_CONFIG, normalizeStoredConfig } from '../src/config.mjs';
+import { PermissionManager, saysYes } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
 import { salvageToolCalls, chatStream, isTransientOllamaError } from '../src/ollama.mjs';
 import {
@@ -47,7 +47,7 @@ import { classifyInput, SMALL_TALK_HINT, withoutHint } from '../src/smalltalk.mj
 import { namesInRequest, missingNames, factsHint, treatsAsExisting, pathsInRequest, missingPaths } from '../src/facts.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
 import { startMcp, stopMcp } from '../src/mcp.mjs';
-import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits } from '../src/edits.mjs';
+import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits, MAX_ENTRIES } from '../src/edits.mjs';
 import { complete, completePath } from '../src/complete.mjs';
 import { createPasteBuffer, attachBracketedPaste, MAX_PASTE_CHARS } from '../src/paste.mjs';
 import { formatTiming, TIMING_FLOOR_MS } from '../src/ui.mjs';
@@ -55,6 +55,7 @@ import { BUILTIN_COMMANDS } from '../src/commands.mjs';
 import { makeCompleter } from '../src/complete.mjs';
 import { decodeSpeedAt, speedRatio, contextNotice, contextLine, NOTICE_THRESHOLDS } from '../src/ctxcost.mjs';
 import readline from 'node:readline';
+import { spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -3539,6 +3540,227 @@ console.log('\nモデルの内部用の印を落とす');
   check('ふつうの文章はそのまま', stripControlMarks('ふつうの文章') === 'ふつうの文章');
   check('空でも落ちない', stripControlMarks(null) === '' && stripControlMarks(undefined) === '');
 }
+
+// ══════════════════════════════════════════════════════════════════
+// 2026-09-10 に見つけた8件。どれも「黙って間違える」たぐいで、
+// 画面にも試験にも何も出ないまま通っていた。再発したらここで落ちる。
+// ══════════════════════════════════════════════════════════════════
+
+// ── 1. 構文検査を、そのシェルの本体にやらせる ──────────────────
+//
+// `.zsh` も `.bash` も拡張子なしの実行ファイルも、まとめて `sh -n` に渡していた。
+// sh は zsh も bash も読めないので、**正しく書けたコードに「壊れている」と言う**。
+// その文面はそのままモデルへ渡るので、直っているものを直しにいく。
+console.log('\n書き換えた直後の構文検査');
+{
+  const hooksFree = { root, config: { commandTimeoutMs: 120000 } };
+  const 検査 = (name, body) => runAfterEdit(put(name, body), hooksFree);
+  const 落ちた = (out) => out.includes('syntax check failed');
+
+  // 正しいものを「壊れている」と言わない
+  check('bash 固有の書き方を通す（プロセス置換）',
+    !落ちた(検査('ok.bash', '#!/bin/bash\nwhile read -r l; do echo "$l"; done < <(ls)\n')));
+  check('zsh 固有の書き方を通す（波括弧の if）',
+    !落ちた(検査('ok.zsh', '#!/bin/zsh\nif [[ -n "$1" ]] { print yes } else { print no }\n')));
+  check('拡張子なし + #!/usr/bin/env bash を通す',
+    !落ちた(検査('okbin', '#!/usr/bin/env bash\nmapfile -t a < <(printf "x\\n")\necho "${a[@]}"\n')));
+
+  // 本当に壊れているものは、これまでどおり拾う
+  check('壊れた bash は拾う', 落ちた(検査('ng.bash', '#!/bin/bash\nif [ 1 ; then\n')));
+  check('壊れた zsh は拾う', 落ちた(検査('ng.zsh', '#!/bin/zsh\nfor x in ; do\n')));
+  check('壊れた sh は拾う', 落ちた(検査('ng.sh', '#!/bin/sh\nif [ 1 ; then\n')));
+  check('壊れた python は拾う', 落ちた(検査('ng.py', 'def f(:\n')));
+  check('壊れた js は拾う', 落ちた(検査('ng.mjs', 'export const a = ;\n')));
+}
+
+// ── 2. `/undo` が「全部戻した」と嘘をつかない ─────────────────
+//
+// 控えは上限に当たると先頭から捨てていた。1回のお願いは最大200手回るので、
+// 捨てられるのは**進行中のお願いの最初の書き換え**。実測では70ファイル直したあと
+// `/undo` して10件が戻らず、それでも60件ぜんぶ「元に戻しました」と報告した。
+console.log('\n書き換えの控えが上限に当たったとき');
+{
+  const mk = () => ({ editLog: [], editBaseline: new Map(), editDropped: new Map(), turnSeq: 0, changedFiles: new Set() });
+  const 触る = (c, tag, i) => {
+    const f = put(`undo/${tag}${i}.txt`, `もと ${tag}${i}\n`);
+    const before = `もと ${tag}${i}\n`;
+    const after = `あと ${tag}${i}\n`;
+    fs.writeFileSync(f, after);
+    recordEdit(c, { path: f, before, after, existed: true });
+    return { f, before };
+  };
+
+  // 終わったお願いのぶんから先に捨てる（進行中のぶんは丸ごと残す）
+  const c1 = mk();
+  beginTurn(c1);
+  for (let i = 0; i < MAX_ENTRIES; i++) 触る(c1, 'old', i);
+  beginTurn(c1);
+  const いま = [];
+  for (let i = 0; i < 40; i++) いま.push(触る(c1, 'cur', i));
+  // 控えは追記順（＝お願い順）なので、この場合は直す前も後も同じ結果になる。
+  // ここは「壊れていないこと」を留めておくための確認で、不具合を捕まえるのは下の2つ。
+  check('直近のお願いのぶんは、上限を超えても丸ごと残る',
+    c1.editLog.filter((e) => e.turn === c1.turnSeq).length === 40);
+  const r1 = undoLastTurn(c1);
+  check('その回のファイルは全部もとに戻る',
+    いま.every(({ f, before }) => fs.readFileSync(f, 'utf8') === before));
+  check('捨てたぶんは無いと申告する', r1.dropped === 0);
+
+  // 1回のお願いだけで上限を超えたら、正直に申告する
+  const c2 = mk();
+  beginTurn(c2);
+  const 多い = [];
+  for (let i = 0; i < MAX_ENTRIES + 10; i++) 多い.push(触る(c2, 'big', i));
+  const r2 = undoLastTurn(c2);
+  const 未復旧 = 多い.filter(({ f, before }) => fs.readFileSync(f, 'utf8') !== before).length;
+  check('戻せなかった件数を申告する（黙って落とさない）',
+    r2.dropped === 未復旧 && r2.dropped === 10, `dropped=${r2.dropped} 未復旧=${未復旧}`);
+}
+
+// ── 3. 閉じた入力を「はい」に倒さない ────────────────────────
+//
+// 計画モードの確認が `?? ''` で受けていたので、Ctrl+D（＝ask が null）が
+// 空入力と同じ枝に入り、「やっぱりやめよう」で計画がそのまま実行されていた。
+console.log('\n「はい」の受け取り方');
+{
+  check('Ctrl+D は「はい」ではない（既定）', saysYes(null) === false);
+  check('Ctrl+D は「はい」ではない（空入力を「はい」にする場所でも）',
+    saysYes(null, { emptyMeansYes: true }) === false && saysYes(undefined, { emptyMeansYes: true }) === false);
+  check('そのまま Enter は、承認では「いいえ」', saysYes('') === false);
+  check('そのまま Enter は、進めるか聞く場所では「はい」', saysYes('', { emptyMeansYes: true }) === true);
+  check('y と yes は「はい」', saysYes('y') && saysYes('YES ') && saysYes(' Yes'));
+  check('n やそれ以外は「はい」ではない', !saysYes('n') && !saysYes('あとで') && !saysYes('yolo'));
+
+  // 不具合は saysYes の中ではなく**呼び出し側**にあった。
+  // 計画モードの確認が `?? ''` で受けていたので、そこを通っていることまで見る。
+  const src = fs.readFileSync(path.join(here, '..', 'bin', 'qwc.mjs'), 'utf8');
+  const 計画の確認 = src.slice(src.indexOf('この方針で進めますか'), src.indexOf('計画モードを抜けました。いまの方針で進めます'));
+  // 「`?? ''` が無いこと」で見てはいけない。**注記に書いた `?? ''` に当たる**（実際に当たった）。
+  // 見るのは「saysYes を通っていること」。元の書き方に戻せば saysYes は消えるので、それで足りる。
+  check('計画モードの確認が saysYes を通っている', /saysYes\(/.test(計画の確認), 計画の確認.slice(0, 400));
+}
+
+// ── 4. 手元・社内のアドレスを、IPv6 の書き方で抜けさせない ─────
+//
+// `http://[::ffff:127.0.0.1]/` は URL のパーサが `[::ffff:7f00:1]` に畳む。
+// 文字だけを見ていた判定はどれにも当たらず、実際に手元のサーバーを読めた。
+console.log('\n手元・社内アドレスの守り（IPv6 に埋めた IPv4）');
+{
+  const 弾く = (u) => checkUrl(u).ok === false;
+  const 通す = (u) => checkUrl(u).ok === true;
+  check('IPv4射影（::ffff:7f00:1 ＝ 127.0.0.1）', 弾く('http://[::ffff:7f00:1]:11434/'));
+  check('IPv4射影（点の書き方でも同じ場所に畳まれる）', 弾く('http://[::ffff:127.0.0.1]/'));
+  check('省略しない書き方（0:0:0:0:0:ffff:…）', 弾く('http://[0:0:0:0:0:ffff:127.0.0.1]/'));
+  check('社内アドレス（::ffff:c0a8:101 ＝ 192.168.1.1）', 弾く('http://[::ffff:192.168.1.1]/'));
+  check('クラウドの覚え書き（::ffff:a9fe:a9fe ＝ 169.254.169.254）', 弾く('http://[::ffff:169.254.169.254]/'));
+  check('IPv4変換（::ffff:0:7f00:1）', 弾く('http://[::ffff:0:7f00:1]/'));
+  check('IPv4互換（::7f00:1）', 弾く('http://[::7f00:1]/'));
+  check('NAT64（64:ff9b::7f00:1）', 弾く('http://[64:ff9b::7f00:1]/'));
+  // 元から塞がっていたぶんが、今も塞がっていること
+  check('10進表記（2130706433）', 弾く('http://2130706433/'));
+  check('16進表記（0x7f000001）', 弾く('http://0x7f000001/'));
+  check('短縮表記（127.1）', 弾く('http://127.1/'));
+  // 公開アドレスまで巻き込んでいないこと
+  check('ふつうの IPv6 は通す', 通す('http://[2606:4700:4700::1111]/'));
+  check('ふつうの IPv4 は通す', 通す('http://8.8.8.8/'));
+  check('ふつうの名前は通す', 通す('https://example.com/'));
+}
+
+// ── 5. 数で受け取る旗と、保存された設定を確かめる ──────────────
+//
+// `--ctx 32k` が NaN のまま通っていた。しきい値まで NaN になると
+// 「まだ短い」と一度も判定されず、毎ターン要約が走る。
+// `/save` すると JSON には null が残り、次からずっと既定値を上書きする。
+console.log('\n数で受け取る設定');
+{
+  const cli = (...args) =>
+    spawnSync(process.execPath, [path.join(here, '..', 'bin', 'qwc.mjs'), ...args], { encoding: 'utf8' });
+
+  let r = cli('--ctx', '32k', '--version');
+  check('--ctx に数でない値を渡したら止まる', r.status === 1 && /--ctx/.test(r.stdout + r.stderr), r.stdout + r.stderr);
+  r = cli('--ctx', '0', '--version');
+  check('--ctx 0 も止まる', r.status === 1);
+  r = cli('--steps', 'ちょっと', '--version');
+  check('--steps に数でない値を渡したら止まる', r.status === 1);
+  r = cli('--temp', '5', '--version');
+  check('--temp は 0〜2 の外を止める', r.status === 1);
+  r = cli('--ctx', '8192', '--temp', '0.4', '--steps', '10', '--version');
+  check('正しい値なら通る', r.status === 0 && /qwc /.test(r.stdout), r.stdout + r.stderr);
+
+  // すでに壊れて保存されているものは、読むときに拾う
+  const 黙る = () => {};
+  const 壊れ = normalizeStoredConfig({ numCtx: null, maxSteps: 'たくさん', temperature: 0.4 }, { warn: 黙る });
+  check('保存された numCtx が null なら、既定に戻す', !('numCtx' in 壊れ));
+  check('保存された maxSteps が数でなければ、既定に戻す', !('maxSteps' in 壊れ));
+  check('まともな値はそのまま残す', 壊れ.temperature === 0.4);
+}
+
+// ── 6. 「考える深さ」が保存されるようにする ────────────────────
+//
+// 深さの持ち主は effort ただ1つなのに、`/save` は think しか書いていなかった。
+// 次の起動では DEFAULT_CONFIG の effort:'medium' が必ず入るので、
+// ollama.mjs の逃げ道（effort が undefined のときだけ think を見る）に一度も入らない。
+console.log('\n考える深さの保存');
+{
+  const 黙る = () => {};
+  const 古い = normalizeStoredConfig({ think: false }, { warn: 黙る });
+  check('古い設定（think:false だけ）は effort:off として読む', 古い.effort === 'off');
+  const 古い2 = normalizeStoredConfig({ think: true }, { warn: 黙る });
+  check('古い設定（think:true）は既定の深さとして読む', 古い2.effort === DEFAULT_CONFIG.effort);
+  const 新しい = normalizeStoredConfig({ effort: 'high', think: true }, { warn: 黙る });
+  check('effort が入っていれば、そちらを優先する', 新しい.effort === 'high');
+  // `/save` が effort を書いているか（書いていなければ、次の起動で必ず戻る）
+  const saveSrc = fs.readFileSync(path.join(here, '..', 'bin', 'qwc.mjs'), 'utf8');
+  const saveBlock = saveSrc.slice(saveSrc.indexOf("case 'save'"), saveSrc.indexOf("case 'init'"));
+  check('/save が effort を保存している', /effort:\s*config\.effort/.test(saveBlock));
+}
+
+// ── 7. コマンドの出力で、文字を壊さない ──────────────────────
+//
+// 届いた塊ごとに `chunk.toString()` していたので、塊の切れ目が文字の途中に
+// 落ちると壊れた。実測で 300〜420KB につき 23〜31 文字が U+FFFD になっていた。
+console.log('\nコマンド出力の受け取り');
+{
+  const 文 = 'あいうえお日本語テスト漢字かな';
+  const 題材 = put('ja-out.txt', (文.repeat(4) + '\n').repeat(8000));   // 約 400KB
+  const 元 = fs.readFileSync(題材, 'utf8');
+  // 上限で切ると、壊れた場所ごと落ちて見えなくなる。ここでは切らずに全部受け取る
+  const 広い = { ...ctx, config: { ...baseConfig(), maxToolChars: 10_000_000 } };
+  const r = await run.run({ command: `cat ${JSON.stringify(題材)}` }, 広い);
+  const 化け = (r.output.match(/�/g) || []).length;
+  check('64KiB の切れ目をまたいでも日本語が壊れない', 化け === 0, `U+FFFD が ${化け} 文字`);
+  check('中身がそのまま届いている', r.output.includes(元.slice(-200)));
+}
+
+// ── 8. 長さの知らせは、区切りごとに1回だけ ───────────────────
+//
+// 跨いだ区切りのうち一番上だけを返していたので、呼び出し側はその1つしか
+// 記録できず、2つ以上まとめて跨ぐと次のターンで下の区切りがまた鳴っていた。
+console.log('\n会話が長くなったときの知らせ');
+{
+  // agent.mjs の maybeCompact と同じ使い方
+  const 流す = (列) => {
+    const seen = new Set();
+    const 出た = [];
+    for (const t of 列) {
+      const n = contextNotice(t, seen);
+      if (!n) continue;
+      // 直す前の呼び出し側は一番上の区切りしか記録しなかった。
+      // 古い形に戻したときも**壊れずに NG になる**ように、そこへ落とす
+      for (const x of n.thresholds ?? [n.threshold]) seen.add(x);
+      出た.push(n.threshold);
+    }
+    return 出た;
+  };
+  check('区切りを2つ以上まとめて跨いでも1回しか鳴らない',
+    流す([33000, 33500, 34000, 34500]).join() === '32000', 流す([33000, 33500, 34000, 34500]).join());
+  check('少しずつ伸びたときは、3段それぞれで1回ずつ鳴る',
+    流す([9000, 17000, 18000, 25000, 26000, 33000, 34000]).join() === '16000,24000,32000');
+  check('跨いだ区切りを全部返す',
+    (contextNotice(33000, new Set()).thresholds || []).join() === '16000,24000,32000');
+  check('跨いでいなければ何も返さない', contextNotice(9000, new Set()) === null);
+}
+
 
 fs.rmSync(root, { recursive: true, force: true });
 

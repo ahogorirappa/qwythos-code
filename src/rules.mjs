@@ -149,11 +149,19 @@ function builtinSyntaxCheck(absPath) {
   // JSON は外の道具を呼ばずにここで見る（速いし、Node に読み手がある）
   if (kind === 'json') return jsonSyntaxCheck(absPath);
 
+  // シェルは**その本体に読ませる**。`sh` にまとめてはいけない。
+  //
+  // 2026-09-10 実測: `sh -n` は正しい bash / zsh を「壊れている」と言う。
+  //     #!/usr/bin/env bash + `mapfile -t a < <(...)`  → bash -n は通る / sh -n は syntax error
+  //     #!/bin/zsh        + `if [[ ]] { } else { }`    → zsh -n は通る / sh -n は syntax error
+  // 検査に落ちた文面はそのままモデルへ渡るので、**正しく書けたコードを直しにいく**。
+  // 見られないなら黙るほうがよい、というこのファイルの方針からも外れていた。
+  const shell = SHELL_CHECKERS[kind];
   const result =
     kind === 'python'
       ? spawnSync('python3', ['-c', PY_SYNTAX_CHECK, absPath], { encoding: 'utf8', timeout: 10000 })
-      : kind === 'shell'
-        ? spawnSync('sh', ['-n', absPath], { encoding: 'utf8', timeout: 10000 })
+      : shell
+        ? spawnSync(shell, ['-n', absPath], { encoding: 'utf8', timeout: 10000 })
         : kind === 'plist'
           ? spawnSync('plutil', ['-lint', absPath], { encoding: 'utf8', timeout: 10000 })
           : spawnSync(process.execPath, ['--check', absPath], { encoding: 'utf8', timeout: 10000 });
@@ -170,13 +178,43 @@ function builtinSyntaxCheck(absPath) {
   );
 }
 
+/**
+ * シェルの種類ごとに、構文を見てもらう相手。
+ *
+ * 入っていない本体を指したときは spawnSync が error を返し、呼び出し側が黙って通す
+ * （「検査できなかった」を「壊れている」と伝えない、というこのファイルの方針どおり）。
+ */
+const SHELL_CHECKERS = { sh: 'sh', bash: 'bash', zsh: 'zsh' };
+
+/**
+ * shebang の行から、実際に動かす本体の名前を取り出す。
+ *
+ * `#!/usr/bin/env bash` の形があるので、`env` のときは次の語を見る
+ * （`-S` のような旗と `FOO=1` の形の代入は読み飛ばす）。
+ */
+function shebangCommand(head) {
+  const m = /^#!([^\n]*)/.exec(head);
+  if (!m) return '';
+  const words = m[1].trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return '';
+  const base = (w) => w.slice(w.lastIndexOf('/') + 1);
+  let name = base(words[0]);
+  if (name === 'env') {
+    const next = words.slice(1).find((w) => !w.startsWith('-') && !w.includes('='));
+    name = next ? base(next) : '';
+  }
+  return name;
+}
+
 /** 構文検査のしかた。拡張子で決まらないものは shebang で見る */
 function syntaxKindOf(absPath) {
   const ext = path.extname(absPath).toLowerCase();
   if (ext === '.py') return 'python';
   if (ext === '.js' || ext === '.mjs' || ext === '.cjs') return 'node';
   if (ext === '.json') return 'json';
-  if (ext === '.sh' || ext === '.bash' || ext === '.zsh') return 'shell';
+  if (ext === '.sh') return 'sh';
+  if (ext === '.bash') return 'bash';
+  if (ext === '.zsh') return 'zsh';
   if (ext === '.plist') return 'plist';
   // ここに無いもの（.ts .toml .yaml .yml など）は見ない。
   // TypeScript は `node --check` が読めず、TOML と YAML は Node に読み手が無い。
@@ -194,9 +232,12 @@ function syntaxKindOf(absPath) {
   } catch {
     return null;
   }
-  if (/^#![^\n]*python/.test(head)) return 'python';
-  if (/^#![^\n]*node/.test(head)) return 'node';
-  if (/^#![^\n]*(bash|zsh|\bsh)\b/.test(head)) return 'shell';
+  const name = shebangCommand(head);
+  if (/^python[\d.]*$/.test(name)) return 'python';
+  if (name === 'node') return 'node';
+  if (name === 'bash') return 'bash';
+  if (name === 'zsh') return 'zsh';
+  if (name === 'sh' || name === 'dash') return 'sh';
   return null;
 }
 
