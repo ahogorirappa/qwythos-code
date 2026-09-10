@@ -42,7 +42,7 @@ import { parseEdits } from '../src/agent.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
 import { classifyInput, SMALL_TALK_HINT, withoutHint } from '../src/smalltalk.mjs';
-import { namesInRequest, missingNames, factsHint } from '../src/facts.mjs';
+import { namesInRequest, missingNames, factsHint, treatsAsExisting } from '../src/facts.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
 import { startMcp, stopMcp } from '../src/mcp.mjs';
 import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits } from '../src/edits.mjs';
@@ -3353,6 +3353,21 @@ console.log('\n始める前の事実確認');
   check('新規作成を止める文言にしない', /作って構いません/.test(factsHint(['newThing_1'])));
   // 人に見せる文からは落とす（会話の一覧に事実確認が並ばないように）
   check('表示からは落とす', withoutHint(`直して${factsHint(['x_1'])}`) === '直して');
+
+  // ── 「もう在るもの」として書いているか ──
+  //
+  // 「`X` を追加して」も「`X` を削除して」も、X が作業場に無い事実は同じ。
+  // 違うのは無くて当たり前かどうか。ここを見分けずに書き換えを止めたら、
+  // **新規追加がそのまま実行されなくなった**（2026-09-10 に実際にそうした）。
+  check('壊れている前提の依頼は「在る前提」', treatsAsExisting('`_typo_round_two` の呼び出しを削除して'));
+  check('traceback も「在る前提」', treatsAsExisting("NameError: name '_typo_round_two' is not defined"));
+  check('「動かない」も「在る前提」', treatsAsExisting('`send_mail` が動かない'));
+  check('追加の依頼は止めない', !treatsAsExisting('`totalWithDiscount` を cart.js に追加して'));
+  check('実装の依頼も止めない', !treatsAsExisting('`parse_config` を新しく実装して'));
+  check('足す依頼も止めない', !treatsAsExisting('`API_KEY` を .env に足して'));
+  // 消す話と作る話が混ざっていたら、作る側に倒す。
+  // 在る前提だと誤れば確認が1回増えるだけだが、逆は作業が実行されない。
+  check('消す話と作る話が混ざったら作る側に倒す', !treatsAsExisting('`old_helper` を消して `new_helper` を作って'));
 }
 
 fs.rmSync(root, { recursive: true, force: true });

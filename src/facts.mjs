@@ -104,3 +104,27 @@ export function factsHint(missing) {
     '新しく作るよう頼まれている場合は、いつもどおり作って構いません。'
   );
 }
+
+/**
+ * その依頼は、名前を「もう在るもの」として書いているか。
+ *
+ * ■ なぜ要るか
+ *   「`totalWithDiscount` を追加して」も「`_typo_round_two` を削除して」も、
+ *   名前が作業場に無いという事実は同じ。**違うのは、無くて当たり前かどうか。**
+ *   ここを見分けないと、**新規追加が全部止まる**（実際に止めてしまった）。
+ *
+ * ■ 迷ったら「作る側」に倒す
+ *   在る前提だと誤れば、書き換えに確認が1回増えるだけ。
+ *   作る側だと誤れば、**頼んだ作業がそもそも実行されない**。損害が釣り合っていない。
+ */
+export function treatsAsExisting(text) {
+  const t = String(text ?? '');
+  // これから作る言い方が1つでもあれば、在る前提とは見ない
+  const 作る =
+    /(追加|新規|新しく|作って|作成|つくって|実装|導入|足して|加えて|生やして|\badd\b|\bcreate\b|\bimplement\b|\bintroduce\b)/i;
+  if (作る.test(t)) return false;
+  // 「もう在って、それが壊れている」と言っている印
+  const 在る =
+    /(直して|なおして|修正|削除|消して|取り除|落ちて|落ちる|エラー|例外|バグ|動かな|直せ|Traceback|Error:|Exception|\bfix\b|\bremove\b|\bdelete\b|\bcrash|\bfail)/i;
+  return 在る.test(t);
+}

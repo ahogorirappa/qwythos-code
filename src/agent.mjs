@@ -13,7 +13,7 @@ function hashText(text) {
 }
 import { buildSystemPrompt, COMPACT_PROMPT } from './prompt.mjs';
 import { classifyInput, SMALL_TALK_HINT } from './smalltalk.mjs';
-import { namesInRequest, missingNames, factsHint } from './facts.mjs';
+import { namesInRequest, missingNames, factsHint, treatsAsExisting } from './facts.mjs';
 import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
 import { PathError } from './paths.mjs';
 import { beginTurn, resetEdits } from './edits.mjs';
@@ -224,7 +224,10 @@ export class Agent {
       if (names.length) {
         const missing = missingNames(names, this.ctx);
         facts = factsHint(missing);
-        if (missing) this.ctx.missingFromRequest = missing;
+        // 書き換えを止めるのは、依頼が「もう在るもの」として書いているときだけ。
+        // 「`X` を追加して」で止めると、頼んだ作業がそのまま実行されない。
+        // 事実（facts）のほうは、作る依頼でも添える。無いと知っておくのは害にならない。
+        if (missing && treatsAsExisting(userInput)) this.ctx.missingFromRequest = missing;
       }
     }
     const message = {
@@ -1106,9 +1109,32 @@ export class Agent {
    *   まだ一度も応答が来ていないとき（最初の一手）は、見積もりだけで答える。
    */
   contextTokens() {
-    if (!this.lastPromptTokens) return estimateTokens(this.messages);
+    if (!this.lastPromptTokens) return estimateTokens(this.messages) + this.schemaTokens();
     const since = this.messages.slice(this.lastPromptUpTo ?? this.messages.length);
     return this.lastPromptTokens + estimateTokens(since);
+  }
+
+
+  /**
+   * 道具の定義がプロンプトに乗る量。
+   *
+   * これは `messages` に入っていないので、estimateTokens では数えられない。
+   * まだ一度も返事が来ていない一手目だけ、ここを足して辻褄を合わせる
+   * （返事が来れば実測に貼り直るので、以後は使わない）。
+   *
+   * 1トークン≒4.7文字は実測から。道具の定義は英語とJSONなので、
+   * 会話（日本語混じり）の係数を当てると3割ほど多く出る。
+   *   実測: 定義 6,141字 に対し、初回プロンプト 3,592 − 指示文 2,288 ＝ 約1,304トークン。
+   */
+  schemaTokens() {
+    if (this._schemaTokens === undefined) {
+      try {
+        this._schemaTokens = Math.ceil(JSON.stringify(toolSchemas(this.ctx.config)).length / 4.7);
+      } catch {
+        this._schemaTokens = 0;
+      }
+    }
+    return this._schemaTokens;
   }
 
   // ── 文脈が長くなりすぎたら要約して詰める ──────────────────
