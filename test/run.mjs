@@ -14,6 +14,7 @@ import { salvageToolCalls, chatStream, isTransientOllamaError } from '../src/oll
 import {
   describesIntentWithoutActing,
   claimsWorkDone,
+  unmentionedMissing,
   estimateTokens,
   filesNeverWritten,
   removedTextThisTurn,
@@ -3243,6 +3244,33 @@ console.log('\n直したという報告を、数で確かめる');
   // 「消しました」は完了報告としても拾えていなかった
   check('「消しました」も完了報告として拾う', claimsWorkDone('`foo` の呼び出しを消しました。'));
   check('「消しました」の嘘も捕まえる', removalClaimsNotRemoved('`_typo_round_two()` の呼び出しを消しました。', '').length === 1);
+
+  // ── 嘘ではないが、頼まれたことに答えていない報告 ──
+  //
+  // 実機（2026-09-10）で出たもの。
+  //   依頼「NameError: _typo_round_two が定義されていない。直して」
+  //   報告「不要な空行を削除しました。`line-guard` を修正しました。」
+  // 空行は本当に消したので嘘ではない。ただ、受け取った側は
+  // 「NameError が直った」と読む。**触れていないことが問題。**
+  check(
+    '無いと分かっているものに一言も触れていない報告を捕まえる',
+    unmentionedMissing('`line-guard` 内の不要な空行を削除しました。', ['_typo_round_two']).join() === '_typo_round_two'
+  );
+  check(
+    '触れていれば、内容が何であれ黙る',
+    unmentionedMissing('`_typo_round_two` は見つかりませんでした。', ['_typo_round_two']).length === 0
+  );
+  check(
+    '「直した」と書いてあっても、触れていれば黙る（真偽は別の見張りが見る）',
+    unmentionedMissing('`_typo_round_two` を削除しました。', ['_typo_round_two']).length === 0
+  );
+  // 名前が複数あるとき、1つでも触れていれば黙る。全部並べろとは言わない。
+  check(
+    '1つでも触れていれば黙る',
+    unmentionedMissing('`foo` はありませんでした。', ['foo', 'bar']).length === 0
+  );
+  check('無いものが無ければ、そもそも見ない', unmentionedMissing('何か書いた', []).length === 0);
+  check('古い ctx でも落ちない', unmentionedMissing('x', undefined).length === 0);
 }
 
 

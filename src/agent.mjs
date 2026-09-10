@@ -218,6 +218,7 @@ export class Agent {
     // 雑談と見たときは調べない（ファイル名を出しただけの独り言で毎回 rg を走らせない）。
     let facts = '';
     this.ctx.missingFromRequest = [];
+    this.ctx.missingKnown = [];
     this.ctx.missingAsked = false;
     if (!auto.smallTalk) {
       const names = namesInRequest(userInput);
@@ -227,7 +228,14 @@ export class Agent {
         // 書き換えを止めるのは、依頼が「もう在るもの」として書いているときだけ。
         // 「`X` を追加して」で止めると、頼んだ作業がそのまま実行されない。
         // 事実（facts）のほうは、作る依頼でも添える。無いと知っておくのは害にならない。
-        if (missing && treatsAsExisting(userInput)) this.ctx.missingFromRequest = missing;
+        // 「もう在るもの」として書かれた名前が無いときだけ、書き換えを止める。
+        // 作る依頼（「`X` を追加して」）では、無くて当たり前なので止めない。
+        if (missing && treatsAsExisting(userInput)) {
+          this.ctx.missingFromRequest = missing;
+          // missingFromRequest は「進めてよい」と言われたら空にするが、
+          // **無いと分かっている事実そのもの**は、報告を見るときまで残す。
+          this.ctx.missingKnown = missing;
+        }
       }
     }
     const message = {
@@ -384,6 +392,36 @@ export class Agent {
                   'Read the exact text you need to change with read_file, then copy old_string from what you just read. ' +
                   'If the thing you are looking for is not in the file at all, say that plainly. ' +
                   'Do not report a change you did not make.'
+              });
+              continue;
+            }
+          }
+
+          // 依頼が指していたものが**この作業場に無い**と分かっているのに、
+          // 報告がそのことに一言も触れていない場合。
+          //
+          // ■ 嘘ではないが、答えていない
+          //   実機（2026-09-10）で、こういう報告が出た。
+          //     依頼「NameError: _typo_round_two が定義されていない。直して」
+          //     報告「不要な空行を削除しました。line-guard を修正しました。」
+          //   空行は本当に消したので嘘ではない。**頼まれたことに答えていないだけ。**
+          //   受け取った側は「NameError が直った」と読む。
+          //
+          // ■ ここは判断ではなく事実で見られる
+          //   qwc は依頼を受けた時点で grep していて、無いことを知っている（facts.mjs）。
+          //   知っている事実に報告が触れていないかどうかは、名前を探すだけで分かる。
+          if (said && this.shouldNudgeToAct() && nudges < (this.config.maxNudges ?? 5)) {
+            const 無い = unmentionedMissing(said, this.ctx.missingKnown);
+            if (無い.length) {
+              nudges++;
+              info(`${無い[0]} が無いことに報告が触れていないので、促しました。`);
+              this.messages.push({
+                role: 'user',
+                content:
+                  `Your reply does not mention \`${無い[0]}\` at all, but that is what the user asked about, ` +
+                  'and it is not in this workspace. ' +
+                  'Whatever else you changed, say plainly what happened to it: that it is not there. ' +
+                  'Otherwise the user will read your reply as "the reported problem is fixed".'
               });
               continue;
             }
@@ -1664,6 +1702,29 @@ export function removalClaimsNotRemoved(text, evidence) {
     if (passive) 足す(passive[1]);
   }
   return missing;
+}
+
+/**
+ * 「この作業場に無い」と分かっている名前のうち、報告が一言も触れていないもの。
+ *
+ * ■ 嘘ではないが、答えていない報告を捕まえる
+ *   実機（2026-09-10）でこういう報告が出た。
+ *     依頼「NameError: _typo_round_two が定義されていない。直して」
+ *     報告「不要な空行を削除しました。`line-guard` を修正しました。」
+ *   空行は本当に消したので嘘ではない。頼まれたことに答えていないだけ。
+ *   受け取った側は「NameError が直った」と読む。
+ *
+ * ■ 1つでも触れていれば黙る
+ *   報告が長くなるほど、名前を全部並べろと言うのは筋が悪い。
+ *   **どれにも触れていない**ときだけ促す。
+ *   触れてさえいれば、「直した」でも「無かった」でも、答えたことにはなっている。
+ */
+export function unmentionedMissing(said, missingKnown) {
+  const names = Array.isArray(missingKnown) ? missingKnown : [];
+  if (!names.length) return [];
+  const text = String(said ?? '');
+  const 触れていない = names.filter((n) => !text.includes(String(n).replace(/\(\)$/, '')));
+  return 触れていない.length === names.length ? 触れていない : [];
 }
 
 export function claimsWorkDone(text) {
