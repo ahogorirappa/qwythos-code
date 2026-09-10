@@ -185,6 +185,49 @@ function readForUndo(abs) {
 }
 
 // ── 2. ファイルを丸ごと書く ──────────────────────────────────
+
+/** 丸ごと書き直したとき、これ以上減っていたら止める（元の行数に対する割合） */
+const SHRINK_LIMIT = 0.7;
+
+/** この行数より小さいファイルでは見ない（数行のファイルは割合で測れない） */
+const SHRINK_MIN_LINES = 50;
+
+/**
+ * 丸ごとの上書きで、中身が大きく減っていないか。
+ *
+ * ■ 何を防ぐか
+ *   置き換えに失敗したモデルに現物の全文を渡して write_file させると、
+ *   写しきれずに**中身を落とすことがある**。実機（2026-09-10）では 442行の
+ *   Python が 299行になり、コード111行が消えた。関数はすべて残っていて
+ *   **構文も通る**ので、構文検査でも `/undo` を見ない限り気づけない。
+ *
+ * ■ なぜ割合で見るか
+ *   「何行消えたか」は、ファイルの大きさで意味が変わる。3割落ちたら、
+ *   それは書き直しではなく写し損ないとみてよい。
+ *
+ * ■ 止め方
+ *   断るだけで、消してはいない。本当に減らしたいなら edit_file で削るか、
+ *   減らす理由を言ってから改めて書けばよい。
+ */
+function shrinkGuard(abs, content, ctx) {
+  let before;
+  try {
+    before = fs.readFileSync(abs, 'utf8');
+  } catch {
+    return null;
+  }
+  const was = before.split('\n').filter((l) => l.trim()).length;
+  const now = content.split('\n').filter((l) => l.trim()).length;
+  if (was < SHRINK_MIN_LINES || now >= was * SHRINK_LIMIT) return null;
+  return (
+    `This would shrink ${displayPath(abs, ctx)} from ${was} to ${now} non-empty lines ` +
+    `(${Math.round((1 - now / was) * 100)}% removed). ` +
+    'When you rewrite a whole file it is easy to drop parts of it without noticing. ' +
+    'If you meant to change only part of it, use edit_file. ' +
+    'If you really mean to delete that much, say so in words first and then write it.'
+  );
+}
+
 const writeFile = {
   name: 'write_file',
   // 実行後に、書いた中身を画面に出す（agent.mjs が preview を使う）
@@ -201,6 +244,36 @@ const writeFile = {
       content: { type: 'string', description: 'The full content to write.' }
     },
     required: ['path', 'content']
+  },
+  /**
+   * 読んでいないファイルを丸ごと上書きさせない。
+   *
+   * ■ なぜ要るか
+   *   write_file は中身を**全部**置き換える。いま何が書いてあるかを知らずに送れば、
+   *   知らない部分は消える。実機の記録では3件あり、いちばん大きいものは
+   *   9,577字の React の部品を一度も読まずに上書きしていた。
+   *   `ctx.readFiles` は集めてあったのに、画面表示にしか使われていなかった。
+   *
+   * ■ 新規作成は止めない
+   *   まだ無いファイルには、消える中身が無い。
+   *
+   * ■ 一度読めば以後は通る
+   *   読み直しを1回はさむだけで済む。置き換えに失敗して全文を渡したときも、
+   *   その場で「読んだ」ことにしてある（escalateAfterRepeatedFailure を参照）ので、
+   *   丸ごと書き直させる流れは止まらない。
+   */
+  validate(args, ctx) {
+    const abs = resolveSafe(args.path, ctx);
+    if (!fs.existsSync(abs)) return null;
+    if (!ctx?.readFiles?.has(abs)) {
+      return (
+        `${displayPath(abs, ctx)} already exists and you have not read it in this session. ` +
+        'write_file replaces the whole file, so anything you have not seen would be lost. ' +
+        'Read it first with read_file, then send the complete new content. ' +
+        'If you only need to change part of it, use edit_file instead.'
+      );
+    }
+    return shrinkGuard(abs, String(args.content ?? ''), ctx);
   },
   approvalTitle(args, ctx) {
     const abs = resolveSafe(args.path, ctx);
@@ -230,6 +303,7 @@ const writeFile = {
     ctx.changedFiles.add(abs);
     ctx.readFiles.add(abs);
     ctx.mutations = (ctx.mutations || 0) + 1;
+    countWrite(ctx, abs, true);
     const lines = content.split('\n').length;
     return {
       output:
@@ -280,6 +354,7 @@ const editFile = {
       ctx.editFailures?.delete(abs);
       return null;
     }
+    countWrite(ctx, abs, false);
     return result.error + escalateAfterRepeatedFailure(abs, before, ctx, result.error.length);
   },
   preview(args, ctx) {
@@ -302,12 +377,14 @@ const editFile = {
     const before = fs.readFileSync(abs, 'utf8');
     const result = applyEdit(before, args, ctx?.config?.maxToolChars);
     if (result.error) {
+      countWrite(ctx, abs, false);
       return { isError: true, output: result.error, display: '置き換えできませんでした' };
     }
     fs.writeFileSync(abs, result.text, 'utf8');
     recordEdit(ctx, { path: abs, before, after: result.text, existed: true });
     ctx.changedFiles.add(abs);
     ctx.mutations = (ctx.mutations || 0) + 1;
+    countWrite(ctx, abs, true);
     return {
       output:
         `Edited ${displayPath(abs, ctx)} (${result.count} replacement${result.count > 1 ? 's' : ''}).` +
@@ -324,8 +401,67 @@ const EDIT_FAILURE_LIMIT = 2;
 /** 差し替えの案内に添えられるファイルの上限。これを超えるものは丸ごと書き直させない */
 const REWRITE_MAX_LINES = 400;
 
+/**
+ * 全文を渡すときだけ使う文字数の枠。`maxToolChars` とは**別枠**にしてある。
+ *
+ * ■ なぜ別枠が要るか
+ *   実測（218セッション）では、2回続けて置き換えに失敗したあとの案内は2種類あって、
+ *   効き方がまるで違った。
+ *       A「現物の全文を渡すので write_file で送れ」… 直後の書き換え 成功3 / 失敗0
+ *       B「範囲を狭めて読み直せ」                  … 直後の書き換え 成功1 / 失敗5
+ *   ところが 2026-09-03 に `maxToolChars` を 12,000 → 4,000 に下げたとき、
+ *   A の枠も一緒に縮んだ。**A は 9/5 を最後に一度も出ていない**（以後 B が11回）。
+ *   いま A を出せるのは src/ の18%、~/bin の4%だけになっていた。
+ *
+ * ■ 8,000 にした根拠（2026-09-10 に実測でここまで下げた）
+ *   過去に A が出た4件の payload と結果:
+ *       1,524字 → 成功 ／ 6,726字 → 成功 ／ 8,429字 → 成功 ／ 13,434字 → **壊した**
+ *   13,434字（442行）を渡した回では、gemma4 が全文を写しきれず、
+ *   全角ピリオド（U+FF0E）を混ぜたうえ、**コード111行を落とした**。
+ *   しかも構文は通るので、書いた直後の構文検査でも捕まらない。**静かに消える。**
+ *   一度 20,000 まで広げてこれを起こしたので、成功が確認できている範囲まで戻した。
+ *
+ * ■ 元のコードの注記は正しかった
+ *   「長すぎるファイルでは丸ごと書き直させない（別の壊し方になるため）」——
+ *   これは実機で確かめられた。上限を上げるなら、その大きさで写せることを先に測ること。
+ */
+export const REWRITE_MAX_CHARS = 8000;
+
+/** 全文を渡す案内の目印。これを含む出力は maxToolChars で切ってはいけない */
+export const WHOLE_FILE_HANDOFF = 'Stop using edit_file on this file.';
+
+/**
+ * 道具が「そのままでは適用できません」と返す文を、上限で切って確定させる。
+ * 全文の受け渡しだけは別枠（上の理由）。
+ */
+export function truncateProblem(text, max) {
+  const s = String(text ?? '');
+  if (s.includes(WHOLE_FILE_HANDOFF)) return truncateOutput(s, Math.max(max, REWRITE_MAX_CHARS + 2000));
+  return truncateOutput(s, max);
+}
+
 /** 上限が取れなかったときに使う既定値（config.mjs の maxToolChars と同じ） */
 const FALLBACK_MAX_CHARS = 4000;
+
+/**
+ * ファイルごとに、書き換えが通った回数と外れた回数を数える。
+ *
+ * ■ なぜ mutations と別に持つか
+ *   `ctx.mutations` には **run_command も数えている**。「コマンドを走らせた」も
+ *   「手を動かした」のうちだからだが、そのせいで「直したと言ったのに直っていない」の
+ *   見張りが、`ls` を1回打つだけで切れていた。書き換えの成否は、別枠で持つ必要がある。
+ *
+ * ■ 数えない失敗
+ *   「ファイルが無い」「作業フォルダの外」は**書き換えの失敗ではなく行き先の間違い**。
+ *   モデルは打ち間違えたパスをすぐ捨てて正しいほうを直すことがあるので、
+ *   ここで数えると、正しい報告まで咎めることになる。
+ */
+function countWrite(ctx, abs, ok) {
+  if (!ctx) return;
+  const key = ok ? 'writeOk' : 'writeFail';
+  if (!(ctx[key] instanceof Map)) ctx[key] = new Map();
+  ctx[key].set(abs, (ctx[key].get(abs) || 0) + 1);
+}
 
 /**
  * 同じファイルで edit_file が続けて失敗したときに、道を変えさせる。
@@ -361,7 +497,7 @@ function escalateAfterRepeatedFailure(abs, before, ctx, errorLen = 0) {
 
   // 全文を貼って write_file に切り替えさせる案内。
   const whole =
-    `\n\nYou have now failed to edit ${rel} ${count} times in a row. **Stop using edit_file on this file.**\n` +
+    `\n\nYou have now failed to edit ${rel} ${count} times in a row. **${WHOLE_FILE_HANDOFF}**\n` +
     'Call write_file with the complete new content instead. Below is the file exactly as it is on disk ' +
     'right now, with no line numbers. Copy it, apply your change to your copy, and send the whole thing:\n\n' +
     before;
@@ -375,9 +511,12 @@ function escalateAfterRepeatedFailure(abs, before, ctx, errorLen = 0) {
   // 「これを丸ごとコピーして write_file で送れ」と言っているので、
   // 貼った全文の真ん中を抜かれると、モデルは**穴の空いたファイルを書く**。
   // 入るときだけ貼り、入らないなら最初から貼らない。
-  const max = Number(ctx?.config?.maxToolChars) || FALLBACK_MAX_CHARS;
+  // 全文を渡すかどうかは `maxToolChars` ではなく、専用の枠で決める。
+  // ここを maxToolChars に縛ると、効くほうの手が出せなくなる（上の注記を参照）。
   if (lines.length > REWRITE_MAX_LINES) return narrow;
-  if (errorLen + whole.length > max) return narrow;
+  if (errorLen + whole.length > REWRITE_MAX_CHARS) return narrow;
+  // 現物の全文をここで渡した。以後 write_file を「読まずに上書き」で止めないようにする。
+  ctx?.readFiles?.add(abs);
   return whole;
 }
 

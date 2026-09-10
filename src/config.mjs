@@ -204,7 +204,9 @@ export const DEFAULT_CONFIG = {
 
 function ensureHomeDir() {
   fs.mkdirSync(HOME_DIR, { recursive: true });
-  fs.mkdirSync(SESSION_DIR, { recursive: true });
+  // 会話の記録は本人だけが読めるようにする（理由は session.mjs に）
+  fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(SESSION_DIR, 0o700); } catch { /* 締められなくても止めない */ }
 }
 
 export function loadConfig() {

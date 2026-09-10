@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { TOOL_MAP, truncateOutput, OUTPUT_DRAIN_MS } from '../src/tools.mjs';
+import { TOOL_MAP, truncateOutput, truncateProblem, OUTPUT_DRAIN_MS } from '../src/tools.mjs';
+import { runAfterEdit } from '../src/rules.mjs';
 import { DEFAULT_CONFIG } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
@@ -12,6 +13,11 @@ import { salvageToolCalls, chatStream, isTransientOllamaError } from '../src/oll
 import {
   describesIntentWithoutActing,
   claimsWorkDone,
+  estimateTokens,
+  filesNeverWritten,
+  removedTextThisTurn,
+  turnEvidence,
+  removalClaimsNotRemoved,
   looksLikeFileRewrite,
   recommendsWithoutActing,
   QUIET_AFTER_MS,
@@ -36,6 +42,7 @@ import { parseEdits } from '../src/agent.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
 import { classifyInput, SMALL_TALK_HINT, withoutHint } from '../src/smalltalk.mjs';
+import { namesInRequest, missingNames, factsHint } from '../src/facts.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
 import { startMcp, stopMcp } from '../src/mcp.mjs';
 import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits } from '../src/edits.mjs';
@@ -163,14 +170,51 @@ console.log('\nedit_file — 置き換えの正しさ');
     const afterOk = edit.validate({ path: 'loop.js', old_string: 'const a = 7;', new_string: 'x' }, fresh);
     check('一度通れば、数えは振り出しに戻る', !/Stop using edit_file/.test(afterOk), afterOk.slice(0, 120));
 
-    // 長すぎるファイルを丸ごと書き直させると、別の壊し方になる
+    // 長すぎるファイルを丸ごと書き直させると、別の壊し方になる。
+    // 境界は 2026-09-10 に上げた（600行 / 20,000字）。理由は tools.mjs の REWRITE_MAX_CHARS に。
     const big = [];
-    for (let i = 0; i < 500; i++) big.push(`const v${i} = ${i};`);
+    for (let i = 0; i < 700; i++) big.push(`const v${i} = ${i};`);
     put('big.js', `${big.join('\n')}\n`);
     const bigCtx = { ...ctx, editFailures: new Map() };
     edit.validate({ path: 'big.js', old_string: 'nope1', new_string: 'x' }, bigCtx);
     const bigSecond = edit.validate({ path: 'big.js', old_string: 'nope2', new_string: 'x' }, bigCtx);
-    check('長すぎるファイルは丸ごと書き直させない', !/Stop using edit_file/.test(bigSecond) && /offset and limit/.test(bigSecond), bigSecond.slice(0, 160));
+    check('行が多すぎるファイルは丸ごと書き直させない', !/Stop using edit_file/.test(bigSecond) && /offset and limit/.test(bigSecond), bigSecond.slice(0, 160));
+
+    // 行数は足りていても、字数が枠を超えるなら渡さない（途中で切れた全文を書かせないため）
+    const fat = [];
+    for (let i = 0; i < 300; i++) fat.push(`const v${i} = "${'あ'.repeat(80)}";`);
+    put('fat.js', `${fat.join('\n')}\n`);
+    const fatCtx = { ...ctx, editFailures: new Map() };
+    edit.validate({ path: 'fat.js', old_string: 'nope1', new_string: 'x' }, fatCtx);
+    const fatSecond = edit.validate({ path: 'fat.js', old_string: 'nope2', new_string: 'x' }, fatCtx);
+    check('字数が枠を超えるファイルも丸ごと書き直させない', !/Stop using edit_file/.test(fatSecond) && /offset and limit/.test(fatSecond));
+
+    // 実機で壊れた大きさ（~/bin/line-guard は 442行・13,434字）は**渡さない**。
+    // 一度この大きさまで枠を広げたら、gemma4 が写しきれずに全角文字を混ぜ、
+    // コード111行を落とした（2026-09-10）。しかも構文は通るので気づけない。
+    const real = [];
+    // 1行あたり約30字。実測（line-guard は 442行 13,434字 ＝ 1行30字）に寄せてある
+    for (let i = 0; i < 440; i++) real.push(`    self.v${i} = compute(${i})`);
+    put('guardish', `#!/usr/bin/env python3\n${real.join('\n')}\n`);
+    const realCtx = { ...ctx, editFailures: new Map() };
+    edit.validate({ path: 'guardish', old_string: 'nope1', new_string: 'x' }, realCtx);
+    const realSecond = edit.validate({ path: 'guardish', old_string: 'nope2', new_string: 'x' }, realCtx);
+    check('写しきれない大きさ（440行・13,000字）は丸ごと渡さない', !/Stop using edit_file/.test(realSecond), realSecond.slice(0, 120));
+
+    // 成功が確認できている大きさ（8,000字以内）は渡す。
+    // 過去の実測: 1,524字 / 6,726字 / 8,429字 はどれも直後の書き換えに成功している。
+    const small = [];
+    for (let i = 0; i < 150; i++) small.push(`    self.v${i} = compute(${i})`);
+    put('smallish', `#!/usr/bin/env python3\n${small.join('\n')}\n`);
+    const smallCtx = { ...ctx, editFailures: new Map() };
+    edit.validate({ path: 'smallish', old_string: 'nope1', new_string: 'x' }, smallCtx);
+    const smallSecond = edit.validate({ path: 'smallish', old_string: 'nope2', new_string: 'x' }, smallCtx);
+    check('成功が確認できている大きさ（150行・4,200字）は丸ごと渡す', /Stop using edit_file/.test(smallSecond), smallSecond.slice(0, 120));
+
+    // その全文を、道具出力の上限で切ってはいけない（穴の空いたファイルを書かせる）
+    const kept = truncateProblem(smallSecond, 4000);
+    check('全文の受け渡しは maxToolChars で切らない', kept.length > 4000 && !kept.includes('characters omitted'), String(kept.length));
+    check('ふつうの失敗は今までどおり上限で切る', truncateProblem('x'.repeat(9000), 4000).includes('characters omitted'));
   }
 
   put('d.js', 'export function sum(a, b) {\n  return a + b;\n}\n');
@@ -3057,6 +3101,258 @@ console.log('\n考える深さ（/effort）');
   cap.close();
 
   check('/effort は予約語（同名の自作コマンドを作らせない）', isReserved('effort'));
+}
+
+
+// ── 「直した」の報告が本当かを、文章ではなく数で確かめる ──────────────
+//
+// 実機の記録（2026-09-08）で3回続けて起きた不具合。
+// 置き換えに8回失敗したあと「`_typo_round_two()` を削除しました」と報告し、
+// ファイルは1文字も変わっていなかった。既存の見張り（ctx.mutations）は
+// run_command も「変えた」に数えているので、`ls` を1回打つだけで切れており、
+// **218セッションで一度も鳴っていなかった**。
+console.log('\n直したという報告を、数で確かめる');
+{
+  // ── 書き換えが一度も通っていないファイル ──
+  check(
+    '置き換えに失敗したきり成功していないファイルを見つける',
+    filesNeverWritten({ writeFail: new Map([['/x/line-guard', 8]]), writeOk: new Map() })
+      .join() === '/x/line-guard'
+  );
+  check(
+    '同じファイルで成功していれば鳴らない',
+    filesNeverWritten({ writeFail: new Map([['/x/a.js', 2]]), writeOk: new Map([['/x/a.js', 1]]) }).length === 0
+  );
+  check(
+    '打ち間違えたパスを捨てて別のファイルを直した場合も鳴らない（失敗を数えていないため）',
+    filesNeverWritten({ writeFail: new Map(), writeOk: new Map([['/x/b.js', 1]]) }).length === 0
+  );
+  check('失敗が無ければ鳴らない', filesNeverWritten({ writeFail: new Map(), writeOk: new Map() }).length === 0);
+  check('古い ctx でも落ちない', filesNeverWritten({}).length === 0 && filesNeverWritten(null).length === 0);
+
+  // ── この回で実際に消えた行 ──
+  const ctx1 = {
+    turnSeq: 3,
+    editLog: [
+      { turn: 2, before: 'ふるい\n', after: '', big: false },          // 前の依頼のぶんは混ぜない
+      { turn: 3, before: 'a\nけす\nb\n', after: 'a\nb\n', big: false }
+    ]
+  };
+  const removed = removedTextThisTurn(ctx1);
+  check('この回で消えた行だけを取る', removed.includes('けす') && !removed.includes('ふるい'));
+  check(
+    '中身を控えていない大きなファイルが混ざったら、確かめずに null を返す',
+    removedTextThisTurn({ turnSeq: 1, editLog: [{ turn: 1, before: null, after: null, big: true }] }) === null
+  );
+  // 書き換えが1つも無いなら「何も消えていない」は確定。ここを null にしていたせいで、
+  // 一度も書き換えずに「削除しました」と報告した回を見逃した（実機 2026-09-10）。
+  check('この回に書き換えが無ければ「何も消えていない」', removedTextThisTurn({ turnSeq: 9, editLog: [] }) === '');
+  check(
+    '一度も書き換えずに「削除しました」と言ったら捕まえる',
+    removalClaimsNotRemoved('`_typo_round_two()` を削除しました。', '').join() === '_typo_round_two()'
+  );
+
+  // ── 証拠に数える道具の出力 ──
+  const msgs = [
+    { role: 'tool', tool_name: 'read_file', turn: 4, content: 'def mark_up():' },
+    { role: 'tool', tool_name: 'todo_write', turn: 4, content: '1. `_typo_round_two` を消す' },
+    { role: 'tool', tool_name: 'read_file', turn: 3, content: 'まえの依頼のぶん' }
+  ];
+  const ev = turnEvidence(msgs, 4);
+  check('この回の道具の出力だけを証拠にする', ev.includes('mark_up') && !ev.includes('まえの依頼'));
+  check(
+    'todo_write はモデル自身の言葉なので証拠にしない',
+    !ev.includes('_typo_round_two')
+  );
+
+  // ── 「消した」と言った名前が、どこにも出てこない ──
+  check(
+    '在りもしない関数を「削除しました」と言ったら捕まえる',
+    removalClaimsNotRemoved(
+      '`line-guard` の `mark_up` 関数内にあった、定義されていない関数 `_typo_round_two()` の呼び出しを削除しました。',
+      'def mark_up():\n    """復旧したら'
+    ).join() === '_typo_round_two()'
+  );
+  check(
+    '本当に消していれば鳴らない',
+    removalClaimsNotRemoved('`vocabWords` を削除しました。', 'const vocabWords = [').length === 0
+  );
+  // 目的語の取り違え。「空行」を消したのに、直前の `mark_up` を拾ってしまう。
+  // それでも `mark_up` はファイルに在るので、証拠に当たって鳴らない。
+  check(
+    '目的語を取り違えても、その名前がファイルに在れば鳴らない',
+    removalClaimsNotRemoved(
+      '`line-guard` の `mark_up` 関数内にあった不要な空行を削除しました。',
+      '\ndef mark_up():\n'
+    ).length === 0
+  );
+  check(
+    '確かめようがないとき（null）は、決めつけない',
+    removalClaimsNotRemoved('`foo` を削除しました。', null).length === 0
+  );
+  check(
+    '削除の話をしていなければ見ない',
+    removalClaimsNotRemoved('`foo` を追加しました。', '').length === 0
+  );
+}
+
+
+// ── 書いた直後に、構文だけ見る ──────────────────────────────
+//
+// `.qwythos/hooks.json` を置いていないフォルダ（`~/bin` など）では、qwc は
+// 書いたものを一度も動かさずに「直しました」と言えていた。中身は動かさず、構文だけ見る。
+console.log('\n書いた直後の構文検査');
+{
+  const d = path.join(root, 'syntax');
+  fs.mkdirSync(d, { recursive: true });
+  const ctx = { root: d, config: { commandTimeoutMs: 120000 } };
+  const 見る = (name, body) => {
+    const p = path.join(d, name);
+    fs.writeFileSync(p, body);
+    return runAfterEdit(p, ctx);
+  };
+  check('壊れた Python を見つける', /syntax check failed/.test(見る('こわれ.py', 'def f(:\n')));
+  check('正しい Python には何も言わない', 見る('ただしい.py', 'def f():\n    return 1\n') === '');
+  check('壊れた JavaScript を見つける', /syntax check failed/.test(見る('こわれ.mjs', 'export function f( {\n')));
+  check('正しい JavaScript には何も言わない', 見る('ただしい.mjs', 'export const f = () => 1;\n') === '');
+  // ~/bin/line-guard のような拡張子の無い実行ファイル
+  check(
+    '拡張子が無くても shebang で見分ける',
+    /syntax check failed/.test(見る('guardlike', '#!/usr/bin/env python3\ndef f(:\n'))
+  );
+  check('ただの文章には手を出さない', 見る('memo', 'これは文章です\n') === '');
+  check('__pycache__ を作らない', !fs.existsSync(path.join(d, '__pycache__')));
+}
+
+// ── 読んでいないファイルを丸ごと上書きさせない ────────────────
+//
+// write_file は中身を全部置き換えるので、読んでいない部分は消える。
+// 実機の記録に3件あり、最大のものは 9,577字の部品を一度も読まずに上書きしていた。
+console.log('\n読まずに上書きしない');
+{
+  const d = path.join(root, 'overwrite');
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'ある.js'), 'export const keep = 1;\n');
+  const w = TOOL_MAP.get('write_file');
+  const r = TOOL_MAP.get('read_file');
+  const ctx = { root: d, readFiles: new Set(), changedFiles: new Set(), config: { ...DEFAULT_CONFIG } };
+
+  check(
+    '読んでいない既存ファイルの上書きは断る',
+    /have not read it/.test(String(w.validate({ path: 'ある.js', content: 'x' }, ctx)))
+  );
+  check(
+    '新規作成は止めない',
+    w.validate({ path: 'まだ無い.js', content: 'x' }, ctx) === null
+  );
+  await r.run({ path: 'ある.js' }, ctx);
+  check(
+    '一度読めば上書きできる',
+    w.validate({ path: 'ある.js', content: 'x' }, ctx) === null
+  );
+
+  // ── 丸ごと書き直したときに、中身が大きく減っていないか ──
+  //
+  // 実機（2026-09-10）で、442行の Python を丸ごと書き直させたら 299行になり、
+  // **コード111行が消えた**。関数は全部残っていて構文も通るので、
+  // 構文検査でも気づけない。割合で見て止める。
+  const 元 = Array.from({ length: 200 }, (_, i) => `line_${i} = ${i}`).join('\n');
+  fs.writeFileSync(path.join(d, '長い.py'), `${元}\n`);
+  await r.run({ path: '長い.py' }, ctx);
+  check(
+    '3割以上減る丸ごと上書きは断る',
+    /shrink/.test(String(w.validate({ path: '長い.py', content: 元.split('\n').slice(0, 120).join('\n') }, ctx)))
+  );
+  check(
+    '少し減るぶんには通す',
+    w.validate({ path: '長い.py', content: 元.split('\n').slice(0, 180).join('\n') }, ctx) === null
+  );
+  check(
+    '増えるぶんには通す',
+    w.validate({ path: '長い.py', content: `${元}\nmore = 1` }, ctx) === null
+  );
+  // 数行のファイルを割合で測っても意味がない
+  fs.writeFileSync(path.join(d, '短い.py'), 'a = 1\nb = 2\nc = 3\n');
+  await r.run({ path: '短い.py' }, ctx);
+  check('小さいファイルには掛けない', w.validate({ path: '短い.py', content: 'a = 1\n' }, ctx) === null);
+}
+
+// ── 一語の同意を雑談に落とさない ──────────────────────────
+//
+// 「うん」だけの返事は直前の提案への同意であることが多い。雑談に落とすと、
+// 同意した直後にもう一度確認を出すことになる（実機で41件中6回）。
+console.log('\n「うん」だけの返事');
+{
+  check('会話の途中の「うん」は返事として扱う', classifyInput('うん', { replyingTo: true }).smallTalk === false);
+  check('「はい」も同じ', classifyInput('はい', { replyingTo: true }).smallTalk === false);
+  check('「y」も同じ', classifyInput('y', { replyingTo: true }).smallTalk === false);
+  check('会話の最初の「うん」は今までどおり雑談', classifyInput('うん', { replyingTo: false }).smallTalk === true);
+  check('打ち消しの「ううん」は同意にしない', classifyInput('ううん', { replyingTo: true }).smallTalk === true);
+  check('「いや」も同意にしない', classifyInput('いや', { replyingTo: true }).smallTalk === true);
+  check('文になっている感想は今までどおり雑談', classifyInput('うん、いい天気だね', { replyingTo: true }).smallTalk === true);
+}
+
+// ── 文脈の長さは、推定ではなく実測を土台にする ─────────────────
+//
+// 以前の見積もりは道具の定義（約2,400トークン）を数えておらず、
+// 日本語の係数も甘くて実測より22〜30%低かった。その数字で圧縮のしきい値を
+// 決めていたので、numCtx を超えてから圧縮が走る計算になっていた。
+console.log('\n文脈の長さ');
+{
+  const 日本語 = [{ role: 'user', content: 'あ'.repeat(1000) }];
+  const 英語 = [{ role: 'user', content: 'a'.repeat(1000) }];
+  check('日本語のほうがトークンを食うと見る', estimateTokens(日本語) > estimateTokens(英語));
+  check('日本語 1,000字は約709トークン', Math.abs(estimateTokens(日本語) - 709) <= 2, String(estimateTokens(日本語)));
+  check('英語 1,000字は約391トークン', Math.abs(estimateTokens(英語) - 391) <= 2, String(estimateTokens(英語)));
+}
+
+
+// ── 依頼が「もう在るもの」として書いている名前を、始める前に確かめる ──────
+//
+// 実機で2日続けて起きた。利用者が貼った traceback の `_typo_round_two()` は
+// そのファイルに無かった。モデルは自分で grep して0件を見たのに「無い」とは言わず、
+// 別の行を書き換えて「削除しました」と報告した（翌日は mins // 60 を mins // 6 に壊した）。
+// 文章の忠告は8回無視された記録があるので、探させるのではなく事実を先に置く。
+console.log('\n始める前の事実確認');
+{
+  const d = path.join(root, 'facts');
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'guard.py'), 'def mark_up():\n    return 1\n');
+
+  check(
+    'バッククォートの名前を拾う',
+    namesInRequest('`_typo_round_two()` を消して').includes('_typo_round_two')
+  );
+  check('括弧つきの呼び出しも拾う', namesInRequest('getUserName() が落ちる').includes('getUserName'));
+  check(
+    'ふつうの英単語は拾わない',
+    namesInRequest('README を直して。テストも走らせて').length === 0
+  );
+  check('日本語だけの依頼では何も拾わない', namesInRequest('消費税を10%にして').length === 0);
+  check(
+    'traceback によく出る語は拾わない',
+    !namesInRequest('NameError: name Traceback is not defined').includes('Traceback')
+  );
+
+  const ctx = { root: d };
+  check('作業場に無い名前を挙げる', missingNames(['_typo_round_two'], ctx).join() === '_typo_round_two');
+  check('在る名前は挙げない', missingNames(['mark_up'], ctx).length === 0);
+  // 同じファイルに両方あるとき、片方を取りこぼさないこと。
+  // まとめて引いて --max-count 1 を付けると、先に当たったほうしか出てこない（実際に外した）。
+  fs.writeFileSync(path.join(d, 'both.py'), 'def mark_up():\n    other_name()\n');
+  check(
+    '同じファイルに複数あっても取りこぼさない',
+    missingNames(['mark_up', 'other_name'], ctx).length === 0
+  );
+  check('調べられないときは null（決めつけない）', missingNames(['x_1'], { root: path.join(root, '無い場所') }) === null);
+
+  check('無いものがあれば事実を添える', /見つかりません/.test(factsHint(['_typo_round_two'])));
+  check('無いものが無ければ何も添えない', factsHint([]) === '');
+  check('調べられなかったとき（null）も何も添えない', factsHint(null) === '');
+  // 新しく作る依頼を止めてはいけない。事実だけ伝えて、作ってよいと明記する。
+  check('新規作成を止める文言にしない', /作って構いません/.test(factsHint(['newThing_1'])));
+  // 人に見せる文からは落とす（会話の一覧に事実確認が並ばないように）
+  check('表示からは落とす', withoutHint(`直して${factsHint(['x_1'])}`) === '直して');
 }
 
 fs.rmSync(root, { recursive: true, force: true });

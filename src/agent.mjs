@@ -4,7 +4,7 @@ import path from 'node:path';
 import { chatStream, chatOnce } from './ollama.mjs';
 import { createHash } from 'node:crypto';
 import { contextNotice } from './ctxcost.mjs';
-import { TOOL_MAP, toolSchemas, truncateOutput } from './tools.mjs';
+import { TOOL_MAP, toolSchemas, truncateOutput, truncateProblem } from './tools.mjs';
 
 // 中身が同じかどうかだけ分かればよいので、短い指紋で足りる。
 // 全文を持ち回すと、送信する JSON がそのぶん太る。
@@ -13,6 +13,7 @@ function hashText(text) {
 }
 import { buildSystemPrompt, COMPACT_PROMPT } from './prompt.mjs';
 import { classifyInput, SMALL_TALK_HINT } from './smalltalk.mjs';
+import { namesInRequest, missingNames, factsHint } from './facts.mjs';
 import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
 import { PathError } from './paths.mjs';
 import { beginTurn, resetEdits } from './edits.mjs';
@@ -21,19 +22,37 @@ import {
   formatMarkdown, termWidth, info, warn, formatTiming
 } from './ui.mjs';
 
-// 文字数からだいたいのトークン数を見積もる（日本語混じりを想定して 1トークン≒3文字）
+// 日本語かどうかで、1トークンあたりの文字数がまるで違う。
+const CJK = /[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]/;
+
+// 文字数からだいたいのトークン数を見積もる。
+//
+// ■ 係数は実測
+//   今日の9本（llama-server が返した prompt_eval_count と突き合わせ）で最小二乗した結果、
+//   日本語 1.41 文字／トークン、それ以外 2.56 文字／トークン。誤差は ±7%。
+//   **以前の「1トークン≒3文字」は 22〜30% 低く出ていた。**
+//
+// ■ これは目安でしかない
+//   指示文と道具の定義（英語とJSON）はもっと詰まっていて、この係数では3割ほど多く出る。
+//   だから本当の長さは estimateTokens ではなく `contextTokens()` を使うこと。
+//   あちらは ollama が返す実測値を土台にして、そこからの増分だけをここで見積もる。
 // 出はじめたあと、これだけ無音が続いたら待ち表示を戻す。
 // 生成中の普通の切れ目（実測で1秒未満）では出さず、
 // 道具を組み立てている本当の無音だけを拾える長さにしてある。
 export const QUIET_AFTER_MS = 2000;
 
 export function estimateTokens(messages) {
-  let chars = 0;
+  let cjk = 0;
+  let other = 0;
   for (const m of messages) {
-    chars += (m.content || '').length + (m.thinking || '').length;
-    if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
+    let text = (m.content || '') + (m.thinking || '');
+    if (m.tool_calls) text += JSON.stringify(m.tool_calls);
+    for (const ch of text) {
+      if (CJK.test(ch)) cjk++;
+      else other++;
+    }
   }
-  return Math.ceil(chars / 3);
+  return Math.ceil(cjk / 1.41 + other / 2.56);
 }
 
 export class Agent {
@@ -60,6 +79,10 @@ export class Agent {
       // ファイルごとの「置き換えに失敗した回数」。
       // 続けて外すようなら、edit_file をやめて丸ごと書き直させる（tools.mjs）。
       editFailures: new Map(),
+      // ファイルごとの「書き換えが通った／外れた」回数（tools.mjs の countWrite が入れる）。
+      // mutations と別に持つ理由はそちらに書いてある。
+      writeOk: new Map(),
+      writeFail: new Map(),
       // 手を動かした回数（書き込み・置き換え・コマンド実行）。
       // changedFiles は「どのファイルか」の集合なので、同じファイルを2度直しても増えない。
       // 「今回のお願いで実際に何かしたか」を見るには、回数で持つ必要がある。
@@ -127,7 +150,12 @@ export class Agent {
     this.ctx.changedFiles.clear();
     this.ctx.readFiles.clear();
     this.ctx.editFailures.clear();
+    this.ctx.writeOk.clear();
+    this.ctx.writeFail.clear();
     this.ctx.mutations = 0;
+    // 会話を切ったら、前の会話で測った長さは当てはまらない
+    this.lastPromptTokens = 0;
+    this.lastPromptUpTo = 0;
     this.ctx.todos = [];
     // 会話をまっさらにしたのに `/undo` が前の作業を戻せてしまうと、
     // 画面に何も残っていないぶん、何が起きたのか分からなくなる。
@@ -173,18 +201,45 @@ export class Agent {
     // あちらには聞く相手がいない（permissions が無い）ので、外したときに取り返せない。
     const skipAuto =
       this.config.chatMode || this.config.planMode || this.config.isSubagent || !this.permissions;
-    const auto = skipAuto ? { smallTalk: false, reason: '' } : classifyInput(userInput);
+    // 直前にこちらが何か言っているなら、この発言は「返事」でありうる。
+    // 「うん」だけの同意を雑談に落とさないために渡す（smalltalk.mjs を参照）。
+    const replyingTo = this.messages.some((m) => m.role === 'assistant' && (m.content || '').trim());
+    const auto = skipAuto ? { smallTalk: false, reason: '' } : classifyInput(userInput, { replyingTo });
     this.ctx.smallTalk = auto.smallTalk;
     // 一度「作業です」と答えてもらったら、その発言の残りはもう聞かない
     this.ctx.smallTalkAsked = false;
     if (auto.smallTalk) info(`雑談として受け取ります（${auto.reason}）。書き換えるときは確認します。`);
 
-    const message = { role: 'user', content: auto.smallTalk ? userInput + SMALL_TALK_HINT : userInput };
+    // 依頼が「もう在るもの」として書いている名前を、**始める前に**1回だけ確かめる。
+    //
+    // モデルは自分で grep して0件を見ても、無いとは言わずに別の何かを書き換える
+    // （実機で2日続けて起きた。詳しくは facts.mjs）。文章で忠告しても効かないので、
+    // 探させるのではなく、事実を先に置いておく。
+    // 雑談と見たときは調べない（ファイル名を出しただけの独り言で毎回 rg を走らせない）。
+    let facts = '';
+    this.ctx.missingFromRequest = [];
+    this.ctx.missingAsked = false;
+    if (!auto.smallTalk) {
+      const names = namesInRequest(userInput);
+      if (names.length) {
+        const missing = missingNames(names, this.ctx);
+        facts = factsHint(missing);
+        if (missing) this.ctx.missingFromRequest = missing;
+      }
+    }
+    const message = {
+      role: 'user',
+      content: userInput + (auto.smallTalk ? SMALL_TALK_HINT : '') + facts
+    };
     if (images.length) message.images = images.map((i) => i.data);
     this.messages.push(message);
     this.stats.turns++;
     // ここから先の書き換えを、ひとまとまりとして控える（`/undo` は1手ではなく1お願い単位で戻す）
     beginTurn(this.ctx);
+    // 書き換えの成否は**そのお願いの中**で見る。前の依頼の失敗を持ち越すと、
+    // 今回きちんと直した報告まで嘘だと言うことになる。
+    this.ctx.writeOk.clear();
+    this.ctx.writeFail.clear();
     this.running = true;
     this.abortController = new AbortController();
     this.ctx.signal = this.abortController.signal;
@@ -220,6 +275,13 @@ export class Agent {
 
         this.messages.push(result.message);
         if (result.stats) {
+          // **その時ollamaが実際に読んだ長さ**。見積もりではなく本当の数なので、
+          // 文脈の長さを言うときはこちらを土台にする（contextTokens を参照）。
+          if (result.stats.promptTokens) {
+            this.lastPromptTokens = result.stats.promptTokens;
+            // この長さを測ったのは、いま積んだ返事の**手前まで**。
+            this.lastPromptUpTo = this.messages.length - 1;
+          }
           this.stats.inputTokens += result.stats.promptTokens || 0;
           this.stats.outputTokens += result.stats.outputTokens || 0;
           // 時間も積む。`/stats` で「今日は前処理ばかりに払っている」が見えるようにするため
@@ -293,6 +355,59 @@ export class Agent {
                 'If you believe no change is needed, say that plainly instead of reporting one you did not make.'
             });
             continue;
+          }
+
+          // 「直しました」と言っているのに、**そのファイルへの書き換えが一度も通っていない**場合。
+          //
+          // 上の判定は `mutations` を見るが、そこには run_command も数えている。
+          // だから `ls` を1回打つだけで見張りが切れる。実機の記録（2026-09-08）では、
+          // 置き換えに8回失敗したあと「削除しました」と報告した回が2つあり、
+          // どちらも run_command を挟んでいたため、一度も鳴らなかった。
+          if (
+            said &&
+            this.shouldNudgeToAct() &&
+            nudges < (this.config.maxNudges ?? 5) &&
+            claimsWorkDone(said)
+          ) {
+            const stuck = filesNeverWritten(this.ctx);
+            if (stuck.length) {
+              nudges++;
+              const rel = path.relative(this.root, stuck[0]) || stuck[0];
+              info(`直したと報告しましたが、${rel} への書き換えは一度も通っていないので、促しました。`);
+              this.messages.push({
+                role: 'user',
+                content:
+                  `You reported the change, but every edit to ${rel} failed. Nothing was written to it. ` +
+                  'Read the exact text you need to change with read_file, then copy old_string from what you just read. ' +
+                  'If the thing you are looking for is not in the file at all, say that plainly. ' +
+                  'Do not report a change you did not make.'
+              });
+              continue;
+            }
+          }
+
+          // 「`X` を削除しました」と言っているのに、**消えた行に X が無い**場合。
+          //
+          // 上の見張りは「一度も通っていない」しか見ないので、
+          // **通ったが中身が違う**嘘は抜ける。実機の記録（2026-09-08 21:28）では、
+          // ファイルに存在しない関数を消したと報告し、実際にやったのは空行を2つ消しただけだった。
+          // 書き換え自体は成功しているので、回数を数えるだけでは捕まらない。
+          if (said && this.shouldNudgeToAct() && nudges < (this.config.maxNudges ?? 5)) {
+            const removed = removedTextThisTurn(this.ctx);
+            const evidence = removed === null ? null : removed + turnEvidence(this.messages, this.stats.turns);
+            const notRemoved = removalClaimsNotRemoved(said, evidence);
+            if (notRemoved.length) {
+              nudges++;
+              info(`「${notRemoved[0]}」を消したと報告しましたが、差分に出てこないので、促しました。`);
+              this.messages.push({
+                role: 'user',
+                content:
+                  `You said you removed \`${notRemoved[0]}\`, but it does not appear anywhere in what you actually changed. ` +
+                  'Look for it again with search_files. If it is not in the file, say so plainly. ' +
+                  'Do not describe a change you did not make.'
+              });
+              continue;
+            }
           }
 
           // 直した全文を画面に貼っただけで、保存していない場合。
@@ -788,7 +903,7 @@ export class Agent {
         // なお、上限に触れないよう作るのは呼び出し側の責任（tools.mjs の
         // escalateAfterRepeatedFailure）。ここは最後の歯止めで、
         // 通常は何も切らずに素通りする。
-        return { output: truncateOutput(problem, this.config.maxToolChars), denied: false };
+        return { output: truncateProblem(problem, this.config.maxToolChars), denied: false };
       }
     }
 
@@ -800,6 +915,66 @@ export class Agent {
     //
     // 確認なしモード（--yolo）でも聞く。あれは「頼んだ作業を任せる」という意味で、
     // 頼んでもいない雑談でファイルを変えてよい、という意味ではない。
+    // 依頼が名指ししたものが、この作業場に無いと**分かっている**とき。
+    //
+    // ■ なぜここで止めるか
+    //   その状態での書き換えは、定義上ぜんぶ辻褄合わせになる。
+    //   実機（2026-09-08〜10）では、無い関数を消せと言われたモデルが
+    //   空行を消したり、`mins // 60` を `mins // 6` に変えたりしたうえで
+    //   「削除しました」と報告した。前提が崩れているとき、手は止めたほうがよい。
+    //
+    // ■ なぜ「頼まれていない変更」一般を禁じないか
+    //   「テストを直して」のような依頼には識別子が出てこない。
+    //   一般に禁じると、ふつうの作業が全部止まる。
+    //   **名指しがあり、かつそれが作業場に無い**という両方が揃ったときだけにする。
+    //
+    // ■ --yolo でも聞く
+    //   あれは「頼んだ作業を任せる」という意味で、
+    //   前提が違っていても構わず書き換えてよい、という意味ではない。
+    if (
+      this.ctx.missingFromRequest?.length &&
+      (tool.name === 'edit_file' || tool.name === 'write_file')
+    ) {
+      const 無い = this.ctx.missingFromRequest[0];
+      if (this.ctx.missingAsked) {
+        toolResultLine('依頼の前提が違うので実行しません', true);
+        return {
+          output:
+            `The user already confirmed that this is not a work request for \`${無い}\`. ` +
+            'Do not change any file. Tell them plainly that it is not in the workspace.',
+          denied: true
+        };
+      }
+      this.ctx.missingAsked = true;
+      line();
+      line(`${c.brightYellow('┌')} ${c.bold('前提が違うようです')}`);
+      line(`${c.brightYellow('│')} ${c.gray(`依頼にある \`${無い}\` は、この作業場のどこにもありません。`)}`);
+      line(`${c.brightYellow('│')} ${c.gray(`それでも ${tool.name} で書き換えようとしています。`)}`);
+      line(`${c.brightYellow('└')} ${c.gray('y = それでも進める / n = 無いと答えてもらう')}`);
+      let yes = false;
+      for (;;) {
+        const raw = await this.permissions.ask(`${c.brightYellow('  →')} [y/n] `);
+        // 入力が閉じている（-p など）ときは、聞けないので「やめる」扱い
+        if (raw === null || raw === undefined) break;
+        const answer = String(raw).trim().toLowerCase();
+        if (/^(y|yes|うん|はい|ok|おk|そう|お願い|おねがい)/.test(answer) || answer === '') { yes = true; break; }
+        if (/^(n|no|いや|ちが|やめ|だめ|駄目)/.test(answer)) break;
+        line(`${c.gray('  y か n で答えてください')}`);
+      }
+      if (yes) {
+        // 進めると決めたなら、この発言の残りではもう聞かない
+        this.ctx.missingFromRequest = [];
+      } else {
+        toolResultLine('無いと答えてもらいます', true);
+        return {
+          output:
+            `\`${無い}\` is not in this workspace, and the user does not want files changed because of it. ` +
+            'Do not change anything. Say plainly that it is not there, and stop.',
+          denied: true
+        };
+      }
+    }
+
     if (this.ctx.smallTalk && this.touchesTheWorld(tool, call.args)) {
       if (this.ctx.smallTalkAsked) {
         toolResultLine('雑談として受け取っているので実行しません', true);
@@ -913,9 +1088,32 @@ export class Agent {
     }
   }
 
+  /**
+   * いまの文脈の長さ。**推定ではなく実測を土台にする。**
+   *
+   * ■ なぜ estimateTokens をそのまま使わないか
+   *   あれは会話の中身しか見ないので、**道具の定義（約2,400トークン）を数えていない**。
+   *   そのうえ日本語の見積もりが甘く、実測より22〜30%低く出ていた。
+   *   その数字で圧縮のしきい値を決めていたので、`numCtx` を超えてから
+   *   初めて圧縮が走る計算になっていた（65,536 に対して実際は約67,000）。
+   *
+   * ■ 実測はどこから来るか
+   *   ollama が応答ごとに `prompt_eval_count` を返す。これは指示文も道具の定義も
+   *   全部込みの本当の数。直前の応答時点の長さを覚えておき、
+   *   **そこから後に積んだぶんだけ**を見積もって足す。増分は小さいので、
+   *   見積もりの誤差もほとんど効かない。
+   *
+   *   まだ一度も応答が来ていないとき（最初の一手）は、見積もりだけで答える。
+   */
+  contextTokens() {
+    if (!this.lastPromptTokens) return estimateTokens(this.messages);
+    const since = this.messages.slice(this.lastPromptUpTo ?? this.messages.length);
+    return this.lastPromptTokens + estimateTokens(since);
+  }
+
   // ── 文脈が長くなりすぎたら要約して詰める ──────────────────
   async maybeCompact() {
-    const tokens = estimateTokens(this.messages);
+    const tokens = this.contextTokens();
 
     // 長くなったことを知らせる。**圧縮はしない。**
     //
@@ -939,7 +1137,7 @@ export class Agent {
     // **これは1回きりの出来事**で、毎ターン走らせてはいけない（runTurn の注記を参照）。
     const freed = this.compactToolOutputOnce();
     if (freed) this.compactedEvents = (this.compactedEvents || 0) + 1;
-    if (estimateTokens(this.messages) < limit) {
+    if (this.contextTokens() < limit) {
       if (freed) {
         info(`古い道具の出力をまとめて短くしました（${freed.toLocaleString()} 文字）。` +
              'この1回だけ読み直しが入りますが、以後は元に戻ります。');
@@ -1300,6 +1498,112 @@ function salvageEdits(text) {
 //
 // 拾うのは「中身を変えた」と言っている場合だけに絞る。
 // 「確認しました」「読みました」は手を動かさなくても成り立つ正しい報告なので入れない。
+/**
+ * このお願いの中で、書き換えが一度も通らなかったファイル。
+ *
+ * ■ なぜ mutations ではなくファイルごとに見るか
+ *   既存の見張りは `ctx.mutations` を見ているが、そこには **run_command も数えている**。
+ *   だから `ls` を1回打つだけで見張りが切れる。実機の記録（2026-09-08）では、
+ *   置き換えに8回失敗したあと「削除しました」と報告した回が2つあり、
+ *   どちらも run_command を挟んでいたため、一度も鳴らなかった。
+ *   **218セッションで発火0回**という数字が、その結果である。
+ *
+ * ■ 数えない失敗
+ *   「ファイルが無い」「作業フォルダの外」は**書き換えの失敗ではなく行き先の間違い**。
+ *   モデルは打ち間違えたパスをすぐ捨てて正しいほうを直すことがある。
+ *   ここで数えると、正しい報告まで咎めることになる（過去の記録で実際に2件そうなった）。
+ */
+export function filesNeverWritten(ctx) {
+  const fail = ctx?.writeFail;
+  if (!(fail instanceof Map) || fail.size === 0) return [];
+  const ok = ctx.writeOk instanceof Map ? ctx.writeOk : new Map();
+  return [...fail.keys()].filter((p) => !(ok.get(p) > 0));
+}
+
+/**
+ * この回で実際に消えた行を集める。
+ *
+ * 控え（editLog）の前後を突き合わせて、**後に残っていない行**だけを取る。
+ * 大きすぎて中身を控えていないもの（big）が混ざっていたら、確かめようがないので null を返す。
+ * 「分からない」を「無かった」と丸めると、正しい報告を嘘だと言うことになる。
+ */
+export function removedTextThisTurn(ctx) {
+  const log = Array.isArray(ctx?.editLog) ? ctx.editLog : [];
+  const mine = log.filter((e) => e.turn === ctx.turnSeq);
+  // この回に書き換えが1つも無いなら、**何も消えていないことは確定**している。
+  // ここを null（確かめようがない）にしていたせいで、
+  // 「一度も書き換えずに『削除しました』と報告した回」を見逃した（実機 2026-09-10）。
+  if (!mine.length) return '';
+  let out = '';
+  for (const e of mine) {
+    if (e.big || e.before == null || e.after == null) return null;
+    const rest = new Map();
+    for (const l of String(e.after).split('\n')) rest.set(l, (rest.get(l) || 0) + 1);
+    for (const l of String(e.before).split('\n')) {
+      const n = rest.get(l) || 0;
+      if (n > 0) rest.set(l, n - 1);
+      else out += `${l}\n`;
+    }
+  }
+  return out;
+}
+
+/**
+ * この回に道具が返してきた中身（＝ファイルから出てきた事実）。
+ *
+ * **todo_write と spawn_agent は外す。** あれはモデル自身が書いた文がそのまま返るだけで、
+ * ファイルの証拠ではない。実機の記録（2026-09-08）では、モデルが予定表に書いた
+ * `_typo_round_two` がそのまま道具の出力になり、「ファイルにあった証拠」として通ってしまった。
+ * 自分の言葉を自分の裏づけにさせない。
+ */
+export function turnEvidence(messages, turn) {
+  let out = '';
+  for (const m of messages || []) {
+    if (m.role !== 'tool' || m.turn !== turn) continue;
+    if (m.tool_name === 'todo_write' || m.tool_name === 'spawn_agent') continue;
+    out += `\n${m.content || ''}`;
+  }
+  return out;
+}
+
+/**
+ * 「`X` を削除しました」と名指ししているのに、X がどこにも出てこないもの。
+ *
+ * ■ これが要る理由
+ *   実機の記録（2026-09-08 21:28）に、**ファイルに存在しない関数を消したと報告した**回がある。
+ *   そのとき実際にやったのは空行を2つ消しただけ。書き換え自体は成功しているので、
+ *   回数を数えるだけの見張り（filesNeverWritten）には掛からない。**通ったが中身が違う**嘘。
+ *
+ * ■ 何を証拠と認めるか
+ *   1) この回に消えた行に X がある … 本当に消した
+ *   2) この回の道具の出力に X がある … 少なくともファイルには在った（消し方の話は別）
+ *   どちらも無ければ、**そのファイルに X が在ったという裏づけが一つも無い**＝作り話。
+ *
+ *   2 を証拠に入れるのが肝心。read_file の出力は上限で切られることがあり、
+ *   消えた行だけを見ると、**本当に消したものまで嘘と判定した**（実機の `vocabWords`）。
+ *
+ * ■ 目的語は動詞の前にある
+ *   日本語なので「… `X` の呼び出しを削除しました」の X は「削除しました」より前に来る。
+ *   その文の**最後の** `…` を取る。
+ *   ただしそれでも取り違えることがある（「`mark_up` 関数内にあった空行を削除しました」では
+ *   目的語は「空行」で、`mark_up` ではない）。上の 2) があるおかげで、
+ *   取り違えた名前はファイルに在るので鳴らない。**取り違えても実害が出ない形にしてある。**
+ */
+export function removalClaimsNotRemoved(text, evidence) {
+  if (evidence == null) return [];
+  const missing = [];
+  for (const s of String(text).split(/(?<=[。.!?！？])\s*|\n+/)) {
+    const m = /^([\s\S]*?)(を削除しました|を取り除きました|を削除済み)/.exec(s);
+    if (!m) continue;
+    const names = [...m[1].matchAll(/`([^`\n]{1,60})`/g)].map((x) => x[1]);
+    if (!names.length) continue;
+    const name = names[names.length - 1];
+    const bare = name.replace(/\(\)$/, '');
+    if (!evidence.includes(bare) && !missing.includes(name)) missing.push(name);
+  }
+  return missing;
+}
+
 export function claimsWorkDone(text) {
   const claim =
     /(\bI (have |already |just )?(changed|edited|fixed|created|updated|added|removed|deleted|replaced|renamed|wrote|implemented|applied)\b|\bhas been (changed|edited|fixed|created|updated|added|removed|replaced|applied)\b|\bthe (fix|change|edit) (is|has been) applied\b|修正しました|直しました|変更しました|書き換えました|作成しました|追加しました|削除しました|更新しました|置き換えました|実装しました|反映しました|修正済み|変更済み)/i;

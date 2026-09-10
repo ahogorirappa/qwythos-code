@@ -118,12 +118,92 @@ export function loadHooks(root) {
  * 失敗しても投げない。**出力をそのまま返す**——直せるのはモデルなので、
  * こちらが握りつぶすと直す機会そのものが消える。
  */
+/** 構文検査にかける上限。これより大きいものは見ない（時間のほうが高くつく） */
+const SYNTAX_CHECK_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 書き換えた直後に、そのファイルが構文として成り立っているかだけ見る。
+ *
+ * ■ なぜ既定で入れるか
+ *   qwc は書いたものを一度も動かさずに「直しました」と言える。
+ *   `.qwythos/hooks.json` を置いていないフォルダ（`~/bin` など）で作業したとき、
+ *   書いた結果が壊れていても、誰も気づかないまま話が進む。
+ *
+ * ■ 何をしないか
+ *   **中身は動かさない。** 型検査もテストも走らせない。それは持ち主が hooks に書くもの。
+ *   ここは「保存した瞬間に壊れていることが分かる」ところまでで止める。
+ *   Python も `import` ではなく構文解析だけにしてあるので、副作用が出ない
+ *   （`py_compile` は使わない。あれは `__pycache__` を作って人のフォルダを汚す）。
+ *
+ * ■ 拡張子が無いファイル
+ *   `~/bin/line-guard` のように拡張子の無い実行ファイルがある。1行目の shebang で見分ける。
+ *   実測 20〜30ms なので、書き換えごとに走らせても体感に出ない。
+ */
+function builtinSyntaxCheck(absPath) {
+  const st = statSafe(absPath);
+  if (!st || !st.isFile() || st.size > SYNTAX_CHECK_MAX_BYTES) return '';
+
+  const kind = syntaxKindOf(absPath);
+  if (!kind) return '';
+
+  const result =
+    kind === 'python'
+      ? spawnSync('python3', ['-c', PY_SYNTAX_CHECK, absPath], { encoding: 'utf8', timeout: 10000 })
+      : spawnSync(process.execPath, ['--check', absPath], { encoding: 'utf8', timeout: 10000 });
+
+  // 検査する道具が無い・動かせないときは黙る。
+  // 「検査できなかった」を「壊れている」と伝えると、直っているものを直させることになる。
+  if (!result || result.error || result.status === null || result.status === 0) return '';
+
+  const out = `${result.stdout || ''}${result.stderr || ''}`.trim();
+  if (!out) return '';
+  return (
+    `\n\n[syntax check failed]\n${out.slice(0, 800)}\n` +
+    'The file you just wrote does not parse. Fix it before moving on.'
+  );
+}
+
+/** 構文検査のしかた。拡張子で決まらないものは shebang で見る */
+function syntaxKindOf(absPath) {
+  const ext = path.extname(absPath).toLowerCase();
+  if (ext === '.py') return 'python';
+  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') return 'node';
+  if (ext) return null;
+
+  let head = '';
+  try {
+    const fd = fs.openSync(absPath, 'r');
+    const buf = Buffer.alloc(80);
+    const n = fs.readSync(fd, buf, 0, 80, 0);
+    fs.closeSync(fd);
+    head = buf.subarray(0, n).toString('utf8');
+  } catch {
+    return null;
+  }
+  if (/^#![^\n]*python/.test(head)) return 'python';
+  if (/^#![^\n]*node/.test(head)) return 'node';
+  return null;
+}
+
+/** 構文解析だけして、駄目なら1行で理由を出す（中身は実行しない） */
+const PY_SYNTAX_CHECK = [
+  'import ast, sys',
+  'try:',
+  '    ast.parse(open(sys.argv[1], encoding="utf-8").read())',
+  'except SyntaxError as e:',
+  '    print(f"{e.msg} (line {e.lineno})")',
+  '    sys.exit(1)',
+  'except Exception:',
+  '    sys.exit(0)'
+].join('\n');
+
 export function runAfterEdit(absPath, ctx) {
   const hooks = loadHooks(ctx.root);
   if (hooks.__error) return `\n\n[${hooks.__error}]`;
 
   const command = typeof hooks.afterEdit === 'string' ? hooks.afterEdit.trim() : '';
-  if (!command) return '';
+  // 決めごとが無いフォルダでも、**構文だけは**見る。
+  if (!command) return builtinSyntaxCheck(absPath);
 
   const relative = path.relative(ctx.root, absPath) || path.basename(absPath);
   const result = spawnSync(command, {

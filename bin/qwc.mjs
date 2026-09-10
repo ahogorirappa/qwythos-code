@@ -1118,7 +1118,7 @@ async function handleSlash(text, { agent, config, permissions, root }) {
       line(`  ${c.gray('出力トークン')}  ${s.outputTokens.toLocaleString()}`);
       line(`  ${c.gray('会話の長さ')}    ${agent.messages.length} 件`);
       // トークン数と、その長さでの速度。実測値は src/ctxcost.mjs。
-      line(`  ${c.gray('文脈')}          ${contextLine(estimateTokens(agent.messages), config.numCtx)}`);
+      line(`  ${c.gray('文脈')}          ${contextLine(agent.contextTokens(), config.numCtx)}`);
       // 同じファイルを読み直したときに、二度積まずに済んだ量。
       // どれだけ起きるかは記録から推定できなかった（保存されるのは圧縮後の履歴のため）ので、
       // 実際に使いながら数える。0 が続くなら、この機構は要らない。

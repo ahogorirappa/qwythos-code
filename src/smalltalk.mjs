@@ -63,15 +63,37 @@ const QUESTION_WORD = /(?:どう思|どっち|どちら|なんで|なぜ|どう�
 const CHATTY =
   /(?:こんにち|こんばん|おはよ|おやすみ|お疲れ|おつかれ|ありがと|さんきゅ|よろしく|すご[いく]|なるほど|たしかに|確かに|そうだね|だよね|ですね|だなあ|だな[。！!]?$|ですよ|かもね|らしいね|みたいだね|と思う|気がする|そういえば|ところで|ちなみに)/m;
 
+// 一語の同意。「うん」「はい」「y」だけの返事。
+//
+// **打ち消しは入れない。**「ううん」「いや」は同意ではないので、
+// ここに混ぜると断ったつもりの返事で作業が始まる。
+const AFFIRM =
+  /^(?:うん|はい|ええ|そう|そうそう|そうだね|それで|それでいい|いいよ|いいね|おｋ|おk|ok|okay|yes|yeah|yep|y|ｙ|うい|了解|わかった|分かった|よろしく)[。、.!！\s]*$/i;
+
 /**
  * その発言を、作業の依頼として受け取ってよいかを見る。
+ *
+ * @param {string} text 利用者の発言
+ * @param {{ replyingTo?: boolean }} [opts]
+ *   replyingTo … 直前にこちらが何か言っている（＝この発言は返事）かどうか。
  *
  * @returns {{ smallTalk: boolean, reason: string }}
  *   smallTalk が true なら「書き換えないで答える」側。
  */
-export function classifyInput(text) {
+export function classifyInput(text, opts = {}) {
   const t = String(text ?? '').trim();
   if (!t) return { smallTalk: false, reason: '' };
+
+  // 「うん」だけの返事は、**直前に出した提案への同意**であることが多い。
+  //
+  // ここを雑談に落とすと、「ファイルは変更しないこと」と言い添えたうえで、
+  // 書き換えようとした瞬間に確認を出すことになる。**同意した直後にもう一度聞く**形で、
+  // 実機の記録では41件中6回これが起きていた。
+  //
+  // 判定は今の発言しか見ないので、「うん」単体からは何への同意か分からない。
+  // 分からないまま雑談に倒すより、直前にこちらが話していたなら**その続き**として扱う。
+  // 会話の最初の「うん」は、返事する相手がいないので今までどおり雑談側に置く。
+  if (opts.replyingTo && AFFIRM.test(t)) return { smallTalk: false, reason: '直前の話への返事' };
 
   // 貼り付けられたコードやエラーは、見てほしいから貼っている。
   // 短い独り言と違って、ここを雑談に落とすと毎回よけいな確認が出る。
@@ -116,8 +138,14 @@ export function classifyInput(text) {
 // 会話の一覧に判定の説明文が並んでしまう（実際にそうなった）。
 // モデルには渡したままにしたいので、消すのではなく表示のときだけ落とす。
 export function withoutHint(text) {
-  const at = String(text ?? '').indexOf('\n\n[自動判定：');
-  return at === -1 ? String(text ?? '') : String(text).slice(0, at);
+  let s = String(text ?? '');
+  // 末尾に添えたものは、モデルには渡したままで、人に見せる文からは落とす。
+  // 会話の一覧に判定や事実確認の文が並んでしまうため（実際にそうなった）。
+  for (const mark of ['\n\n[自動判定：', '\n\n[事実確認：']) {
+    const at = s.indexOf(mark);
+    if (at !== -1) s = s.slice(0, at);
+  }
+  return s;
 }
 
 export const SMALL_TALK_HINT = `

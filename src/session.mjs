@@ -33,9 +33,23 @@ export function stripImages(data) {
   };
 }
 
+/** 権限を締める。できなくても止めない（別の機械・別のファイルシステムのことがある） */
+function chmodQuietly(target, mode) {
+  try {
+    fs.chmodSync(target, mode);
+  } catch {
+    // 締められなくても、保存そのものは続ける
+  }
+}
+
 export function saveSession(id, data) {
   try {
-    fs.mkdirSync(SESSION_DIR, { recursive: true });
+    // 本人だけが読める権限で作る。
+    // 会話の記録には、読んだファイルの中身がそのまま残る。実際に .env を読んだ回があり、
+    // API キーが平文で入っていた（218件中2件）。既定の 755 は、同じ機械で動く
+    // ほかのものから丸見えになるので、はじめから 700 にしておく。
+    fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+    chmodQuietly(SESSION_DIR, 0o700);
     fs.writeFileSync(sessionPath(id), JSON.stringify(stripImages(data), null, 2), 'utf8');
     return true;
   } catch {
