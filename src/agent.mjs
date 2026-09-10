@@ -947,6 +947,7 @@ export class Agent {
       }
       if (problem) {
         toolResultLine('そのままでは適用できません', true);
+        this.noteWriteBlocked(tool, call.args);
         // 失敗の理由も道具の出力なので、成功時と同じ上限で切って確定させる。
         // ここだけ上限を通っておらず、edit_file の失敗が 13,609 字まで伸びていた。
         // なお、上限に触れないよう作るのは呼び出し側の責任（tools.mjs の
@@ -1135,6 +1136,31 @@ export class Agent {
       toolResultLine(message.split('\n')[0], true);
       return { output: `Tool error: ${message}`, denied: false };
     }
+  }
+
+
+  /**
+   * 書き換えの道具が**断られた**とき、それを「失敗」として数える。
+   *
+   * ■ なぜ要るか
+   *   道具の中で失敗したもの（old_string が一致しないなど）は tools.mjs が数えている。
+   *   ところが**道具に届く前に断ったもの**（前提が違う・雑談中・読まずに上書き）は、
+   *   どこにも数が残らない。実機（2026-09-10）で、断られた write_file について
+   *   モデルが「書き換えました」と報告し、**どの見張りも鳴らなかった**。
+   *   断られたのも「その回、そのファイルには何も書けていない」ことに変わりはない。
+   */
+  noteWriteBlocked(tool, args) {
+    if (!tool || (tool.name !== 'edit_file' && tool.name !== 'write_file')) return;
+    const raw = args && args.path;
+    if (!raw) return;
+    let abs;
+    try {
+      abs = path.resolve(this.root, String(raw));
+    } catch {
+      return;
+    }
+    if (!(this.ctx.writeFail instanceof Map)) this.ctx.writeFail = new Map();
+    this.ctx.writeFail.set(abs, (this.ctx.writeFail.get(abs) || 0) + 1);
   }
 
   /**

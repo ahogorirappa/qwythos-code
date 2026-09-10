@@ -32,7 +32,13 @@ const STOP = new Set([
   'AttributeError', 'ImportError', 'KeyError', 'IndexError', 'SyntaxError',
   'None', 'True', 'False', 'null', 'undefined', 'self', 'this', 'args', 'kwargs',
   'print', 'line', 'File', 'module', 'python', 'node', 'npm', 'test', 'main',
-  'string', 'number', 'object', 'boolean', 'result', 'value', 'data', 'name'
+  'string', 'number', 'object', 'boolean', 'result', 'value', 'data', 'name',
+  // qwc 自身の語彙。利用者は道具の名前を書いて頼むことがある
+  // （「edit_file を使わずに write_file で書き直して」）。これを「作業場に無い名前」として
+  // 拾うと、**その依頼のあいだ書き換えが全部止まる**。実機で踏んだ。
+  'read_file', 'write_file', 'edit_file', 'list_dir', 'search_files', 'run_command',
+  'todo_write', 'web_search', 'web_fetch', 'find_symbol', 'spawn_agent', 'browse',
+  'browser_login', 'old_string', 'new_string', 'replace_all'
 ]);
 
 /**

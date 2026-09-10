@@ -3446,6 +3446,13 @@ console.log('\n始める前の事実確認');
     'traceback によく出る語は拾わない',
     !namesInRequest('NameError: name Traceback is not defined').includes('Traceback')
   );
+  // 利用者は道具の名前を書いて頼むことがある。これを「作業場に無い名前」として拾うと、
+  // その依頼のあいだ**書き換えが全部止まる**。実機（2026-09-10）で踏んだ。
+  check(
+    '道具の名前は拾わない',
+    namesInRequest('`edit_file` は使わず `write_file` で `step_3` を直して').join() === 'step_3'
+  );
+  check('old_string などの用語も拾わない', namesInRequest('old_string が合わないので直して').length === 0);
 
   const ctx = { root: d };
   check('作業場に無い名前を挙げる', missingNames(['_typo_round_two'], ctx).join() === '_typo_round_two');
