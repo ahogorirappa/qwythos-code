@@ -44,6 +44,61 @@ const STOP = new Set([
  * `foo` のような短くありふれた語は拾わない。外して困るより、
  * 無意味な事実確認を並べるほうが害が大きい。
  */
+/**
+ * 依頼が名指ししているファイルの場所。
+ *
+ * ■ なぜ識別子と別に見るか
+ *   `namesInRequest` は識別子だけを拾うので、**パスだけを言われると何も確かめない**。
+ *   「src/utils/helper.js のバグを直して」に識別子が無ければ、事実確認も前提の見張りも
+ *   一度も働かない。実機の題材で拾えていたのは、たまたま関数名が混ざっていたからだった。
+ *
+ * ■ 拾う形
+ *   `/` を含むか、拡張子が付いているもの。URL は除く（外の話なので作業場には無くて当然）。
+ */
+export function pathsInRequest(text) {
+  const t = String(text ?? '');
+  const out = [];
+  const add = (raw) => {
+    const p = String(raw).replace(/[。、,.:;)\]]+$/, '').trim();
+    if (!p || p.length > 200) return;
+    if (/^[a-z]+:\/\//i.test(p)) return;            // URL は見ない
+    if (!/[/\\]/.test(p) && !/\.[A-Za-z0-9]{1,6}$/.test(p)) return;
+    if (!/^[\w./\-~]+$/.test(p)) return;
+    if (out.length < MAX_NAMES && !out.includes(p)) out.push(p);
+  };
+  for (const m of t.matchAll(/`([^`\n]{1,200})`/g)) add(m[1]);
+  for (const m of t.matchAll(/(?:^|[\s"'(（])([\w.\-~]+(?:\/[\w.\-~]+)+(?:\.[A-Za-z0-9]{1,6})?)/gm)) add(m[1]);
+  return out;
+}
+
+/**
+ * そのパスが作業場に無いか。
+ *
+ * **同じ名前のファイルがどこかにあれば「無い」とは言わない。**
+ *   書き方が違うだけ（`src/utils/helper.js` と `utils/helper.js`）のことがあり、
+ *   そこで「無い」と伝えると、在るものを無いと言うことになる。
+ *   場所が違うのは、モデルが自分で探せばよい話。
+ */
+export function missingPaths(paths, ctx) {
+  if (!paths.length) return [];
+  const root = ctx?.root;
+  if (!root) return null;
+  let 一覧;
+  try {
+    const r = spawnSync('rg', ['--files', root], { encoding: 'utf8', timeout: 10000, maxBuffer: 16 * 1024 * 1024 });
+    if (!r || r.error || (r.status !== 0 && r.status !== 1)) return null;
+    一覧 = String(r.stdout || '').split('\n').filter(Boolean);
+  } catch {
+    return null;
+  }
+  const 名前だけ = new Set(一覧.map((f) => f.slice(f.lastIndexOf('/') + 1)));
+  return paths.filter((p) => {
+    const base = p.slice(p.lastIndexOf('/') + 1);
+    if (名前だけ.has(base)) return false;                       // 同じ名前がどこかにある
+    return !一覧.some((f) => f.endsWith(`/${p}`) || f === p);   // 末尾一致でも見つからない
+  });
+}
+
 export function namesInRequest(text) {
   const t = String(text ?? '');
   const found = [];

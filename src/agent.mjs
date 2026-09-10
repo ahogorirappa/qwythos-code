@@ -13,7 +13,7 @@ function hashText(text) {
 }
 import { buildSystemPrompt, COMPACT_PROMPT } from './prompt.mjs';
 import { classifyInput, SMALL_TALK_HINT } from './smalltalk.mjs';
-import { namesInRequest, missingNames, factsHint, treatsAsExisting } from './facts.mjs';
+import { namesInRequest, missingNames, factsHint, treatsAsExisting, pathsInRequest, missingPaths } from './facts.mjs';
 import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
 import { PathError } from './paths.mjs';
 import { beginTurn, resetEdits } from './edits.mjs';
@@ -222,8 +222,16 @@ export class Agent {
     this.ctx.missingAsked = false;
     if (!auto.smallTalk) {
       const names = namesInRequest(userInput);
-      if (names.length) {
-        const missing = missingNames(names, this.ctx);
+      // パスだけを名指しされることがある（「src/utils/helper.js を直して」）。
+      // 識別子しか見ていないと、そこでは事実確認も前提の見張りも一度も働かない。
+      const paths = pathsInRequest(userInput);
+      if (names.length || paths.length) {
+        const 名前の欠け = names.length ? missingNames(names, this.ctx) : [];
+        const パスの欠け = paths.length ? missingPaths(paths, this.ctx) : [];
+        const missing =
+          名前の欠け === null || パスの欠け === null
+            ? null
+            : [...名前の欠け, ...パスの欠け];
         facts = factsHint(missing);
         // 書き換えを止めるのは、依頼が「もう在るもの」として書いているときだけ。
         // 「`X` を追加して」で止めると、頼んだ作業がそのまま実行されない。

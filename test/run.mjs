@@ -44,7 +44,7 @@ import { parseEdits } from '../src/agent.mjs';
 import { looksLikeComment as looksLikeCommentForTest, serverStatus } from '../src/lsp.mjs';
 import { buildSystemPrompt } from '../src/prompt.mjs';
 import { classifyInput, SMALL_TALK_HINT, withoutHint } from '../src/smalltalk.mjs';
-import { namesInRequest, missingNames, factsHint, treatsAsExisting } from '../src/facts.mjs';
+import { namesInRequest, missingNames, factsHint, treatsAsExisting, pathsInRequest, missingPaths } from '../src/facts.mjs';
 import { loadSkills, skillsBlock } from '../src/skills.mjs';
 import { startMcp, stopMcp } from '../src/mcp.mjs';
 import { beginTurn, recordEdit, undoLastTurn, sessionChanges, canUndo, resetEdits } from '../src/edits.mjs';
@@ -3466,6 +3466,28 @@ console.log('\n始める前の事実確認');
   check('新規作成を止める文言にしない', /作って構いません/.test(factsHint(['newThing_1'])));
   // 人に見せる文からは落とす（会話の一覧に事実確認が並ばないように）
   check('表示からは落とす', withoutHint(`直して${factsHint(['x_1'])}`) === '直して');
+
+  // ── パスだけを名指しされたとき ──
+  //
+  // 識別子しか見ていないと、「src/utils/helper.js を直して」で
+  // 事実確認も前提の見張りも**一度も働かない**。
+  // 実機の題材で拾えていたのは、たまたま関数名が混ざっていたからだった。
+  check('スラッシュを含むパスを拾う', pathsInRequest('src/utils/helper.js を直して').join() === 'src/utils/helper.js');
+  check('バッククォート付きでも拾う', pathsInRequest('`src/a/b.js` を直して').join() === 'src/a/b.js');
+  check('URL は拾わない', pathsInRequest('https://example.com/a/b.js を参考に').length === 0);
+  check('パスが無い依頼では何も拾わない', pathsInRequest('テストを走らせて').length === 0);
+
+  const pd = path.join(root, 'paths');
+  fs.mkdirSync(path.join(pd, 'src', 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(pd, 'src', 'lib', 'util.js'), 'export const a = 1;\n');
+  check('本当に無いパスを挙げる', missingPaths(['src/utils/helper.js'], { root: pd }).join() === 'src/utils/helper.js');
+  check('在るパスは挙げない', missingPaths(['src/lib/util.js'], { root: pd }).length === 0);
+  // 書き方が違うだけのことがある。同じ名前がどこかにあれば「無い」とは言わない。
+  // 場所が違うのはモデルが自分で探せばよい話で、そこで「無い」と伝えると在るものを無いと言うことになる。
+  check('同じ名前が別の場所にあれば「無い」と言わない', missingPaths(['lib/util.js'], { root: pd }).length === 0);
+  check('名前だけでも同じ', missingPaths(['util.js'], { root: pd }).length === 0);
+  // 作る依頼では止めない（今日3回やった間違い）
+  check('新しく作るパスは在る前提にしない', !treatsAsExisting('src/new/thing.js を作って'));
 
   // ── 「もう在るもの」として書いているか ──
   //
