@@ -3463,6 +3463,60 @@ console.log('\n始める前の事実確認');
   );
   check('old_string などの用語も拾わない', namesInRequest('old_string が合わないので直して').length === 0);
 
+  // ── 地の文からは拾わない（2026-09-10 の本番事故） ──
+  //
+  // 「`_` か数字を含む、または camelCase」という**語の形**で拾っていたため、
+  // ふつうの技術語がぜんぶ通り、実測8件中7件が誤爆した。作業場に無いのは当たり前なので
+  // 前提の見張りが立ち、-p では書き換えが却下される。**ふつうの依頼が通らなくなった。**
+  // 語彙の一覧（STOP）では解けない。技術語は無限にあるため。
+  for (const t of [
+    'この JavaScript を macOS 用に直して',
+    'TypeScript の型エラーが出る。直して',
+    'utf8 の扱いがおかしい。修正して',
+    'Python3 で動かないので直して',
+    'GitHub Actions が失敗する。直して',
+    'この関数、arg1 と arg2 の順番が逆。直して'
+  ]) {
+    check(`地の文から拾わない: ${t.slice(0, 20)}`, namesInRequest(t).length === 0);
+  }
+
+  // ── 機械が出した文言からは、位置を決めて拾う ──
+  //
+  // 行を丸ごとさらうと `Traceback (most recent call last)` から
+  // most・recent・call・last まで名前として拾ってしまう。
+  // 「その位置に来るのは名前だと決まっている」形だけを見る。
+  check(
+    'NameError から拾う',
+    namesInRequest("NameError: name '_typo_round_two' is not defined").join() === '_typo_round_two'
+  );
+  check(
+    'AttributeError から拾う',
+    namesInRequest("AttributeError: module 'conf' has no attribute 'RETRY_LIMIT'").join() === 'RETRY_LIMIT'
+  );
+  check(
+    'JS の TypeError から拾う',
+    namesInRequest('TypeError: cart.applyCoupon is not a function').join() === 'applyCoupon'
+  );
+  check(
+    'JS のスタックフレームから拾う',
+    namesInRequest('    at checkout (app.js:22:18)').join() === 'checkout'
+  );
+  check(
+    'Python のフレームから拾う',
+    namesInRequest('  File "line-guard", line 203, in mark_up').join() === 'mark_up'
+  );
+  check(
+    'traceback の定型文は拾わない',
+    namesInRequest('Traceback (most recent call last):').length === 0
+  );
+
+  // ── 値をファイル名と見なさない ──
+  //
+  // 拡張子を [A-Za-z0-9] で見ていたので `0.3` が「拡張子 3 のファイル」として通っていた。
+  check('`0.3` はパスではない', pathsInRequest('`temperature` を `0.3` に変えて').length === 0);
+  check('`1.5` もパスではない', pathsInRequest('`1.5` にして').length === 0);
+  check('package.json はパス', pathsInRequest('`package.json` を直して').join() === 'package.json');
+
   const ctx = { root: d };
   check('作業場に無い名前を挙げる', missingNames(['_typo_round_two'], ctx).join() === '_typo_round_two');
   check('在る名前は挙げない', missingNames(['mark_up'], ctx).length === 0);

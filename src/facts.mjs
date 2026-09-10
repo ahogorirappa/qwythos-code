@@ -68,7 +68,12 @@ export function pathsInRequest(text) {
     const p = String(raw).replace(/[。、,.:;)\]]+$/, '').trim();
     if (!p || p.length > 200) return;
     if (/^[a-z]+:\/\//i.test(p)) return;            // URL は見ない
-    if (!/[/\\]/.test(p) && !/\.[A-Za-z0-9]{1,6}$/.test(p)) return;
+    // スラッシュを含むか、**英字の拡張子**が付いているもの。
+    // 以前は拡張子を [A-Za-z0-9] で見ていたので、`0.3` が
+    // 「拡張子 3 のファイル」として通っていた（実測 2026-09-10）。
+    // 数字だけの幹（0.3・1.5 など）は値であってファイルではない。
+    const 拡張子つき = /^[\w.\-~]+\.[A-Za-z][A-Za-z0-9]{0,5}$/.test(p) && !/^[\d.]+$/.test(p);
+    if (!/[/\\]/.test(p) && !拡張子つき) return;
     if (!/^[\w./\-~]+$/.test(p)) return;
     if (out.length < MAX_NAMES && !out.includes(p)) out.push(p);
   };
@@ -110,16 +115,48 @@ export function namesInRequest(text) {
   const found = [];
   const add = (raw) => {
     const n = String(raw).replace(/\(\)$/, '').trim();
-    if (!n || n.length < 4 || n.length > 60) return;
+    if (!n || n.length < 3 || n.length > 60) return;
     if (STOP.has(n)) return;
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(n)) return;
-    // ふつうの英単語らしいもの（全部小文字で区切りが無い）は外す
-    if (!/[_0-9]/.test(n) && !/[a-z][A-Z]/.test(n)) return;
     if (!found.includes(n)) found.push(n);
   };
+
+  // 1) バッククォートで囲まれたもの。利用者が「これ」と指している。
   for (const m of t.matchAll(/`([^`\n]{1,60})`/g)) add(m[1]);
-  for (const m of t.matchAll(/\b([A-Za-z_][A-Za-z0-9_]{3,})\s*\(\)/g)) add(m[1]);
-  for (const m of t.matchAll(/\b([A-Za-z_][A-Za-z0-9_]{3,})\b/g)) add(m[1]);
+
+  // 2) 括弧つきの呼び出し。`foo()` は名前だと分かる。
+  for (const m of t.matchAll(/\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(\)/g)) add(m[1]);
+
+  // 3) traceback / スタックトレースの、**名前が来ると決まっている位置**から拾う。
+  //
+  // ■ 語の形で拾ってはいけない
+  //   以前は「`_` か数字を含む、または camelCase」という条件だった。
+  //   その形だと、ふつうの技術語がぜんぶ通る。実測で8件中7件が誤爆した（2026-09-10）。
+  //     「この JavaScript を macOS 用に直して」／「utf8 の扱いがおかしい」
+  //     「Python3 で動かない」／「arg1 と arg2 の順番が逆」
+  //   作業場に無いのは当たり前なので前提の見張りが立ち、`-p` では書き換えが却下される。
+  //   **ふつうの依頼が通らなくなる。**
+  //
+  // ■ 語彙の一覧では解けない
+  //   STOP に足しても切りがない。技術語は無限にある。
+  //
+  // ■ 行の中を全部さらうのも駄目
+  //   「機械が出した行だけ見る」に変えても、`Traceback (most recent call last)` から
+  //   most・recent・call・last を拾ってしまう。定型文まで名前として報告することになる。
+  //
+  // ■ だから「その位置に来るのは名前だと決まっている」形だけを見る
+  //   どれも機械が出す文言で、人が書く地の文には現れない。
+  const 名前の位置 = [
+    /name '([A-Za-z_][A-Za-z0-9_]*)' is not defined/g,          // Python NameError
+    /has no attribute '([A-Za-z_][A-Za-z0-9_]*)'/g,             // Python AttributeError
+    /\.([A-Za-z_][A-Za-z0-9_]*) is not a function/g,            // JS TypeError
+    /^\s*at ([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm,                   // JS スタックフレーム
+    /,\s*line \d+,\s*in ([A-Za-z_][A-Za-z0-9_]*)/g              // Python フレーム
+  ];
+  for (const re of 名前の位置) {
+    for (const m of t.matchAll(re)) add(m[1]);
+  }
+
   return found.slice(0, MAX_NAMES);
 }
 
