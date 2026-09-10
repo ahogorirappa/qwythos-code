@@ -3860,6 +3860,47 @@ console.log('\n文脈の広さがモデルの上限を超えたとき');
   check('上限が 0 でも黙る', 立てる({ contextLength: 0 }, 999999999).notes.length === 0);
 }
 
+// ── @ で丸ごと渡したファイルは、書き直せる ────────────────────
+//
+// resolveMentions は ctx を持たないので readFiles に入る道が無く、
+// `@app.py これを書き直して` が write_file の「まだ読んでいない」で断られていた。
+// しかも添えた本文には「you do not need to read them again」と書いてある。
+console.log('\n@ で添えたファイルの扱い');
+{
+  const 元 = 'def f():\n    return 1\n'.repeat(30);
+  put('mention/app.py', 元);
+  const m = resolveMentions('@mention/app.py これを整理して書き直して', root, {});
+  const a = m.attachments[0];
+  check('@ の添付が絶対パスを持っている', Boolean(a && a.path && path.isAbsolute(a.path)), JSON.stringify(a && a.path));
+  check('丸ごと添えられている（切られていない）', Boolean(a) && a.truncated === false && a.chars === 元.length);
+
+  // bin/qwc.mjs の prepareInput と同じ入れ方
+  const c = { ...ctx, config: baseConfig(), readFiles: new Set(), changedFiles: new Set() };
+  check('入れる前は write_file が断る', Boolean(write.validate({ path: 'mention/app.py', content: 元 }, c)));
+  for (const x of m.attachments) if (!x.truncated && x.path) c.readFiles.add(x.path);
+  check('丸ごと添えたあとは write_file が通る',
+    write.validate({ path: 'mention/app.py', content: 元 }, c) === null,
+    String(write.validate({ path: 'mention/app.py', content: 元 }, c)).slice(0, 120));
+
+  // 切られた添付は、今までどおり断る
+  const 長い = 'x'.repeat(400000);
+  put('mention/huge.txt', 長い);
+  const m2 = resolveMentions('@mention/huge.txt 書き直して', root, {});
+  const b = m2.attachments[0];
+  check('大きすぎるものは truncated が立つ', Boolean(b) && b.truncated === true);
+  const c2 = { ...ctx, config: baseConfig(), readFiles: new Set(), changedFiles: new Set() };
+  for (const x of m2.attachments) if (!x.truncated && x.path) c2.readFiles.add(x.path);
+  check('切られた添付は「読んだ」ことにしない（断り続ける）',
+    Boolean(write.validate({ path: 'mention/huge.txt', content: 'short' }, c2)));
+
+  // 呼び出し側が実際に繋いでいるか（prepareInput は import できないので、そこだけ字面で見る）
+  const qsrc = fs.readFileSync(path.join(here, '..', 'bin', 'qwc.mjs'), 'utf8');
+  const 添付の輪 = qsrc.slice(qsrc.indexOf('for (const a of mentioned.attachments)'), qsrc.indexOf('for (const img of mentioned.images)'));
+  check('prepareInput が readFiles に繋いでいる', /readFiles\.add\(a\.path\)/.test(添付の輪), 添付の輪.slice(-200));
+  check('切られた添付は繋がない', /!a\.truncated/.test(添付の輪));
+}
+
+
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(`\n合計: ${passed} 件成功 / ${failed} 件失敗\n`);

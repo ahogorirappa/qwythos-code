@@ -128,7 +128,9 @@ export function resolveMentions(text, root, { vision = false } = {}) {
       truncated = true;
     }
     total += body.length;
-    attachments.push({ name: rel, chars: body.length, truncated, body });
+    // `path` は絶対パス。呼び出し側が `ctx.readFiles` に入れるために要る。
+    // `name` は作業フォルダからの相対で、画面に出す用（readFiles は絶対で持っている）。
+    attachments.push({ name: rel, path: abs, chars: body.length, truncated, body });
   }
 
   return { attachments, images, missing, text };

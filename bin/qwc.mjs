@@ -726,6 +726,26 @@ async function main() {
 
     for (const a of mentioned.attachments) {
       info(`@${a.name} を添えました（${a.chars.toLocaleString()}文字${a.truncated ? '・一部' : ''}）`);
+      // 丸ごと渡したものは「読んだ」ものとして扱う。
+      //
+      // ■ 何が起きていたか
+      //   `@app.py これを書き直して` と頼むと、write_file が
+      //   「まだ読んでいないファイルは丸ごと上書きさせない」で断っていた。
+      //   resolveMentions は ctx を持たないので、`readFiles` に入る道が無かった
+      //   （入るのは read_file・write_file・全文の受け渡しの3か所だけ）。
+      //   **利用者が自分で渡したファイルを書き直せない。**
+      //
+      // ■ 見張りの言い分が、この経路では成り立っていない
+      //   あれが守っているのは「見ていない部分が消えること」。
+      //   丸ごと添えたなら、見ていない部分は無い。
+      //   そのうえ buildMentionBlock は本文で
+      //   「you do not need to read them again」と言っている。
+      //   読むなと言っておいて、読んでいないから断る、では辻褄が合わない。
+      //
+      // ■ 切られた添付は入れない
+      //   `truncated` が立っているなら、見えていない部分が本当にある。
+      //   そこは今までどおり断るのが正しい。
+      if (!a.truncated && a.path) agent.ctx.readFiles.add(a.path);
     }
     for (const img of mentioned.images) {
       info(`@${img.name} を画像として見せます（${Math.round(img.bytes / 1024)}KB）`);
