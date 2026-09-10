@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TOOL_MAP, truncateOutput, truncateProblem, OUTPUT_DRAIN_MS } from '../src/tools.mjs';
 import { runAfterEdit } from '../src/rules.mjs';
+import { stripControlMarks } from '../src/ollama.mjs';
 import { DEFAULT_CONFIG } from '../src/config.mjs';
 import { PermissionManager } from '../src/permissions.mjs';
 import { renderDiff } from '../src/ui.mjs';
@@ -3433,6 +3434,26 @@ console.log('\n始める前の事実確認');
   // 消す話と作る話が混ざっていたら、作る側に倒す。
   // 在る前提だと誤れば確認が1回増えるだけだが、逆は作業が実行されない。
   check('消す話と作る話が混ざったら作る側に倒す', !treatsAsExisting('`old_helper` を消して `new_helper` を作って'));
+}
+
+
+// ── モデルの内部用の印が本文に漏れる ────────────────────────
+//
+// 実機（2026-09-10）で、gemma4 が考えを述べる声から最終回答へ切り替わる境目に
+// `<channel|>` を本文へ出した。278セッション中7件。うち1件は、その印を出したところで
+// 返事が終わっていて、答えが尻切れになっていた。
+console.log('\nモデルの内部用の印を落とす');
+{
+  check(
+    '本文に漏れた印を落とす',
+    stripControlMarks('確認します。<channel|>`line-guard` の 203 行目') === '確認します。`line-guard` の 203 行目'
+  );
+  check('印だけの返事は空になる', stripControlMarks('<channel|>') === '');
+  // 形で消してはいけない。コードの中の HTML まで消える。
+  check('コードの中の HTML は残す', stripControlMarks('<ul><li>残す</li></ul>') === '<ul><li>残す</li></ul>');
+  check('<header> も残す', stripControlMarks('<header> も残す') === '<header> も残す');
+  check('ふつうの文章はそのまま', stripControlMarks('ふつうの文章') === 'ふつうの文章');
+  check('空でも落ちない', stripControlMarks(null) === '' && stripControlMarks(undefined) === '');
 }
 
 fs.rmSync(root, { recursive: true, force: true });

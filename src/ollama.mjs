@@ -447,6 +447,37 @@ function matchingParen(text, open) {
 }
 
 /**
+ * モデルの内部用の印が本文に漏れたときに落とす。
+ *
+ * ■ 実機で出たもの（2026-09-10）
+ *   gemma4 が、考えを述べる声から最終回答へ切り替わる境目で `<channel|>` を本文に出す。
+ *   278セッション中7件で、利用者に見える返事にそのまま入っていた。
+ *   1件は `<channel|>` を出したところで返事が終わっていて、答えが尻切れになっている。
+ *
+ * ■ 決め打ちの一覧で落とす。**形で落とさない。**
+ *   `<[a-z]+|?>` のような正規表現で消すと、コードの中の `<ul>` `<li>` `<header>` まで
+ *   消えてしまう（実際、同じ調べで本文に出ていた）。
+ *   モデルが増えたら、ここに足す。**知らない印は残す**ほうが、黙って壊すより良い。
+ *
+ * ■ 途中で切れた場合
+ *   流しながら画面に出しているので、印が2つの塊にまたがると画面には一瞬出る。
+ *   ここで落とすのは、履歴と最終の返事。次の往復に持ち越さないことが目的。
+ */
+const CONTROL_MARKS = [
+  '<channel|>', '<|channel|>', '<|message|>', '<message|>',
+  '<|start|>', '<|end|>', '<|im_start|>', '<|im_end|>',
+  '<start_of_turn>', '<end_of_turn>'
+];
+
+export function stripControlMarks(text) {
+  let s = String(text ?? '');
+  for (const mark of CONTROL_MARKS) {
+    if (s.includes(mark)) s = s.split(mark).join('');
+  }
+  return s;
+}
+
+/**
  * 括弧の中を引数に直す。`{...}` の JSON か、`名前="値"` の並びだけを受け付ける。
  * その道具が持っていない引数名が1つでも混ざっていたら、まるごと諦める（取り違えるより出さないほうがよい）。
  */
@@ -705,7 +736,7 @@ async function* chatStreamOnce({ cfg, messages, tools, signal }) {
     }
   }
 
-  const message = { role: 'assistant', content };
+  const message = { role: 'assistant', content: stripControlMarks(content) };
   if (thinking) message.thinking = thinking;
   if (finalCalls.length) {
     message.tool_calls = finalCalls.map((call) => ({
