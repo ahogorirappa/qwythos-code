@@ -219,12 +219,19 @@ function shrinkGuard(abs, content, ctx) {
   const was = before.split('\n').filter((l) => l.trim()).length;
   const now = content.split('\n').filter((l) => l.trim()).length;
   if (was < SHRINK_MIN_LINES || now >= was * SHRINK_LIMIT) return null;
+  // **満たせない指示を書かないこと。**
+  //
+  // 以前ここには「本当にそれだけ消したいなら、まず言葉で言ってから書け」と書いていた。
+  // ところが shrinkGuard が見ているのは (abs, content, ctx) だけで、会話も宣言も見ていない。
+  // 言っても通らない。モデルは宣言してから書き直し、また断られる。
+  // **効かないことを「やれ」と言うのは、この一式が問題として扱っているものそのもの。**
+  // 通る道（edit_file で削る）だけを書く。
   return (
     `This would shrink ${displayPath(abs, ctx)} from ${was} to ${now} non-empty lines ` +
     `(${Math.round((1 - now / was) * 100)}% removed). ` +
     'When you rewrite a whole file it is easy to drop parts of it without noticing. ' +
-    'If you meant to change only part of it, use edit_file. ' +
-    'If you really mean to delete that much, say so in words first and then write it.'
+    'Remove what you want removed with edit_file instead — one edit per part is fine. ' +
+    'write_file on this file will keep being refused while it shrinks this much.'
   );
 }
 

@@ -3381,6 +3381,13 @@ console.log('\n読まずに上書きしない');
   const 元 = Array.from({ length: 200 }, (_, i) => `line_${i} = ${i}`).join('\n');
   fs.writeFileSync(path.join(d, '長い.py'), `${元}\n`);
   await r.run({ path: '長い.py' }, ctx);
+  // 断り文が「満たせない指示」になっていないこと。
+  // shrinkGuard は会話も宣言も見ていないので、「言えば通る」と書いたら嘘になる。
+  {
+    const 断り = String(w.validate({ path: '長い.py', content: 元.split('\n').slice(0, 120).join('\n') }, ctx));
+    check('通る道（edit_file）を示す', /edit_file/.test(断り));
+    check('満たせない指示を書かない', !/say so in words|言ってから|宣言/.test(断り));
+  }
   check(
     '3割以上減る丸ごと上書きは断る',
     /shrink/.test(String(w.validate({ path: '長い.py', content: 元.split('\n').slice(0, 120).join('\n') }, ctx)))
