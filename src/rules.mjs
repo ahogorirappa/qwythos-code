@@ -146,10 +146,17 @@ function builtinSyntaxCheck(absPath) {
   const kind = syntaxKindOf(absPath);
   if (!kind) return '';
 
+  // JSON は外の道具を呼ばずにここで見る（速いし、Node に読み手がある）
+  if (kind === 'json') return jsonSyntaxCheck(absPath);
+
   const result =
     kind === 'python'
       ? spawnSync('python3', ['-c', PY_SYNTAX_CHECK, absPath], { encoding: 'utf8', timeout: 10000 })
-      : spawnSync(process.execPath, ['--check', absPath], { encoding: 'utf8', timeout: 10000 });
+      : kind === 'shell'
+        ? spawnSync('sh', ['-n', absPath], { encoding: 'utf8', timeout: 10000 })
+        : kind === 'plist'
+          ? spawnSync('plutil', ['-lint', absPath], { encoding: 'utf8', timeout: 10000 })
+          : spawnSync(process.execPath, ['--check', absPath], { encoding: 'utf8', timeout: 10000 });
 
   // 検査する道具が無い・動かせないときは黙る。
   // 「検査できなかった」を「壊れている」と伝えると、直っているものを直させることになる。
@@ -168,6 +175,13 @@ function syntaxKindOf(absPath) {
   const ext = path.extname(absPath).toLowerCase();
   if (ext === '.py') return 'python';
   if (ext === '.js' || ext === '.mjs' || ext === '.cjs') return 'node';
+  if (ext === '.json') return 'json';
+  if (ext === '.sh' || ext === '.bash' || ext === '.zsh') return 'shell';
+  if (ext === '.plist') return 'plist';
+  // ここに無いもの（.ts .toml .yaml .yml など）は見ない。
+  // TypeScript は `node --check` が読めず、TOML と YAML は Node に読み手が無い。
+  // 外の道具を入れれば見られるが、qwc は依存ゼロで通しているので、
+  // **見られないものは黙って見ない**。「検査した」と誤解させないほうがよい。
   if (ext) return null;
 
   let head = '';
@@ -182,7 +196,75 @@ function syntaxKindOf(absPath) {
   }
   if (/^#![^\n]*python/.test(head)) return 'python';
   if (/^#![^\n]*node/.test(head)) return 'node';
+  if (/^#![^\n]*(bash|zsh|\bsh)\b/.test(head)) return 'shell';
   return null;
+}
+
+/**
+ * JSON が壊れていないか。
+ *
+ * ■ コメント付き（JSONC）で誤報を出さない
+ *   `tsconfig.json` や `.eslintrc.json` はコメント入りが普通で、そのまま JSON.parse すると必ず落ちる。
+ *   落ちたときだけコメントを外してもう一度試し、**それで通るなら壊れていない**と見る。
+ *   最初から外さないのは、外す処理そのものが壊す可能性を残さないため。
+ *
+ * ■ 文字列の中の // を消さない
+ *   `{"url": "https://example.com"}` のような値がある。素朴に消すと、正しい JSON を壊して
+ *   「壊れています」と報告することになる。文字列の中かどうかを見ながら進む。
+ */
+function jsonSyntaxCheck(absPath) {
+  let text;
+  try {
+    text = fs.readFileSync(absPath, 'utf8');
+  } catch {
+    return '';
+  }
+  if (!text.trim()) return '';
+  try {
+    JSON.parse(text);
+    return '';
+  } catch (err) {
+    try {
+      JSON.parse(stripJsonComments(text));
+      return '';
+    } catch {
+      return (
+        `\n\n[syntax check failed]\n${String(err.message).slice(0, 300)}\n` +
+        'The file you just wrote is not valid JSON. Fix it before moving on.'
+      );
+    }
+  }
+}
+
+/** JSON からコメントだけを外す。文字列の中は触らない */
+function stripJsonComments(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; out += ch; continue; }
+    if (ch === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i++;
+      out += '\n';
+      continue;
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
 }
 
 /** 構文解析だけして、駄目なら1行で理由を出す（中身は実行しない） */

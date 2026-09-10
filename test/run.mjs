@@ -3222,6 +3222,42 @@ console.log('\n書いた直後の構文検査');
   );
   check('ただの文章には手を出さない', 見る('memo', 'これは文章です\n') === '');
   check('__pycache__ を作らない', !fs.existsSync(path.join(d, '__pycache__')));
+
+  // ── JSON ──
+  //
+  // コメント入り（JSONC）で誤報を出さないのが肝心。tsconfig.json や .eslintrc.json は
+  // コメント入りが普通で、素朴に JSON.parse すると**正しいファイルを壊れていると報告する**。
+  check('末尾カンマの JSON を見つける', /syntax check failed/.test(見る('package.json', '{ "name": "a", }')));
+  check('閉じていない JSON を見つける', /syntax check failed/.test(見る('こわれ.json', '{ "a": 1 ')));
+  check('正しい JSON には何も言わない', 見る('ただしい.json', '{"a": 1, "b": [2,3]}') === '');
+  check(
+    'コメント入り（JSONC）を壊れていると言わない',
+    見る('tsconfig.json', '{\n  // これは普通\n  "strict": true\n}') === ''
+  );
+  check(
+    'ブロック注釈も同じ',
+    見る('注釈.json', '{\n  /* これも普通 */\n  "a": 1\n}') === ''
+  );
+  // 文字列の中の // を消してしまうと、正しい JSON を壊して報告することになる
+  check('URL の // を壊さない', 見る('url.json', '{"url": "https://example.com//x"}') === '');
+  check('空のファイルには何も言わない', 見る('空.json', '') === '');
+
+  // ── シェル ──
+  check('閉じていないシェルを見つける', /syntax check failed/.test(見る('こわれ.sh', 'if [ 1 -eq 1 ]; then\n  echo hi\n')));
+  check('正しいシェルには何も言わない', 見る('ただしい.sh', 'if [ 1 -eq 1 ]; then\n  echo hi\nfi\n') === '');
+  check(
+    '拡張子が無くても shebang でシェルと分かる',
+    /syntax check failed/.test(見る('shonly', '#!/bin/bash\nfor i in 1 2; do\n  echo $i\n'))
+  );
+
+  // ── 見られないものは、黙って見ない ──
+  //
+  // TypeScript は node --check が読めず、TOML と YAML は Node に読み手が無い。
+  // 外の道具を入れれば見られるが、依存ゼロを崩さない。
+  // 「検査した」と誤解させるより、何も言わないほうがよい。
+  check('TOML は見ない', 見る('a.toml', 'これは = 壊れて [ いる') === '');
+  check('YAML は見ない', 見る('b.yaml', 'a: [1, 2') === '');
+  check('TypeScript は見ない', 見る('c.ts', 'const x: numbr = ;') === '');
 }
 
 // ── 読んでいないファイルを丸ごと上書きさせない ────────────────
