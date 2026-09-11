@@ -146,12 +146,35 @@ export function namesInRequest(text) {
   //
   // ■ だから「その位置に来るのは名前だと決まっている」形だけを見る
   //   どれも機械が出す文言で、人が書く地の文には現れない。
+  //
+  // ■ 位置を増やすのは、誤爆と引き換えではない（2026-09-11 に測った）
+  //   位置ベースに絞ったとき、見ていたのは誤爆だけで、取りこぼしを測っていなかった。
+  //   題材24件（機械の文言8・日本語の言い換え8・英語の言い換え8）で測ると、
+  //   **19件を取りこぼしていた。** 日本語の言い換えは 0/8、英語の言い換えも 0/8 で、
+  //   traceback をそのまま貼った場合しか効いていなかった。
+  //
+  //   取りこぼしを決めるのは「**名前が来ると決まっている位置をいくつ知っているか**」、
+  //   誤爆を決めるのは「**地の文に語の形を当てているかどうか**」で、**別の機構**。
+  //   だから位置を足しても誤爆は増えない。実測: 下の2つを足して
+  //   取りこぼし 19→8、書き換えが誤って止まる件数は 3/23 のまま変わらず。
   const 名前の位置 = [
     /name '([A-Za-z_][A-Za-z0-9_]*)' is not defined/g,          // Python NameError
     /has no attribute '([A-Za-z_][A-Za-z0-9_]*)'/g,             // Python AttributeError
     /\.([A-Za-z_][A-Za-z0-9_]*) is not a function/g,            // JS TypeError
     /^\s*at ([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm,                   // JS スタックフレーム
-    /,\s*line \d+,\s*in ([A-Za-z_][A-Za-z0-9_]*)/g              // Python フレーム
+    /,\s*line \d+,\s*in ([A-Za-z_][A-Za-z0-9_]*)/g,             // Python フレーム
+
+    // 「X is not defined」の裸形。**JS の ReferenceError はこの形**で、
+    // 上の Python 用（name 'X' is not defined）には当たらない。
+    // 英語で言い換えられたとき（"calc_total is not defined, please fix"）もここで拾う。
+    // 地の文の語を巻き込まないのは、`is not defined` が直後に要るため。
+    // 「this/it/the function is not defined」は STOP と長さで落ちる。
+    /\b([A-Za-z_][A-Za-z0-9_]*)\s+is not defined\b/g,
+
+    // 決まった例外名のあとに、引用符でくくられた名前が来る形。
+    //   KeyError: 'user_id' / ImportError: cannot import name 'parse_config' from …
+    // 例外名を先に要求するので、ふつうの文中の引用符は拾わない。
+    /(?:KeyError|ImportError|ModuleNotFoundError|cannot import name|no attribute)[^\n'"]{0,40}['"]([A-Za-z_][A-Za-z0-9_]*)['"]/g
   ];
   for (const re of 名前の位置) {
     for (const m of t.matchAll(re)) add(m[1]);

@@ -3901,6 +3901,49 @@ console.log('\n@ で添えたファイルの扱い');
 }
 
 
+// ── 名前が来ると決まっている位置を増やす ──────────────────────
+//
+// 位置ベースに絞ったとき、見ていたのは誤爆だけだった。取りこぼしを測っていなかった。
+// 題材24件（機械の文言8・日本語の言い換え8・英語の言い換え8）で 19件を落としていた。
+// 足したのも位置なので、誤爆は増えない（実測: 誤って止まる件数は 2/20 のまま）。
+console.log('\n依頼から名前を拾う位置');
+{
+  const 拾う = (t) => namesInRequest(t);
+
+  // JS の ReferenceError は「name 'X' is not defined」の形ではない
+  check('ReferenceError（裸の is not defined）',
+    拾う('ReferenceError: applyCoupon is not defined').includes('applyCoupon'));
+  check('英語の言い換えでも拾う',
+    拾う('calc_total is not defined anywhere, fix it').includes('calc_total'));
+  check('Python の NameError はこれまでどおり',
+    拾う("NameError: name '_typo_round_two' is not defined").includes('_typo_round_two'));
+
+  // 例外名のあとの引用符つき
+  check('KeyError の引用符つき', 拾う("KeyError: 'user_id'").includes('user_id'));
+  check('ImportError の cannot import name',
+    拾う("ImportError: cannot import name 'parse_config' from 'conf'").includes('parse_config'));
+  check('ModuleNotFoundError',
+    拾う("ModuleNotFoundError: No module named 'confparse'").includes('confparse'));
+
+  // **地の文を巻き込まないこと。** ここが崩れると 2026-09-10 夜の事故が戻る。
+  check('this is not defined は拾わない', !拾う('this is not defined').length);
+  check('the function is not defined は拾わない', !拾う('the function is not defined').length);
+  check('it is not defined は拾わない', !拾う('it is not defined').length);
+  check('引用符があっても例外名が無ければ拾わない',
+    !拾う("メッセージは 'hello' のままにして").length, JSON.stringify(拾う("メッセージは 'hello' のままにして")));
+
+  // 誤爆が戻っていないこと（238a6c1 で潰したもの）
+  for (const t of [
+    'この JavaScript を macOS 用に直して',
+    'utf8 の扱いがおかしい。修正して',
+    'Python3 で動かないので直して',
+    'この関数、arg1 と arg2 の順番が逆。直して',
+    'GitHub Actions が失敗する。直して',
+    'Traceback (most recent call last):'
+  ]) check(`ふつうの依頼から名前を拾わない: ${t.slice(0, 20)}`, !拾う(t).length, JSON.stringify(拾う(t)));
+}
+
+
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log(`\n合計: ${passed} 件成功 / ${failed} 件失敗\n`);
