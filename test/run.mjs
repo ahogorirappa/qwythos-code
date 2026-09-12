@@ -3836,28 +3836,57 @@ console.log('\n会話が長くなったときの知らせ');
 //   「効きません」と出す先があるから。numCtx にはそれが無い。）
 console.log('\n文脈の広さがモデルの上限を超えたとき');
 {
-  const 立てる = (info, numCtx) => {
-    const cfg = { model: 'testmodel', numCtx, effort: 'off' };
-    // adaptToModel の中身のうち、上限を見る部分だけを同じ条件で組み立てる
-    const notes = [];
-    const 上限 = Number(info.contextLength);
-    if (Number.isFinite(上限) && 上限 > 0 && Number(cfg.numCtx) > 上限) {
-      notes.push({ level: 'info', text: `${cfg.model} が扱えるのは ${上限.toLocaleString()} トークンまで` });
-    }
-    return { notes, numCtx: cfg.numCtx };
+  const { adaptToModel } = await import('../src/ollama.mjs');
+  const http = await import('node:http');
+
+  // **本物の adaptToModel を呼ぶ。**
+  // ここは以前、上限を見る部分を試験の中に書き写していた。書き写しでは本体を消しても
+  // 全部通るので、知らせが出ることの証拠にならない（2026-09-12 に直した）。
+  const serve = (contextLength) => new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      const mi = { 'general.architecture': 'testarch' };
+      if (contextLength !== null) mi['testarch.context_length'] = contextLength;
+      const body = {
+        '/api/version': { version: '0.32.1' },
+        '/api/tags': { models: [{ name: 'm' }] },
+        '/api/show': { capabilities: ['completion', 'tools'], model_info: mi },
+        '/api/ps': { models: [] }
+      }[req.url.split('?')[0]] || { done: true };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    });
+    srv.listen(0, '127.0.0.1', () => resolve(srv));
+  });
+
+  const 立てる = async (contextLength, numCtx) => {
+    const srv = await serve(contextLength);
+    const cfg = {
+      ...baseConfig(), host: `http://127.0.0.1:${srv.address().port}`,
+      model: 'm', numCtx, effort: 'off'
+    };
+    const { notes } = await adaptToModel(cfg);
+    srv.close();
+    // 思考モードなどの別の知らせが混ざるので、広さの話だけ取り出す
+    return { notes: notes.filter((n) => /トークンまで/.test(n.text)), numCtx: cfg.numCtx };
   };
 
-  const 超えた = 立てる({ contextLength: 262144 }, 999999999);
+  const 超えた = await 立てる(262144, 999999999);
   check('上限を超えたら知らせる', 超えた.notes.length === 1);
-  check('知らせは info（起動は止めない）', 超えた.notes[0].level === 'info');
-  check('**詰めない**（設定はそのまま）', 超えた.numCtx === 999999999);
-  check('上限の数字を出す', /262,144/.test(超えた.notes[0].text));
+  check('知らせは info（起動は止めない）', 超えた.notes[0]?.level === 'info');
+  check('**詰めない**（こちらの設定はそのまま）', 超えた.numCtx === 999999999);
+  check('上限の数字を出す', /262,144/.test(超えた.notes[0]?.text || ''));
 
-  check('ふつうの指定では黙る', 立てる({ contextLength: 262144 }, 32768).notes.length === 0);
-  check('ちょうど上限でも黙る', 立てる({ contextLength: 262144 }, 262144).notes.length === 0);
+  // 2026-09-12 の実測に合わせた文面。ollama（0.32.1）は 5xx を返さず、黙って上限に詰める。
+  check('「黙って詰められる」ことを伝える', /黙って 262,144 に詰めます/.test(超えた.notes[0]?.text || ''));
+  // 知らせが無いときに素通りしないよう、**在ることまで含めて**見る
+  check('起きないこと（毎ターン43秒）を予告しない',
+    超えた.notes.length === 1 && !/43/.test(超えた.notes[0].text), 超えた.notes[0]?.text);
+
+  check('ふつうの指定では黙る', (await 立てる(262144, 32768)).notes.length === 0);
+  check('ちょうど上限でも黙る', (await 立てる(262144, 262144)).notes.length === 0);
   // 上限が取れないモデルもある。取れないことを「超えている」と扱わない。
-  check('上限が分からなければ黙る', 立てる({ contextLength: null }, 999999999).notes.length === 0);
-  check('上限が 0 でも黙る', 立てる({ contextLength: 0 }, 999999999).notes.length === 0);
+  check('上限が分からなければ黙る', (await 立てる(null, 999999999)).notes.length === 0);
+  check('上限が 0 でも黙る', (await 立てる(0, 999999999)).notes.length === 0);
 }
 
 // ── @ で丸ごと渡したファイルは、書き直せる ────────────────────
