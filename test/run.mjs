@@ -3858,35 +3858,57 @@ console.log('\n文脈の広さがモデルの上限を超えたとき');
     srv.listen(0, '127.0.0.1', () => resolve(srv));
   });
 
-  const 立てる = async (contextLength, numCtx) => {
+  const 当てる = async (cfg, contextLength) => {
     const srv = await serve(contextLength);
-    const cfg = {
-      ...baseConfig(), host: `http://127.0.0.1:${srv.address().port}`,
-      model: 'm', numCtx, effort: 'off'
-    };
+    cfg.host = `http://127.0.0.1:${srv.address().port}`;
     const { notes } = await adaptToModel(cfg);
     srv.close();
     // 思考モードなどの別の知らせが混ざるので、広さの話だけ取り出す
-    return { notes: notes.filter((n) => /トークンまで/.test(n.text)), numCtx: cfg.numCtx };
+    return notes.filter((n) => /トークンまで/.test(n.text));
+  };
+  const 立てる = async (contextLength, numCtx) => {
+    const cfg = { ...baseConfig(), model: 'm', numCtx, effort: 'off' };
+    const notes = await 当てる(cfg, contextLength);
+    return { notes, cfg };
   };
 
   const 超えた = await 立てる(262144, 999999999);
   check('上限を超えたら知らせる', 超えた.notes.length === 1);
   check('知らせは info（起動は止めない）', 超えた.notes[0]?.level === 'info');
-  check('**詰めない**（こちらの設定はそのまま）', 超えた.numCtx === 999999999);
   check('上限の数字を出す', /262,144/.test(超えた.notes[0]?.text || ''));
 
-  // 2026-09-12 の実測に合わせた文面。ollama（0.32.1）は 5xx を返さず、黙って上限に詰める。
-  check('「黙って詰められる」ことを伝える', /黙って 262,144 に詰めます/.test(超えた.notes[0]?.text || ''));
+  // 2026-09-13 に「詰める」へ変えた。ollama（0.32.1）が黙って上限に詰めるので、
+  // こちらが持ったままだと圧縮のしきい値（numCtx × compactAtRatio）だけが嘘になる。
+  check('**上限に詰める**', 超えた.cfg.numCtx === 262144, String(超えた.cfg.numCtx));
+  check('詰めたことを知らせに書く', /262,144 に詰めました/.test(超えた.notes[0]?.text || ''));
+  check('圧縮のしきい値も実物の窓に収まる',
+    Math.floor(超えた.cfg.numCtx * 超えた.cfg.compactAtRatio) < 262144);
   // 知らせが無いときに素通りしないよう、**在ることまで含めて**見る
   check('起きないこと（毎ターン43秒）を予告しない',
     超えた.notes.length === 1 && !/43/.test(超えた.notes[0].text), 超えた.notes[0]?.text);
 
-  check('ふつうの指定では黙る', (await 立てる(262144, 32768)).notes.length === 0);
+  // 詰めた結果だけを持ち回ると、上限の大きいモデルへ移ったときに戻せない。
+  // /model で 32k のモデルを経由すると、以後ずっと 32k のままになる形。
+  {
+    const cfg = { ...baseConfig(), model: 'm', numCtx: 999999999, effort: 'off' };
+    await 当てる(cfg, 32768);
+    check('小さいモデルではそこまで詰める', cfg.numCtx === 32768, String(cfg.numCtx));
+    await 当てる(cfg, 262144);
+    check('大きいモデルに移ったら望んだ広さまで戻る', cfg.numCtx === 262144, String(cfg.numCtx));
+    check('望んだ広さを覚えている', cfg.numCtxWanted === 999999999, String(cfg.numCtxWanted));
+  }
+
+  const ふつう = await 立てる(262144, 32768);
+  check('ふつうの指定では黙る', ふつう.notes.length === 0);
+  check('ふつうの指定は触らない', ふつう.cfg.numCtx === 32768, String(ふつう.cfg.numCtx));
   check('ちょうど上限でも黙る', (await 立てる(262144, 262144)).notes.length === 0);
   // 上限が取れないモデルもある。取れないことを「超えている」と扱わない。
-  check('上限が分からなければ黙る', (await 立てる(null, 999999999)).notes.length === 0);
-  check('上限が 0 でも黙る', (await 立てる(0, 999999999)).notes.length === 0);
+  const 不明 = await 立てる(null, 999999999);
+  check('上限が分からなければ黙る', 不明.notes.length === 0);
+  check('上限が分からなければ詰めない', 不明.cfg.numCtx === 999999999, String(不明.cfg.numCtx));
+  const ゼロ = await 立てる(0, 999999999);
+  check('上限が 0 でも黙る', ゼロ.notes.length === 0);
+  check('上限が 0 でも詰めない', ゼロ.cfg.numCtx === 999999999, String(ゼロ.cfg.numCtx));
 }
 
 // ── @ で丸ごと渡したファイルは、書き直せる ────────────────────
