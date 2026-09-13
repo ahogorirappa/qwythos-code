@@ -3911,6 +3911,66 @@ console.log('\n文脈の広さがモデルの上限を超えたとき');
   check('上限が 0 でも詰めない', ゼロ.cfg.numCtx === 999999999, String(ゼロ.cfg.numCtx));
 }
 
+// ── 温めも、本番と同じ広さで送る ──────────────────────────────
+//
+// 温め（checkGpuFit → preloadModel）は adaptToModel より先に走ることがあるので、
+// 詰める前の 999,999,999 をそのまま送っていた（2026-09-13 に偽ollamaで気づいた）。
+// ollama は同じ上限に詰めるので載る広さは変わらないが、記録だけが食い違う。
+console.log('\n温めが送る広さ');
+{
+  const { preloadModel, fitNumCtx } = await import('../src/ollama.mjs');
+  const http = await import('node:http');
+
+  check('上限まで詰める', fitNumCtx(999999999, 262144) === 262144);
+  check('小さい望みはそのまま', fitNumCtx(32768, 262144) === 32768);
+  check('上限が分からなければ詰めない', fitNumCtx(999999999, null) === 999999999);
+  check('上限が 0 でも詰めない', fitNumCtx(999999999, 0) === 999999999);
+
+  // /api/generate が受け取った num_ctx を覚える偽 ollama
+  const serve = (contextLength) => new Promise((resolve) => {
+    const 受けた = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => (b += c));
+      req.on('end', () => {
+        const p = req.url.split('?')[0];
+        if (p === '/api/generate') {
+          try { 受けた.push(JSON.parse(b)?.options?.num_ctx); } catch { 受けた.push(null); }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ done: true }));
+        }
+        if (p === '/api/show') {
+          if (contextLength === 'こわれる') { res.writeHead(500); return res.end('{}'); }
+          const mi = { 'general.architecture': 'testarch' };
+          if (contextLength !== null) mi['testarch.context_length'] = contextLength;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ capabilities: ['completion', 'tools'], model_info: mi }));
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      });
+    });
+    srv.listen(0, '127.0.0.1', () => resolve({ srv, 受けた }));
+  });
+
+  const 温める = async (contextLength, cfgPatch) => {
+    const { srv, 受けた } = await serve(contextLength);
+    await preloadModel({ ...baseConfig(), host: `http://127.0.0.1:${srv.address().port}`, model: 'm', ...cfgPatch });
+    srv.close();
+    return 受けた[0];
+  };
+
+  check('温めも上限に詰めて送る', await 温める(262144, { numCtx: 999999999 }) === 262144);
+  check('ふつうの広さはそのまま送る', await 温める(262144, { numCtx: 65536 }) === 65536);
+  // **詰めた後の numCtx ではなく、望んだ値から詰め直す。**
+  // そうしないと、32k のモデルを一度経由したあと大きいモデルに戻れない。
+  check('望んだ値から詰め直す',
+    await 温める(262144, { numCtx: 32768, numCtxWanted: 999999999 }) === 262144);
+  // 上限が取れなくても温めは止めない（起動が進まなくなるほうが困る）
+  check('上限が取れなければ望みのまま送る',
+    await 温める('こわれる', { numCtx: 999999999 }) === 999999999);
+}
+
 // ── @ で丸ごと渡したファイルは、書き直せる ────────────────────
 //
 // resolveMentions は ctx を持たないので readFiles に入る道が無く、

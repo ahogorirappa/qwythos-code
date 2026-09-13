@@ -218,6 +218,24 @@ export async function listModels(cfg) {
 // 実際に載せてから `/api/ps` の size_vram と size を比べるのが唯一の確実な方法。
 // 読み込みは最初のやり取りでどのみち起きるので、それを起動時に前倒しするだけ。
 
+/**
+ * 望んだ広さを、そのモデルが受け取れる広さに収める。
+ *
+ * ollama（0.32.1）は大きすぎる num_ctx を黙って上限に詰めるので、こちらが詰めても
+ * **載る広さは変わらない。** それでも同じ値を送るのは、頼んだ広さと実際の広さが
+ * 食い違ったままだと、後から記録を見たときに何を頼んだのか追えなくなるため。
+ * 将来 ollama が詰める代わりに断るようになっても、こちらは壊れない。
+ *
+ * 上限が分からないモデルもある。分からないことを「超えている」と扱わない。
+ */
+export function fitNumCtx(wanted, contextLength) {
+  const 望み = Number(wanted);
+  const 上限 = Number(contextLength);
+  if (!Number.isFinite(望み) || 望み <= 0) return wanted;
+  if (!Number.isFinite(上限) || 上限 <= 0) return 望み;
+  return Math.min(望み, 上限);
+}
+
 // モデルを読み込ませる（生成はしない）。prompt を空にすると Ollama は読み込みだけ行う。
 //
 // **num_ctx を必ず一緒に渡すこと。** 渡さないと Ollama は既定の広さで載せてしまい、
@@ -225,10 +243,16 @@ export async function listModels(cfg) {
 // 実測: 65,536 で使う設定のまま num_ctx を省いたら、毎回 6.2 秒の積み直しが挟まった
 // （渡すようにしたら 0.2 秒）。載っているのに「読み込み」が出るときは、ここを疑う。
 export async function preloadModel(cfg, name = cfg.model, timeoutMs = 10 * 60 * 1000) {
+  // **本番と同じ広さで送る。** 温めは adaptToModel より先に走ることがあるので
+  // （GPU に載りきらないときの差し替えが先に来る・bin/qwc.mjs）、ここでも上限に詰める。
+  // showModel は失敗しても投げずに返すので、上限が取れなければ望みのまま送る
+  // （温めのために起動を止めない）。
+  const info = await showModel(cfg, name);
+  const numCtx = fitNumCtx(cfg.numCtxWanted ?? cfg.numCtx, info.contextLength);
   const res = await fetch(`${cfg.host}/api/generate`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ model: name, keep_alive: cfg.keepAlive, options: { num_ctx: cfg.numCtx } }),
+    body: JSON.stringify({ model: name, keep_alive: cfg.keepAlive, options: { num_ctx: numCtx } }),
     signal: AbortSignal.timeout(timeoutMs)
   });
   if (!res.ok) throw new OllamaError(`モデルを読み込めませんでした (HTTP ${res.status})`);
@@ -384,8 +408,9 @@ export async function adaptToModel(cfg) {
   if (cfg.numCtxWanted === undefined) cfg.numCtxWanted = cfg.numCtx;
   const 望み = Number(cfg.numCtxWanted);
   if (Number.isFinite(望み) && 望み > 0) {
-    if (Number.isFinite(上限) && 上限 > 0 && 望み > 上限) {
-      cfg.numCtx = 上限;
+    // 上限の大きいモデルに移ったら、望んだ広さまで戻る（詰めた値を持ち回らない）
+    cfg.numCtx = fitNumCtx(望み, 上限);
+    if (cfg.numCtx !== 望み) {
       notes.push({
         level: 'info',
         text:
@@ -395,8 +420,6 @@ export async function adaptToModel(cfg) {
           'ほかのセッションと違う広さで呼ぶとモデルの積み直しが起きるため、' +
           '広さは --ctx か ~/.qwythos-code/config.json の numCtx で揃えてください。'
       });
-    } else {
-      cfg.numCtx = 望み;   // 上限の大きいモデルに移ったら、望んだ広さに戻す
     }
   }
 
