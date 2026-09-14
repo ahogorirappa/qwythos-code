@@ -17,6 +17,8 @@ import {
   unmentionedMissing,
   estimateTokens,
   filesNeverWritten,
+  commandsNeverRan,
+  unmentionedCommands,
   removedTextThisTurn,
   turnEvidence,
   removalClaimsNotRemoved,
@@ -3140,6 +3142,50 @@ console.log('\n直したという報告を、数で確かめる');
   );
   check('失敗が無ければ鳴らない', filesNeverWritten({ writeFail: new Map(), writeOk: new Map() }).length === 0);
   check('古い ctx でも落ちない', filesNeverWritten({}).length === 0 && filesNeverWritten(null).length === 0);
+
+  // ── 一度も通らなかったコマンド ──
+  // 「ファイルを変えた」は差し引きで照合できるが、
+  // 「コマンドで世界を変えた」は前と後の差分が取れないので照合できない。
+  // 照合はあきらめて、通らなかったという事実のほうを残す。
+  check(
+    '一度も通らなかったコマンドを拾う',
+    commandsNeverRan({ cmdFail: new Map([['sudo tee -a /etc/hosts', 2]]), cmdOk: new Map() })
+      .join() === 'sudo tee -a /etc/hosts'
+  );
+  check(
+    '同じコマンドが通った回があれば鳴らない（打ち間違えてすぐ直した形）',
+    commandsNeverRan({ cmdFail: new Map([['npm test', 1]]), cmdOk: new Map([['npm test', 1]]) }).length === 0
+  );
+  check('失敗が無ければ鳴らない', commandsNeverRan({ cmdFail: new Map(), cmdOk: new Map() }).length === 0);
+  check('古い ctx でも落ちない', commandsNeverRan({}).length === 0 && commandsNeverRan(null).length === 0);
+
+  // 報告が触れているかは、**名前が出ているかどうかだけ**で見る。
+  // 言い回しを並べる判定は、並べた人の想像力が上限になる。
+  check(
+    '報告が別の話をしていたら鳴る',
+    unmentionedCommands('不要な空行を削除しました。', ['sudo tee -a /etc/hosts']).length === 1
+  );
+  check(
+    '先頭語に触れていれば鳴らない',
+    unmentionedCommands('sudo が要るので実行できませんでした。', ['sudo tee -a /etc/hosts']).length === 0
+  );
+  check(
+    '道に触れていれば鳴らない',
+    unmentionedCommands('/etc/hosts は権限が無くて触れませんでした。', ['sudo tee -a /etc/hosts']).length === 0
+  );
+  check(
+    '2つのうち1つでも触れていれば鳴らない（部分的な言及を咎めない）',
+    unmentionedCommands('npm test が落ちました。', ['npm test', 'sudo systemctl restart x']).length === 0
+  );
+  check(
+    'どちらにも触れていなければ2つとも返す',
+    unmentionedCommands('終わりました。', ['npm test', 'sudo systemctl restart x']).length === 2
+  );
+  check(
+    '引用符の付いた道具名でも触れていると読む',
+    unmentionedCommands('`npm test` を流しました。', ['npm test']).length === 0
+  );
+  check('コマンドが無ければ鳴らない', unmentionedCommands('なんでも', []).length === 0);
 
   // ── この回で実際に消えた行 ──
   const ctx1 = {

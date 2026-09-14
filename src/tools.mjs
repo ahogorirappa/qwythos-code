@@ -478,6 +478,29 @@ const FALLBACK_MAX_CHARS = 4000;
  *   モデルは打ち間違えたパスをすぐ捨てて正しいほうを直すことがあるので、
  *   ここで数えると、正しい報告まで咎めることになる。
  */
+/**
+ * コマンドの通り／通らずを、コマンドの文ごとに数える。
+ *
+ * ■ なぜ mutations では足りないか
+ *   `mutations` は「手を動かした回数」なので、**走らせたことしか言わない**。
+ *   走らせて失敗したのか、通ったのかが残らない。
+ *   ファイルの書き換えには writeOk / writeFail があるのに、コマンドには無かった。
+ *
+ * ■ なぜ要るか（2026-09-14 に足した）
+ *   「ファイルを変えた」という報告は、差し引きで照合できる（filesNeverWritten）。
+ *   **「コマンドで世界を変えた」という報告は、何とも突き合わせられない。**
+ *   実機では、sudo を一度も通していないのに反映を語った回がある。
+ *   前と後の差分が取れない以上、**せめて「通らなかった」という事実を残す**。
+ */
+function countCommand(ctx, command, ok) {
+  if (!ctx) return;
+  const key = ok ? 'cmdOk' : 'cmdFail';
+  if (!(ctx[key] instanceof Map)) ctx[key] = new Map();
+  const c = String(command || '').trim();
+  if (!c) return;
+  ctx[key].set(c, (ctx[key].get(c) || 0) + 1);
+}
+
 function countWrite(ctx, abs, ok) {
   if (!ctx) return;
   const key = ok ? 'writeOk' : 'writeFail';
@@ -1011,6 +1034,8 @@ const runCommand = {
     // 実際にコマンドが走ったこと自体を数える。
     // 「実行しました」という報告が本当かどうかは、これでしか確かめられない。
     ctx.mutations = (ctx.mutations || 0) + 1;
+    // **通ったか通らなかったかも残す。**mutations は走らせたことしか言わない。
+    countCommand(ctx, command, !result.timedOut && result.code === 0);
     const body = result.output.trim() || '(no output)';
     const status = result.timedOut
       ? `Command timed out after ${timeoutMs} ms and was killed.`

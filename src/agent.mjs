@@ -459,6 +459,38 @@ export class Agent {
             }
           }
 
+          // このお願いの中で**一度も通らなかったコマンド**があるのに、
+          // 報告がそのことに一言も触れていない場合。
+          //
+          // ■ ここが、照合できない側の穴だった
+          //   「ファイルを変えた」は差し引きで照合できる（filesNeverWritten）。
+          //   **「コマンドで世界を変えた」は、前と後の差分が取れないので照合できない。**
+          //   2026-09-11、sudo を一度も通していないのに反映を語った回があった。
+          //   受け取った側は「反映された」と読む。
+          //
+          // ■ 照合はあきらめて、事実のほうを置く
+          //   「やったと言っているか」を文から読むのはやめた。
+          //   言い回しは無限にあり、**並べた人の想像力が上限**になる
+          //   （2026-09-14、7語並べて1語漏らし、しかも安心する方向に間違えた）。
+          //   代わりに、**通らなかったコマンドの名前が報告に出ているか**だけを見る。
+          //   1つでも出ていれば、報告は失敗の話をしているので黙る。
+          if (said && this.shouldNudgeToAct() && nudges < (this.config.maxNudges ?? 5)) {
+            const 通らず = unmentionedCommands(said, commandsNeverRan(this.ctx));
+            if (通らず.length) {
+              nudges++;
+              const c = 通らず[0];
+              info(`一度も通らなかったコマンドに報告が触れていないので、促しました（${c.slice(0, 40)}）。`);
+              this.messages.push({
+                role: 'user',
+                content:
+                  `Your reply does not mention \`${c}\` at all, but that command never succeeded in this request. ` +
+                  'Whatever else you did, say plainly what happened to it: that it did not run. ' +
+                  'Otherwise the user will read your reply as "the command was applied".'
+              });
+              continue;
+            }
+          }
+
           // 直した全文を画面に貼っただけで、保存していない場合。
           // 上の2つと違い、本人は何も主張しない（コードを出しただけ）ので、文章では捕まらない。
           if (
@@ -1755,6 +1787,53 @@ export function removalClaimsNotRemoved(text, evidence) {
  *   **どれにも触れていない**ときだけ促す。
  *   触れてさえいれば、「直した」でも「無かった」でも、答えたことにはなっている。
  */
+/**
+ * このお願いの中で、一度も通らなかったコマンド。
+ *
+ * ■ なぜ要るか
+ *   「ファイルを変えた」という報告は、差し引きで照合できる（filesNeverWritten）。
+ *   **「コマンドで世界を変えた」という報告は、前と後の差分が無いので照合できない。**
+ *   だから照合はあきらめて、**通らなかったという事実のほうを残す**。
+ *   2026-09-11、sudo を一度も通していないのに反映を語った回があった。
+ *
+ * ■ 通った回があれば数えない
+ *   打ち間違えてすぐ直した、は正しい直し方である。
+ *   writeFail / writeOk と同じ扱いにしてある。
+ */
+export function commandsNeverRan(ctx) {
+  const fail = ctx?.cmdFail;
+  if (!(fail instanceof Map) || fail.size === 0) return [];
+  const ok = ctx.cmdOk instanceof Map ? ctx.cmdOk : new Map();
+  return [...fail.keys()].filter((c) => !(ok.get(c) > 0));
+}
+
+/**
+ * 通らなかったコマンドのうち、報告がまったく触れていないもの。
+ *
+ * ■ 何を探すか
+ *   コマンドの**先頭語**（sudo / npm / find …）と、**道らしき引数**（/ か . を含む語）。
+ *   どれか1つでも報告に出ていれば「触れている」とみなす。
+ *   **文の意味は読まない。**名前が出ているかどうかだけで見る
+ *   （言い回しを並べる判定は、並べた人の想像力が上限になる）。
+ *
+ * ■ 全部触れていないときだけ返す
+ *   1つでも触れていれば、報告は失敗の話をしている。
+ *   `unmentionedMissing` と同じ構えで、部分的な言及を咎めない。
+ */
+export function unmentionedCommands(said, cmds) {
+  const list = Array.isArray(cmds) ? cmds.filter(Boolean) : [];
+  if (!list.length) return [];
+  const text = String(said ?? '');
+  const 触れていない = list.filter((c) => {
+    const words = String(c).split(/\s+/).filter(Boolean);
+    const 目印 = [words[0], ...words.filter((w) => /[/.]/.test(w) && w.length >= 3)]
+      .filter(Boolean)
+      .map((w) => w.replace(/^["'`]|["'`]$/g, ''));
+    return !目印.some((w) => w && text.includes(w));
+  });
+  return 触れていない.length === list.length ? 触れていない : [];
+}
+
 export function unmentionedMissing(said, missingKnown) {
   const names = Array.isArray(missingKnown) ? missingKnown : [];
   if (!names.length) return [];
