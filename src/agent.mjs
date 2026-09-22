@@ -511,6 +511,29 @@ export class Agent {
             }
           }
 
+          // 通らなかったコマンドについて完了を語り、**ファイルも変わっていない**場合。
+          //
+          // 下の見張りは「コマンド名が報告に出ていれば失敗の話をしている」と賭けている。
+          // held-out 42件（2026-09-23）で、**名前を出しながら成功を語る**回が3件出て、
+          // その賭けが外れた（「iconv コマンドを実行し、変換しました」）。
+          // 賭け直さずに、通っていない・完了を語っている・何も変わっていない、の3つを重ねる。
+          if (said && this.shouldNudgeToAct() && nudges < (this.config.maxNudges ?? 5)) {
+            const 語るだけ = claimedCommandNeverRan(said, this.ctx);
+            if (語るだけ.length) {
+              nudges++;
+              const c = 語るだけ[0];
+              info(`通っていないコマンドの結果を語っているので、促しました（${c.slice(0, 40)}）。`);
+              this.messages.push({
+                role: 'user',
+                content:
+                  `You described the result of \`${c}\`, but that command never succeeded in this request, ` +
+                  'and no file changed either. Nothing happened. ' +
+                  'Run it again and read the error, or say plainly that it did not run.'
+              });
+              continue;
+            }
+          }
+
           // このお願いの中で**一度も通らなかったコマンド**があるのに、
           // 報告がそのことに一言も触れていない場合。
           //
@@ -1835,7 +1858,10 @@ export function removalClaimNames(text) {
   for (const s of String(text).split(/(?<=[。！？])\s*|(?<=[.!?])\s+|\n+/)) {
     // ── 日本語：目的語は動詞の**前**にある ──
     //   「いたしました」「が完了しました」も受ける（実測で両方出た）
-    const ja = /^([\s\S]*?)(?:削除|除去|消去|取り除き|削り|消し)(?:し|いたし|致し|され)?(?:まし|済み|が完了|を完了)/.exec(s);
+    // 「削除し、…更新しました」の連用形も受ける。実測（2026-09-23）で、
+    // claimsWorkDone 側は連用形に直したのに、**こちらを直し忘れていた**。
+    // 「削除していません」「削除しません」は、まし/、/。が続かないので入らない。
+    const ja = /^([\s\S]*?)(?:(?:削除|除去|消去)(?:(?:し|いたし|致し|され)(?:まし|、|。)|済み|(?:が|を)完了)|(?:取り除き|削り|消し)まし)/.exec(s);
     if (ja) 前から取る(ja[1]);
 
     // ── 英語：目的語は動詞の**後ろ**にある ──
@@ -2098,6 +2124,39 @@ export function claimedButNothingChanged(said, ctx) {
   return null;
 }
 
+/**
+ * 通らなかったコマンドについて完了を語り、**ファイルも1バイトも変わっていない**場合。
+ *
+ * ■ `unmentionedCommands` の賭けが外れる形がある
+ *   あちらはこう賭けている——「コマンド名が報告に1つでも出ていれば、
+ *   報告は失敗の話をしている」。言い回しを読まずに済ませるための、よい賭けだった。
+ *   ところが held-out 42件（2026-09-23）で、**名前を出しながら成功を語る**回が3件出た。
+ *
+ *     iconv コマンドを実行し、data.txt の文字コードを UTF-8 に変換しました。
+ *     check_exit_code.py の実行を完了し、終了コード 0 で正常に終了したことを確認しました。
+ *
+ *   どちらもコマンドは一度も通っていない。名前が出ているので、あちらは黙る。
+ *
+ * ■ 賭け直さずに、事実を3つ重ねる
+ *   「成功を語っているか」を文から読み取ろうとすると、また言い回しの一覧になる。
+ *   代わりに、**文からは「やったと言っているか」だけ**を取り、残りは事実で見る。
+ *     1) このお願いの中で一度も通っていないコマンドがある
+ *     2) 報告は完了を語っている
+ *     3) **ファイルも1バイトも変わっていない**
+ *   3つ揃えば、何をやったにせよ、世界は動いていない。
+ *
+ *   3) が効いている。コマンドが失敗しても、ファイルを直して正直に報告した回
+ *   （「config.json は書き換えました。sudo は通らなかったので反映はまだです」）は、
+ *   ここで落ちる。**正しく手を止めた側を咎めないための条件。**
+ */
+export function claimedCommandNeverRan(said, ctx) {
+  if (!claimsWorkDone(said)) return [];
+  const 通らず = commandsNeverRan(ctx);
+  if (!通らず.length) return [];
+  if (changedThisTurn(ctx).size) return [];
+  return 通らず;
+}
+
 export function unmentionedCommands(said, cmds) {
   const list = Array.isArray(cmds) ? cmds.filter(Boolean) : [];
   if (!list.length) return [];
@@ -2152,7 +2211,10 @@ export function claimsWorkDone(text) {
   // 動作を表す語の**語幹**。活用は下の (?:し|しまし|済み) 側で受ける。
   // 「確認」「実行」「調査」は入れない（手を動かさなくても成り立つため）。
   const 動作 =
-    '修正|変更|削除|追加|作成|更新|置換|置き換え|書き換え|書き込み|実装|反映|保存|適用|対応|完了|実施|移動|改名|除去|統一|整理|導入|調整|設定|有効化|無効化|コメントアウト';
+    // 「変換」は held-out（2026-09-23）で3件のうち2件を落としていた。
+    // 足すのは**世界が変わったことを含意する語だけ**。「抽出」「集計」は
+    // 答えを出しただけでも成り立つので入れない。
+    '修正|変更|削除|追加|作成|更新|置換|置き換え|書き換え|書き込み|実装|反映|保存|適用|対応|完了|実施|移動|改名|除去|統一|整理|導入|調整|設定|有効化|無効化|コメントアウト|変換|生成|出力|圧縮|展開|同期|初期化|登録|統合|分割';
 
   const claim = new RegExp(
     '(' +

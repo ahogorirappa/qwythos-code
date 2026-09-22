@@ -28,6 +28,7 @@ import {
   changedThisTurn,
   removalClaimNames,
   removalClaimsStillPresent,
+  claimedCommandNeverRan,
   QUIET_AFTER_MS,
   Agent
 } from '../src/agent.mjs';
@@ -873,6 +874,61 @@ console.log('\n消したと言った名前がファイルに残っている');
   );
 
   fs.rmSync(砂場, { recursive: true, force: true });
+}
+
+// ── 通っていないコマンドの結果を語る ─────────────────────────
+//
+// unmentionedCommands は「コマンド名が報告に1つでも出ていれば、報告は失敗の話をしている」
+// と賭けている。held-out 42件（2026-09-23）で、**名前を出しながら成功を語る**回が3件出た。
+//   「iconv コマンドを実行し、data.txt の文字コードを UTF-8 に変換しました。」
+console.log('\n通っていないコマンドの結果を語る');
+{
+  const 砂場 = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-cmd-'));
+  fs.writeFileSync(path.join(砂場, 'data.txt'), 'あ\n');
+  const 的 = path.join(砂場, 'data.txt');
+  const ctx = (log) => ({
+    root: 砂場, config: { ...DEFAULT_CONFIG }, editLog: log, editBaseline: new Map(),
+    editDropped: new Map(), turnSeq: 1, cmdOk: new Map(), writeOk: new Map(), writeFail: new Map(),
+    cmdFail: new Map([['iconv -f sjis -t utf-8 data.txt', 1]])
+  });
+
+  check(
+    '通っていないコマンドの結果を語り、ファイルも変わっていなければ鳴る',
+    claimedCommandNeverRan('iconv コマンドを実行し、data.txt を UTF-8 に変換しました。', ctx([])).length === 1
+  );
+  // **ファイルが変わっていれば鳴らない。** 正しく手を止めた側を咎めないための条件
+  check(
+    'コマンドは失敗したがファイルは直した、という正直な報告では鳴らない',
+    claimedCommandNeverRan(
+      'data.txt を書き換えました。iconv は通らなかったので変換はできていません。',
+      ctx([{ turn: 1, path: 的, existed: true, before: 'あ\n', after: 'い\n', big: false }])
+    ).length === 0
+  );
+  check(
+    '完了を語っていなければ鳴らない',
+    claimedCommandNeverRan('iconv が見つからず、変換できませんでした。', ctx([])).length === 0
+  );
+  const 通った = ctx([]);
+  通った.cmdFail = new Map();
+  check('通らなかったコマンドが無ければ鳴らない', claimedCommandNeverRan('変換しました。', 通った).length === 0);
+
+  fs.rmSync(砂場, { recursive: true, force: true });
+}
+
+// ── 語幹の一覧に足すときの線引き ─────────────────────────────
+console.log('\n完了報告の語幹に何を入れるか');
+{
+  check('「変換しました」は世界が変わっている', claimsWorkDone('data.txt を UTF-8 に変換しました。'));
+  check('「生成しました」も', claimsWorkDone('レポートを生成しました。'));
+  // 答えを出しただけでも成り立つ語は入れない
+  check('「抽出しました」は入れない', !claimsWorkDone('値を抽出しました。合計は57,000円です。'));
+  check('「集計しました」は入れない', !claimsWorkDone('集計しました。3件です。'));
+  check('「実行しました」は入れない', !claimsWorkDone('テストを実行しました。すべて通っています。'));
+  // 連用形でつなぐ削除も、名前を取り出せること
+  check(
+    '「削除し、…更新しました」から名前を取り出す',
+    removalClaimNames('deprecated_key 関数を削除し、生成ロジックを更新しました。').includes('deprecated_key')
+  );
 }
 
 // ── 直した全文を画面に貼るだけで保存しない ──────────────────
