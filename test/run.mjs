@@ -90,6 +90,21 @@ const run = TOOL_MAP.get('run_command');
 
 let passed = 0;
 let failed = 0;
+// **測れなかったものは、成功にも失敗にも数えない。**ただし黙って飛ばさず、名前を最後に並べる。
+const unmeasured = [];
+const skip = (name, why) => {
+  unmeasured.push(`${name}（${why}）`);
+  console.log(`  --   ${name}  測れない: ${why}`);
+};
+/**
+ * 子の qwc に渡す「仮のホーム」。**HOME だけでは足りない。**
+ * Windows の Node は os.homedir() を USERPROFILE から決めるので、HOME だけ差し替えると
+ * 子は本物のホームの設定を読み書きする（2026-09-23、GitHub の Windows 実機で確定。
+ * 試験のあと本物の ~/.qwythos-code/config.json に偽サーバーの host と autoApprove:true が書かれていた）。
+ */
+const 仮のホーム = (home) => ({ ...process.env, HOME: home, USERPROFILE: home });
+// 名前・パスの走査は rg を使う。無い機械では本体は null（確かめられない）を返すのが正しい。
+const rgある = !spawnSync('rg', ['--version'], { encoding: 'utf8' }).error;
 const check = (name, ok, detail = '') => {
   if (ok) {
     passed++;
@@ -2834,12 +2849,18 @@ console.log('\n確認なしモードの保存と打ち消し');
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-home-'));
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-work-'));
   const cfgPath = path.join(home, '.qwythos-code', 'config.json');
+  {
+    const r = spawnSync(process.execPath, ['-e', 'process.stdout.write(require("os").homedir())'],
+      { env: 仮のホーム(home), encoding: 'utf8' });
+    check('子の qwc は仮のホームを見る（本物の設定を踏まない）',
+      path.resolve(r.stdout || '') === path.resolve(home), `${r.stdout} ≠ ${home}`);
+  }
 
   const runQwc = (args, stdin) =>
     new Promise((resolve) => {
       const proc = spawn(process.execPath, [qwcBin, '--host', host, ...args], {
         cwd: work,
-        env: { ...process.env, HOME: home },
+        env: 仮のホーム(home),
         stdio: ['pipe', 'pipe', 'pipe']
       });
       let seen = '';
@@ -2919,7 +2940,7 @@ console.log('\n降ろされても作業が続く（実機の経路）');
   const seen = await new Promise((resolve) => {
     const proc = spawn(process.execPath, [qwcBin, '--host', host], {
       cwd: work,
-      env: { ...process.env, HOME: home },
+      env: 仮のホーム(home),
       stdio: ['pipe', 'pipe', 'pipe']
     });
     let buf = '';
@@ -3769,15 +3790,21 @@ console.log('\n始める前の事実確認');
   check('package.json はパス', pathsInRequest('`package.json` を直して').join() === 'package.json');
 
   const ctx = { root: d };
-  check('作業場に無い名前を挙げる', missingNames(['_typo_round_two'], ctx).join() === '_typo_round_two');
-  check('在る名前は挙げない', missingNames(['mark_up'], ctx).length === 0);
+  if (rgある) {
+    check('作業場に無い名前を挙げる', missingNames(['_typo_round_two'], ctx).join() === '_typo_round_two');
+  } else skip('作業場に無い名前を挙げる', 'rg（ripgrep）が無い');
+  if (rgある) {
+    check('在る名前は挙げない', missingNames(['mark_up'], ctx).length === 0);
+  } else skip('在る名前は挙げない', 'rg（ripgrep）が無い');
   // 同じファイルに両方あるとき、片方を取りこぼさないこと。
   // まとめて引いて --max-count 1 を付けると、先に当たったほうしか出てこない（実際に外した）。
   fs.writeFileSync(path.join(d, 'both.py'), 'def mark_up():\n    other_name()\n');
-  check(
-    '同じファイルに複数あっても取りこぼさない',
-    missingNames(['mark_up', 'other_name'], ctx).length === 0
-  );
+  if (rgある) {
+    check(
+      '同じファイルに複数あっても取りこぼさない',
+      missingNames(['mark_up', 'other_name'], ctx).length === 0
+    );
+  } else skip('同じファイルに複数あっても取りこぼさない', 'rg（ripgrep）が無い');
   check('調べられないときは null（決めつけない）', missingNames(['x_1'], { root: path.join(root, '無い場所') }) === null);
 
   check('無いものがあれば事実を添える', /見つかりません/.test(factsHint(['_typo_round_two'])));
@@ -3801,12 +3828,20 @@ console.log('\n始める前の事実確認');
   const pd = path.join(root, 'paths');
   fs.mkdirSync(path.join(pd, 'src', 'lib'), { recursive: true });
   fs.writeFileSync(path.join(pd, 'src', 'lib', 'util.js'), 'export const a = 1;\n');
-  check('本当に無いパスを挙げる', missingPaths(['src/utils/helper.js'], { root: pd }).join() === 'src/utils/helper.js');
-  check('在るパスは挙げない', missingPaths(['src/lib/util.js'], { root: pd }).length === 0);
+  if (rgある) {
+    check('本当に無いパスを挙げる', missingPaths(['src/utils/helper.js'], { root: pd }).join() === 'src/utils/helper.js');
+  } else skip('本当に無いパスを挙げる', 'rg（ripgrep）が無い');
+  if (rgある) {
+    check('在るパスは挙げない', missingPaths(['src/lib/util.js'], { root: pd }).length === 0);
+  } else skip('在るパスは挙げない', 'rg（ripgrep）が無い');
   // 書き方が違うだけのことがある。同じ名前がどこかにあれば「無い」とは言わない。
   // 場所が違うのはモデルが自分で探せばよい話で、そこで「無い」と伝えると在るものを無いと言うことになる。
-  check('同じ名前が別の場所にあれば「無い」と言わない', missingPaths(['lib/util.js'], { root: pd }).length === 0);
-  check('名前だけでも同じ', missingPaths(['util.js'], { root: pd }).length === 0);
+  if (rgある) {
+    check('同じ名前が別の場所にあれば「無い」と言わない', missingPaths(['lib/util.js'], { root: pd }).length === 0);
+  } else skip('同じ名前が別の場所にあれば「無い」と言わない', 'rg（ripgrep）が無い');
+  if (rgある) {
+    check('名前だけでも同じ', missingPaths(['util.js'], { root: pd }).length === 0);
+  } else skip('名前だけでも同じ', 'rg（ripgrep）が無い');
   // 作る依頼では止めない（今日3回やった間違い）
   check('新しく作るパスは在る前提にしない', !treatsAsExisting('src/new/thing.js を作って'));
 
@@ -4258,5 +4293,9 @@ console.log('\n@ で添えたファイルの扱い');
 
 fs.rmSync(root, { recursive: true, force: true });
 
+if (unmeasured.length) {
+  console.log(`\n測れなかった: ${unmeasured.length} 件（成功にも失敗にも数えていない）`);
+  for (const u of unmeasured) console.log(`  ・${u}`);
+}
 console.log(`\n合計: ${passed} 件成功 / ${failed} 件失敗\n`);
 process.exit(failed ? 1 : 0);
