@@ -16,6 +16,7 @@ import { classifyInput, SMALL_TALK_HINT } from './smalltalk.mjs';
 import { namesInRequest, missingNames, factsHint, treatsAsExisting, pathsInRequest, missingPaths } from './facts.mjs';
 import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
 import { PathError } from './paths.mjs';
+import { isSafeCommand } from './permissions.mjs';
 import { beginTurn, resetEdits } from './edits.mjs';
 import {
   c, line, out, clearLine, supportsAnsi, Spinner, toolHeader, toolResultLine,
@@ -2143,8 +2144,18 @@ export function claimedButNothingChanged(said, ctx) {
   const log = Array.isArray(ctx?.editLog) ? ctx.editLog.filter((e) => e.turn === ctx.turnSeq) : [];
   if (log.length) return { kind: 'tried', detail: null };
 
-  // 通ったコマンドに名前が出ているファイルは、控えの外で変わっている見込みがある
-  const 通った = ctx?.cmdOk instanceof Map ? [...ctx.cmdOk.keys()].join(' ') : '';
+  // 控えの外で変わっている見込みがあるファイルは見ない。
+  //
+  // **ただし「読むだけのコマンド」は除外に入れない。** ここを分けていなかったので、
+  // held-out 42件（2026-09-23・5本目）で `cat tax_calc.py` が成功しただけで
+  // tax_calc.py が免除され、1バイトも変わっていないのに見逃した。
+  // 除外の理由は「そのコマンドが書き換えたかもしれない」なので、
+  // 書き換ええないコマンドを理由にしてはいけない。判断は permissions.mjs に任せる
+  // （確認をとるかどうか・計画モードで通すかどうかと、同じ線を使う）。
+  const 書きうる = ctx?.cmdOk instanceof Map
+    ? [...ctx.cmdOk.keys()].filter((c) => !isSafeCommand(c, ctx.config || {}))
+    : [];
+  const 通った = 書きうる.join(' ');
 
   for (const s of 文に分ける(text)) {
     if (!claimsWorkDone(s)) continue;   // 打ち消しは claimsWorkDone が落とす
@@ -2152,6 +2163,24 @@ export function claimedButNothingChanged(said, ctx) {
       if (通った.includes(rel)) continue;
       return { kind: 'named', detail: rel };
     }
+  }
+
+  // 報告がファイルを名指ししていなくても、**世界がどこも動いていない**ことはある。
+  //
+  //   read_file(tax_calc.py) → run_command(ls)
+  //   →「消費税率を10%に書き換え、ファイルへの反映が完了しました。」
+  //
+  // held-out で5回出た形。書き換えを試してもいない・ファイルも変わっていない・
+  // 世界を変えうるコマンドも1つも通っていない。**それでも完了を語っている。**
+  //
+  // ■ ここだけ完了語を狭くとる
+  //   「完了しました」「対応しました」は、調べて答えただけでも成り立つ。
+  //   「調査を完了しました。原因は4行目です。」で鳴らせてはいけない。
+  //   だからこの枝に限り、**ファイルの中身が変わったことを含意する語**だけを見る。
+  const 中身を変える語 =
+    /(修正|変更|削除|追加|作成|更新|置換|置き換え|書き換え|書き込み|実装|反映|保存|適用|移動|改名|除去|変換|生成)(?:し|でき)(?:まし|た|、|。)/;
+  if (!書きうる.length && 中身を変える語.test(text)) {
+    return { kind: 'nothing', detail: null };
   }
   return null;
 }

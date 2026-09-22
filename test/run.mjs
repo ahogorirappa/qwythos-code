@@ -721,9 +721,12 @@ console.log('\nやったと言うが、この回で中身が変わっていな�
   const 砂場 = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-unchanged-'));
   fs.writeFileSync(path.join(砂場, 'config.py'), 'PORT = 8080\n');
   fs.writeFileSync(path.join(砂場, '.env'), 'TIMEOUT=30\n');
+  // **config を渡すこと。** 読むだけのコマンドかどうかの判断は
+  // permissions.mjs の safeCommands を見るので、config が空だと
+  // `cat` すら「書き換えうる」に分類され、免除が効きすぎる。
   const 土台 = () => ({
-    root: 砂場, editLog: [], editBaseline: new Map(), editDropped: new Map(),
-    turnSeq: 1, cmdOk: new Map(), writeOk: new Map(), writeFail: new Map()
+    root: 砂場, config: { ...DEFAULT_CONFIG }, editLog: [], editBaseline: new Map(),
+    editDropped: new Map(), turnSeq: 1, cmdOk: new Map(), writeOk: new Map(), writeFail: new Map()
   });
 
   // 一度も書き換えを試さず、コマンドだけ打った
@@ -772,16 +775,44 @@ console.log('\nやったと言うが、この回で中身が変わっていな�
     '説明しただけでは鳴らない',
     claimedButNothingChanged('config.py は PORT を 8080 に設定しています。', 土台()) === null
   );
+  // 作業場に無いファイルの話。
+  //
+  // **2026-09-23 に想定を変えた。** もとは「無いものは unmentionedMissing の担当」
+  // として鳴らさないことにしていた。ところが unmentionedMissing が見るのは
+  // **依頼が名指しした**名前（ctx.missingKnown）だけで、**モデルが報告の中で
+  // 勝手に出したファイル名は誰も拾っていなかった**（実測で確認）。
+  // 何も変わらず、何も試さず、世界を変えうるコマンドも通っていないのだから、
+  // ファイルが在ろうと無かろうと「何も起きていない」ほうが確かな事実である。
+  // 名前は出さずに鳴る（detail は null）。取り違えた名前を突きつけないため。
+  {
+    const r = claimedButNothingChanged('nowhere.py を修正しました。', 土台());
+    check('作業場に無いファイルの話でも、何も起きていないことは言う', r?.kind === 'nothing');
+    check('そのとき名前は突きつけない', r?.detail === null);
+  }
+  // ただし**調べて答えただけ**では鳴らない。この枝の完了語は狭くとってある
   check(
-    '作業場に無いファイルの話では鳴らない（無いものは別の見張りの担当）',
-    claimedButNothingChanged('nowhere.py を修正しました。', 土台()) === null
+    '「調査を完了しました」では鳴らない（調べて答えただけでも成り立つ語）',
+    claimedButNothingChanged('調査を完了しました。原因は4行目です。', 土台()) === null
+  );
+  check(
+    '「対応しました」だけでも鳴らない',
+    claimedButNothingChanged('ご指摘の件、対応しました。', 土台()) === null
   );
   // 控えに残らない変え方（sed -i など）を「変えていない」と言わない
   const ctx4 = 土台();
   ctx4.cmdOk.set('sed -i "" s/8080/9000/ config.py', 1);
   check(
-    '通ったコマンドが名指ししているファイルでは鳴らない',
+    '書き換えうるコマンドが名指ししているファイルでは鳴らない',
     claimedButNothingChanged('config.py の PORT を 9000 に変更しました。', ctx4) === null
+  );
+  // **読むだけのコマンドを免除の理由にしてはいけない。**
+  // held-out（2026-09-23・5本目）で `cat tax_calc.py` が成功しただけで
+  // tax_calc.py が免除され、1バイトも変わっていないのに見逃した。
+  const ctx4b = 土台();
+  ctx4b.cmdOk.set('cat config.py', 1);
+  check(
+    '読むだけのコマンドでは免除しない（cat は書き換えられない）',
+    claimedButNothingChanged('config.py の PORT を 9000 に変更しました。', ctx4b)?.detail === 'config.py'
   );
   // 前の回の書き換えを持ち越さない
   const ctx5 = 土台();
