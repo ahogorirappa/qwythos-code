@@ -405,6 +405,35 @@ export class Agent {
             }
           }
 
+          // 「やりました」と言っているのに、**この回でファイルが1バイトも変わっていない**場合。
+          //
+          // 上の2つでは塞がらない形がある（評価層が 2026-09-23 に見つけた）。
+          //   read_file(.env) → run_command(ls) → 「.env を変更し、保存しました」
+          // `mutations` は run_command を数えるので 0 でなくなり、
+          // `filesNeverWritten` は writeFail を見るので「一度も試していない」を拾わない。
+          // 2026-09-08 に塞いだのは「試して失敗した」側だけだった。
+          if (said && this.shouldNudgeToAct() && nudges < (this.config.maxNudges ?? 5)) {
+            const 変わらず = claimedButNothingChanged(said, this.ctx);
+            if (変わらず) {
+              nudges++;
+              const 何 = 変わらず.kind === 'named' ? 変わらず.detail : 'どのファイルも';
+              info(`やったと報告しましたが、${何} の中身がこの回で変わっていないので、促しました。`);
+              this.messages.push({
+                role: 'user',
+                content:
+                  変わらず.kind === 'named'
+                    ? `You reported a change to ${変わらず.detail}, but its contents are byte-for-byte the same as when this request started. ` +
+                      'Nothing was written to it. Make the change now with edit_file or write_file, ' +
+                      'or say plainly that you did not change it.'
+                    : 'You reported that the work is done, but every file you touched this request ended up ' +
+                      'byte-for-byte the same as it started. If you added something and then removed it again, ' +
+                      'the file is unchanged and nothing was done. ' +
+                      'Make the actual change now, or say plainly what is still missing.'
+              });
+              continue;
+            }
+          }
+
           // 依頼が指していたものが**この作業場に無い**と分かっているのに、
           // 報告がそのことに一言も触れていない場合。
           //
@@ -1762,7 +1791,8 @@ export function removalClaimsNotRemoved(text, evidence) {
     //   「I removed the call to `X`」「I have deleted `X`」。
     //   日本語と同じ「前を見る」やり方だと**丸ごと素通りする**。
     //   実機の20本のうち6本が英語で答えていて、そこは一度も見張れていなかった。
-    const en = /\b(?:I (?:have |just |already )?(?:removed|deleted|dropped|stripped)|took out)\b([^`\n]{0,80})`([^`\n]{1,60})`/i.exec(s);
+    // 副詞を1語まで挟めるようにする。「I have **successfully** deleted `X`」で外れていた
+    const en = /\b(?:I (?:have |just |already |now )*(?:[a-z]+ly )?(?:removed|deleted|dropped|stripped)|took out)\b([^`\n]{0,80})`([^`\n]{1,60})`/i.exec(s);
     if (en) 足す(en[2]);
 
     // 受け身の言い方は、名前が動詞より前に来る。「`X` has been removed」
@@ -1820,6 +1850,152 @@ export function commandsNeverRan(ctx) {
  *   1つでも触れていれば、報告は失敗の話をしている。
  *   `unmentionedMissing` と同じ構えで、部分的な言及を咎めない。
  */
+/**
+ * この回で、**正味で中身が変わった**ファイル（絶対パス）。
+ *
+ * 1手ごとの差分を足さず、その回の始まりの姿と終わりの姿だけを比べる。
+ * `removedTextThisTurn` と同じ理由で、**自分で書き足してから消した**ぶんを
+ * 「変えた」と数えないため（実機 2026-09-10 の `_typo_round_two`）。
+ *
+ * 中身を控えていないもの（big）は**変わった側に入れる**。
+ * 確かめられないものを「変わっていない」と丸めると、正しい報告を嘘だと言うことになる。
+ */
+export function changedThisTurn(ctx) {
+  const out = new Set();
+  const log = Array.isArray(ctx?.editLog) ? ctx.editLog.filter((e) => e.turn === ctx.turnSeq) : [];
+  const 始まり = new Map();
+  const 終わり = new Map();
+  for (const e of log) {
+    if (e.big || e.before == null || e.after == null) {
+      out.add(e.path);   // 確かめようがない。咎めない側に倒す
+      continue;
+    }
+    if (!始まり.has(e.path)) 始まり.set(e.path, String(e.before));
+    終わり.set(e.path, String(e.after));
+  }
+  for (const [p, before] of 始まり) {
+    if (String(終わり.get(p) ?? '') !== before) out.add(p);
+  }
+  return out;
+}
+
+/**
+ * 「やりました」と言っているのに、**この回でファイルが1バイトも変わっていない**場合。
+ *
+ * ■ ここが開いていた（評価層が 2026-09-23 に見つけた）
+ *   既にある見張りは2本とも、この形を素通りする。
+ *
+ *     read_file(.env) → run_command(ls) → 「.env を変更し、保存しました」
+ *
+ *   ・`mutations` は run_command を数えるので、`ls` を1回打つだけで 0 でなくなる
+ *   ・`filesNeverWritten` は **writeFail** を見るので、「試して失敗した」しか拾わない。
+ *     **一度も試していない**ときは writeFail が空で、こちらも鳴らない
+ *
+ *   `agent.mjs:381` のコメントは前半（`ls` で切れること）を名指ししているが、
+ *   そこで足した見張りは後半（一度も試していない）を塞いでいなかった。
+ *   2026-09-08 に塞いだのは「試して失敗した」側だけだった。
+ *
+ * ■ 何を根拠にするか
+ *   文章から読み取るのは「やったと言っているか」だけにして、
+ *   **やったかどうかは差し引きで見る**。返すのは2つの形。
+ *
+ *     'tried' … この回に書き換えを試したのに、正味で何も変わっていない
+ *               （型2＝自分で書き足してから消した、がここに来る。ファイル名を言わなくても鳴る）
+ *     'named' … 報告が名指しした作業場のファイルが、この回で変わっていない
+ *
+ * ■ 名指しを見るときの用心
+ *   打ち消している文の中のファイル名は見ない（「README は変更していません」で鳴らせない）。
+ *   通ったコマンドに名前が出ているファイルも見ない（`sed -i app.py` で変えた場合、
+ *   控えには残らないので「変わっていない」に見える）。
+ */
+/**
+ * 報告の中から、**作業場に実在するファイル名**を拾う。
+ *
+ * ■ なぜ facts.mjs の pathsInRequest を使わないか
+ *   あちらは（バッククォートの外では）**スラッシュを含む語しか拾わない**。
+ *   利用者の依頼はそれでよいが、モデルの報告は日本語の中に
+ *   `main.pyの修正` のように埋め込むので、前後に区切りが無い。
+ *   実測（2026-09-23）で、`.env` `main.py` `config.py` の3件とも1つも拾えなかった。
+ *
+ * ■ なぜ facts.mjs のほうを広げないか
+ *   あちらを広げると、**事実の先渡しと書き換えの差し止め**が一緒に広がる。
+ *   2026-09-10 の本番事故がそれで、語の形で識別子を拾った結果
+ *   「JavaScript」「utf8」などが名前と見なされ、8件中7件で書き換えが全停止した。
+ *
+ * ■ 安全はどこで担保するか
+ *   **語の形ではなく、実在で決める。** 拾いすぎても、作業場に無いものは落ちる。
+ *   `items.length` も `0.08` もファイルとしては存在しないので、そこで消える。
+ *   取り違えたときの害も、差し止めではなく**促し1回**にとどまる。
+ */
+/**
+ * 文に分ける。**ASCII のピリオドは、後ろに空白があるときだけ区切りにする。**
+ *
+ * よく使われている分け方（`(?<=[。.!?！？])\s*`）は、ピリオドを無条件に区切りにする。
+ * するとファイル名がそこで割れる。実測（2026-09-23）:
+ *
+ *     'config.py の PORT を 9000 に変更しました。'
+ *       → ['config.', 'py の PORT を 9000 に変更しました。']
+ *
+ * 割れた後ろの断片には「変更しました」が残るので**完了報告としては拾える**が、
+ * ファイル名は消えている。名前を手掛かりにする判定は、ここで静かに何も見つけられなくなる。
+ * `.env` `main.py` `config.py` の3件とも、これで素通りしていた。
+ */
+function 文に分ける(text) {
+  return String(text)
+    .split(/(?<=[。！？])\s*|(?<=[.!?])\s+|\n+/)
+    .filter((s) => s.trim());
+}
+
+function 実在するファイル名(text, ctx) {
+  const 候補 = new Set();
+  for (const m of String(text).matchAll(/`([^`\n]{1,200})`/g)) 候補.add(m[1]);
+  // 拡張子つき。日本語の中に埋まっていても拾う（分かち書きしないので境界に頼れない）
+  for (const m of String(text).matchAll(/[\w.\-~/]*[\w\-~]\.[A-Za-z][A-Za-z0-9]{0,5}/g)) 候補.add(m[0]);
+  // ドットで始まる設定ファイル（.env / .gitignore）
+  for (const m of String(text).matchAll(/(?:^|[^\w.\-~/])(\.[A-Za-z][\w\-]{1,20})/g)) 候補.add(m[1]);
+
+  const out = [];
+  for (const rel of 候補) {
+    if (!rel || rel.length > 200) continue;
+    let abs;
+    try {
+      abs = path.resolve(ctx.root, rel);
+    } catch {
+      continue;
+    }
+    try {
+      if (!fs.statSync(abs).isFile()) continue;
+    } catch {
+      continue;   // 無いものの話は unmentionedMissing の担当
+    }
+    if (!out.includes(rel)) out.push(rel);
+  }
+  return out;
+}
+
+export function claimedButNothingChanged(said, ctx) {
+  const text = String(said ?? '');
+  if (!claimsWorkDone(text)) return null;
+
+  const 変わった = changedThisTurn(ctx);
+  if (変わった.size) return null;   // 何か変わっているなら、ここの出番ではない
+
+  const log = Array.isArray(ctx?.editLog) ? ctx.editLog.filter((e) => e.turn === ctx.turnSeq) : [];
+  if (log.length) return { kind: 'tried', detail: null };
+
+  // 通ったコマンドに名前が出ているファイルは、控えの外で変わっている見込みがある
+  const 通った = ctx?.cmdOk instanceof Map ? [...ctx.cmdOk.keys()].join(' ') : '';
+
+  for (const s of 文に分ける(text)) {
+    if (!claimsWorkDone(s)) continue;   // 打ち消しは claimsWorkDone が落とす
+    for (const rel of 実在するファイル名(s, ctx)) {
+      if (通った.includes(rel)) continue;
+      return { kind: 'named', detail: rel };
+    }
+  }
+  return null;
+}
+
 export function unmentionedCommands(said, cmds) {
   const list = Array.isArray(cmds) ? cmds.filter(Boolean) : [];
   if (!list.length) return [];
@@ -1842,9 +2018,62 @@ export function unmentionedMissing(said, missingKnown) {
   return 触れていない.length === names.length ? 触れていない : [];
 }
 
+/**
+ * 手を動かしたと主張している返事か。
+ *
+ * ■ 出来上がった形を並べるのをやめた（2026-09-23）
+ *   以前は「修正しました」「変更しました」…と**活用し終わった形**を並べていた。
+ *   評価層に16件当てたところ、**見逃し5件のうち4件がこの入口で外れていた**。
+ *
+ *     変更し、保存しました          連用形でつないで、別の動詞で締める
+ *     実装し、…完了しました          「完了しました」が一覧に無い
+ *     allow_dots の削除と…完了しました  同上
+ *     I have successfully deleted   副詞が1語挟まると英語側が外れる
+ *
+ *   `agent.mjs` の別の場所（unmentionedCommands）に、これと同じことが書いてある。
+ *   「言い回しは無限にあり、**並べた人の想像力が上限**になる」。
+ *   あちらは事実照合に逃げたが、こちらは並べたまま残っていて、
+ *   **見張り2本の入口を兼ねている**。入口で外すと、その先の事実照合は一度も動かない。
+ *
+ * ■ 並べる単位を「語幹」に下げた
+ *   日本語の完了報告は〈動作を表す語〉＋〈活用〉でできている。
+ *   活用のほうは無限にあるが、**語幹は有限**なので、そちらを並べる。
+ *   `変更し` まで一致すれば、そのあとが「ました」でも「、保存しました」でも拾える。
+ *   天井は無くならない（新しい動作語は出る）が、**1段高くなる**。
+ *
+ * ■ 「確認」を入れてはいけない
+ *   「ファイルを確認しました。バグは4行目にあります。」は手を動かさなくても成り立つ、
+ *   正しい報告である。ここを拾うと、調べて答えただけの返事を毎回催促することになる。
+ *   同じ理由で「実行」も入れない（テストを走らせただけで鳴る）。
+ */
 export function claimsWorkDone(text) {
-  const claim =
-    /(\bI (have |already |just )?(changed|edited|fixed|created|updated|added|removed|deleted|replaced|renamed|wrote|implemented|applied)\b|\bhas been (changed|edited|fixed|created|updated|added|removed|replaced|applied)\b|\bthe (fix|change|edit) (is|has been) applied\b|修正しました|直しました|変更しました|書き換えました|作成しました|追加しました|削除しました|更新しました|置き換えました|実装しました|反映しました|消しました|消去しました|削りました|修正済み|変更済み)/i;
+  // 動作を表す語の**語幹**。活用は下の (?:し|しまし|済み) 側で受ける。
+  // 「確認」「実行」「調査」は入れない（手を動かさなくても成り立つため）。
+  const 動作 =
+    '修正|変更|削除|追加|作成|更新|置換|置き換え|書き換え|書き込み|実装|反映|保存|適用|対応|完了|実施|移動|改名|除去|統一|整理|導入|調整|設定|有効化|無効化|コメントアウト';
+
+  const claim = new RegExp(
+    '(' +
+      // ── 英語：副詞を1語まで挟めるようにする ──
+      //   「I have **successfully** deleted」で外れていた。
+      '\\bI (?:have |already |just |now )*(?:[a-z]+ly )?' +
+      '(?:changed|edited|fixed|created|updated|added|removed|deleted|replaced|renamed|wrote|written|implemented|applied|saved|completed|finished)\\b' +
+      '|\\bhas been (?:[a-z]+ly )?(?:changed|edited|fixed|created|updated|added|removed|replaced|applied|saved|completed)\\b' +
+      '|\\bthe (?:fix|change|edit) (?:is|has been) applied\\b' +
+      // ── 日本語：語幹＋活用。「変更し、」「変更しました」「変更済み」を1つで受ける ──
+      // 「し」の後ろに「て」を許してはいけない。**「設定しています」は状態の説明**で、
+      // 仕事の主張ではない。「変更していません」も同じ形なので、打ち消しに頼る前に落とす。
+      // 「修正しておきました」だけは完了なので、別枝で受ける。
+      '|(?:' + 動作 + ')(?:し|でき)(?:まし|た|、|。|$)' +
+      '|(?:' + 動作 + ')して(?:おき|しまい|あり)まし' +
+      '|(?:' + 動作 + ')済み' +
+      // ── サ変にならない和語 ──
+      '|(?:直し|消し|削り|足し|入れ替え|書き足し|貼り付け|取り除き|抜き)(?:まし|た)' +
+      // ── 「〜にしました」「〜に変えました」 ──
+      '|に(?:し|変え|直し)まし' +
+    ')',
+    'i'
+  );
 
   // 打ち消しの言い回しは除く。
   // 「まだ修正していません」「修正しませんでした」を完了報告として拾うと、

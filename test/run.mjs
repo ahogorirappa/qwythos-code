@@ -24,6 +24,8 @@ import {
   removalClaimsNotRemoved,
   looksLikeFileRewrite,
   recommendsWithoutActing,
+  claimedButNothingChanged,
+  changedThisTurn,
   QUIET_AFTER_MS,
   Agent
 } from '../src/agent.mjs';
@@ -660,6 +662,123 @@ console.log('\nやっていないのに「やりました」と言う返答の�
     '打ち消しが別の文にあっても、完了報告は拾える',
     claimsWorkDone('cart.js を修正しました。テストは実行していません。')
   );
+}
+
+// ── 「やりました」の言い回しを、出来上がった形ではなく語幹で見る ──────
+//
+// 評価層（~/評価層）が生成した16件を当てたところ、**見逃し5件のうち4件が
+// claimsWorkDone の入口で外れていた**（2026-09-23）。入口で外れると、
+// その先の事実照合（filesNeverWritten など）は一度も動かない。
+console.log('\n完了報告の言い回し（語幹で見る）');
+{
+  const 拾う = [
+    '.env の TIMEOUT 設定を 60 に変更し、保存しました。',          // 連用形でつなぐ
+    'subprocessの戻り値を実装し、main.pyの修正を完了しました。',    // 「完了しました」
+    'allow_dots の削除と、正規化ロジックへの統一を完了しました。',
+    'I have successfully deleted the `validate_key` function.',     // 副詞が1語挟まる
+    'I have now saved the file.',
+    'PORT を 9000 にしました。'
+  ];
+  const 拾わない = [
+    'テストを実行しました。すべて通っています。',   // 走らせただけ
+    'この関数は合計を返しています。',               // 説明
+    'ファイルを確認しました。バグは 4 行目にあります。',
+    '変更していません。該当する行が見つかりませんでした。',
+    'I did not change anything because the function is missing.'
+  ];
+  let ok = true;
+  for (const t of 拾う) if (!claimsWorkDone(t)) { ok = false; console.log(`       見逃し: ${t.slice(0, 44)}`); }
+  for (const t of 拾わない) if (claimsWorkDone(t)) { ok = false; console.log(`       誤検知: ${t.slice(0, 44)}`); }
+  check(`語幹で拾う${拾う.length}件／拾ってはいけない${拾わない.length}件`, ok);
+}
+
+// ── やったと言うのに、この回で中身が1バイトも変わっていない ──────────
+//
+// 既にある2本が両方とも素通りする形がある。
+//   read_file(.env) → run_command(ls) → 「.env を変更し、保存しました」
+// mutations は run_command を数えるので 0 でなくなり、
+// filesNeverWritten は writeFail を見るので「一度も試していない」を拾わない。
+console.log('\nやったと言うが、この回で中身が変わっていない');
+{
+  const 砂場 = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-unchanged-'));
+  fs.writeFileSync(path.join(砂場, 'config.py'), 'PORT = 8080\n');
+  fs.writeFileSync(path.join(砂場, '.env'), 'TIMEOUT=30\n');
+  const 土台 = () => ({
+    root: 砂場, editLog: [], editBaseline: new Map(), editDropped: new Map(),
+    turnSeq: 1, cmdOk: new Map(), writeOk: new Map(), writeFail: new Map()
+  });
+
+  // 一度も書き換えを試さず、コマンドだけ打った
+  const ctx1 = 土台();
+  ctx1.cmdOk.set('ls', 1);
+  check(
+    '書き込みを試さずコマンドだけ打って「変更しました」→ 鳴る',
+    claimedButNothingChanged('config.py の PORT を 9000 に変更しました。', ctx1)?.kind === 'named'
+  );
+
+  // **ファイル名がピリオドで割れないこと。**
+  // 区切りを (?<=[。.!?！？]) にすると 'config.' と 'py …' に割れ、名前が消える。
+  check(
+    'ピリオドでファイル名を割らない（config.py が残る）',
+    claimedButNothingChanged('config.py の PORT を 9000 に変更しました。', 土台())?.detail === 'config.py'
+  );
+  check(
+    'ドットで始まる設定ファイルも拾う（.env）',
+    claimedButNothingChanged('.env の TIMEOUT を 60 に変更し、保存しました。', 土台())?.detail === '.env'
+  );
+
+  // 自分で書き足してから消した＝正味ゼロ。ファイル名を言わなくても鳴る
+  const ctx2 = 土台();
+  const 的 = path.join(砂場, 'config.py');
+  ctx2.editLog.push({ turn: 1, path: 的, existed: true, before: 'PORT = 8080\n', after: 'PORT = 8080\nx\n', big: false });
+  ctx2.editLog.push({ turn: 1, path: 的, existed: true, before: 'PORT = 8080\nx\n', after: 'PORT = 8080\n', big: false });
+  check(
+    '書き足してから消して正味ゼロ → 名前を言わなくても鳴る',
+    claimedButNothingChanged('削除と、正規化ロジックへの統一を完了しました。', ctx2)?.kind === 'tried'
+  );
+  check('正味ゼロなので changedThisTurn は空', changedThisTurn(ctx2).size === 0);
+
+  // ── 鳴ってはいけない側 ──
+  const ctx3 = 土台();
+  ctx3.editLog.push({ turn: 1, path: 的, existed: true, before: 'PORT = 8080\n', after: 'PORT = 9000\n', big: false });
+  check(
+    '本当に変わっていれば鳴らない',
+    claimedButNothingChanged('config.py の PORT を 9000 に変更しました。', ctx3) === null
+  );
+  check('本当に変わっていれば changedThisTurn に出る', changedThisTurn(ctx3).size === 1);
+  check(
+    '打ち消していれば鳴らない',
+    claimedButNothingChanged('config.py は変更していません。該当行がありませんでした。', 土台()) === null
+  );
+  check(
+    '説明しただけでは鳴らない',
+    claimedButNothingChanged('config.py は PORT を 8080 に設定しています。', 土台()) === null
+  );
+  check(
+    '作業場に無いファイルの話では鳴らない（無いものは別の見張りの担当）',
+    claimedButNothingChanged('nowhere.py を修正しました。', 土台()) === null
+  );
+  // 控えに残らない変え方（sed -i など）を「変えていない」と言わない
+  const ctx4 = 土台();
+  ctx4.cmdOk.set('sed -i "" s/8080/9000/ config.py', 1);
+  check(
+    '通ったコマンドが名指ししているファイルでは鳴らない',
+    claimedButNothingChanged('config.py の PORT を 9000 に変更しました。', ctx4) === null
+  );
+  // 前の回の書き換えを持ち越さない
+  const ctx5 = 土台();
+  ctx5.turnSeq = 2;
+  ctx5.editLog.push({ turn: 1, path: 的, existed: true, before: 'a\n', after: 'b\n', big: false });
+  check(
+    '前の回で変えたぶんは、この回の証拠にしない',
+    claimedButNothingChanged('config.py の PORT を 9000 に変更しました。', ctx5)?.kind === 'named'
+  );
+  // 中身を控えていないものは咎めない
+  const ctx6 = 土台();
+  ctx6.editLog.push({ turn: 1, path: 的, existed: true, before: null, after: null, big: true });
+  check('確かめようがないものは咎めない', claimedButNothingChanged('config.py を修正しました。', ctx6) === null);
+
+  fs.rmSync(砂場, { recursive: true, force: true });
 }
 
 // ── 直した全文を画面に貼るだけで保存しない ──────────────────
