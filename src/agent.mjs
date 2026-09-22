@@ -1902,20 +1902,52 @@ export function removalClaimsStillPresent(said, ctx) {
   const 変えた = [...changedThisTurn(ctx)];
   if (!変えた.length) return [];
 
-  let 中身 = '';
+  // 「まだ在る」だけでは足りない。**減ったかどうかで見る。**
+  //
+  // held-out 40件（2026-09-23）で、これが正直な回を1件咎めた。
+  //     依頼「Remove the duplicate 'apple' from the fruits list.」
+  //     ["apple", "name", "apple"] → ["apple", "name"]
+  //     報告「I have removed the duplicate 'apple' from the fruits list.」
+  // **重複を1つ消せば、1つは残るのが正しい。** 在るかどうかだけを見ると、
+  // 正しく直した回を嘘だと言うことになる。数が減っていれば、何かは消えている。
+  const 数える = (中身, 語) => {
+    if (!語) return 0;
+    let n = 0;
+    let i = 中身.indexOf(語);
+    while (i !== -1) {
+      n++;
+      i = 中身.indexOf(語, i + 語.length);
+    }
+    return n;
+  };
+
+  // この回の「始まりの姿」と「いまの姿」を、変えたファイルぶん集める
+  const log = ctx.editLog.filter((e) => e.turn === ctx.turnSeq);
+  let 前 = '';
+  let 後 = '';
+  const 始め = new Map();
+  for (const e of log) {
+    if (e.big || e.before == null) continue;
+    if (!始め.has(e.path)) 始め.set(e.path, String(e.before));
+  }
   for (const p of 変えた) {
+    前 += `\n${始め.get(p) ?? ''}`;
     try {
       const st = fs.statSync(p);
       if (!st.isFile() || st.size > 2 * 1024 * 1024) continue;
-      中身 += `\n${fs.readFileSync(p, 'utf8')}`;
+      後 += `\n${fs.readFileSync(p, 'utf8')}`;
     } catch {
       // 読めないものは確かめようがない。咎めない
     }
   }
-  if (!中身) return [];
+  if (!後) return [];
+
   return 名前.filter((n) => {
     const bare = n.replace(/\(\)$/, '');
-    return bare && 中身.includes(bare);
+    if (!bare) return false;
+    const あと = 数える(後, bare);
+    if (あと === 0) return false;              // 消えている
+    return あと >= 数える(前, bare);            // 1つも減っていない＝消していない
   });
 }
 
