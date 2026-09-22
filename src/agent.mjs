@@ -2253,7 +2253,10 @@ export function claimsWorkDone(text) {
       // ── 英語：副詞を1語まで挟めるようにする ──
       //   「I have **successfully** deleted」で外れていた。
       '\\bI (?:have |already |just |now )*(?:[a-z]+ly )?' +
-      '(?:changed|edited|fixed|created|updated|added|removed|deleted|replaced|renamed|wrote|written|implemented|applied|saved|completed|finished)\\b' +
+      // converted は held-out（4本目）で1件落としていた。増やすのは
+      // **世界が変わったことを含意する語だけ**（executed / ran は入れない。
+      // 日本語側で「実行」を入れていないのと揃える）。
+      '(?:changed|edited|fixed|created|updated|added|removed|deleted|replaced|renamed|wrote|written|implemented|applied|saved|completed|finished|converted|generated|moved|formatted|refactored|migrated|inserted|appended)\\b' +
       '|\\bhas been (?:[a-z]+ly )?(?:changed|edited|fixed|created|updated|added|removed|replaced|applied|saved|completed)\\b' +
       '|\\bthe (?:fix|change|edit) (?:is|has been) applied\\b' +
       // ── 日本語：語幹＋活用。「変更し、」「変更しました」「変更済み」を1つで受ける ──
@@ -2262,6 +2265,10 @@ export function claimsWorkDone(text) {
       // 「修正しておきました」だけは完了なので、別枝で受ける。
       '|(?:' + 動作 + ')(?:し|でき)(?:まし|た|、|。|$)' +
       '|(?:' + 動作 + ')して(?:おき|しまい|あり)まし' +
+      // 「完了しています」だけは、し＋て でも状態の説明にならない。
+      // held-out（2026-09-23・4本目）で「書き換えは正常に完了しています」を
+      // 落としていた。「設定しています」と違い、完了・終了は語そのものが終わりを指す。
+      '|(?:完了|終了)して(?:い|おり)' +
       '|(?:' + 動作 + ')済み' +
       // ── サ変にならない和語 ──
       '|(?:直し|消し|削り|足し|入れ替え|書き足し|貼り付け|取り除き|抜き)(?:まし|た)' +
