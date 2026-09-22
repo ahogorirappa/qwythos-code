@@ -488,6 +488,29 @@ export class Agent {
             }
           }
 
+          // 「`X` を消した」と言っているのに、**変えたファイルに X がまだ残っている**場合。
+          //
+          // 上の見張りは「道具の出力に名前があれば鳴らない」ようにしてある。
+          // read_file の出力が切られたときに本当に消したものまで嘘と判定したためで、
+          // その判断は正しい。ただし**「前に在った」証拠は「今も在る」ことの言い訳にならない。**
+          // 実測 2026-09-23: 「`sys.exit(1)` を削除しました」と報告して別の行を消しただけ、
+          // という回を、出力に名前があるという理由で見逃していた。
+          if (said && this.shouldNudgeToAct() && nudges < (this.config.maxNudges ?? 5)) {
+            const 残っている = removalClaimsStillPresent(said, this.ctx);
+            if (残っている.length) {
+              nudges++;
+              info(`「${残っている[0]}」を消したと報告しましたが、まだファイルに残っているので、促しました。`);
+              this.messages.push({
+                role: 'user',
+                content:
+                  `You said you removed \`${残っている[0]}\`, but it is still in the file you just edited. ` +
+                  'Read the file again and look for it. Whatever you changed, it was not that. ' +
+                  'Either remove it now, or say plainly that it is still there.'
+              });
+              continue;
+            }
+          }
+
           // このお願いの中で**一度も通らなかったコマンド**があるのに、
           // 報告がそのことに一言も触れていない場合。
           //
@@ -1767,40 +1790,119 @@ export function turnEvidence(messages, turn) {
  *   目的語は「空行」で、`mark_up` ではない）。上の 2) があるおかげで、
  *   取り違えた名前はファイルに在るので鳴らない。**取り違えても実害が出ない形にしてある。**
  */
-export function removalClaimsNotRemoved(text, evidence) {
-  if (evidence == null) return [];
-  const missing = [];
+/**
+ * 「消した」と名指ししている名前を取り出す。
+ *
+ * ■ バッククォートだけに頼ると、ほとんど取れない（2026-09-23 に実測）
+ *   生成した42件のうち型3の見逃し5件を当てたところ、**4件がここで名前を1つも取れずに
+ *   素通り**していた。モデルの報告はバッククォートを付けないことのほうが多い。
+ *
+ *     ご依頼通り、プログラムからdiscount_func関数を削除いたしました。
+ *     config_loader.py 内の validate_settings 関数を正常に削除しました。
+ *     The duplicate 'apple' has been successfully removed from the items list.
+ *
+ * ■ それでも「語の形」で拾うのは最後の手段にする
+ *   2026-09-10 の本番事故は、語の形で識別子を拾って「JavaScript」「utf8」を
+ *   名前と見なし、8件中7件で書き換えが全停止した。だから順に降りる。
+ *     1) バッククォート … 本人が「これ」と指している
+ *     2) 引用符 … 同上
+ *     3) 識別子らしい形 … **`_` か数字か大文字を含むものだけ**（facts.mjs と同じ線引き）
+ *   3) は `import` や `return` のような英単語を拾わない。ここが緩いと、
+ *   まだ在って当たり前の語を「まだ在る」と咎めることになる。
+ */
+export function removalClaimNames(text) {
+  const out = [];
+  // **ここで `()` を落とさない。** 返す名前は書かれたまま（`foo()` は `foo()`）。
+  // 落とすのは突き合わせるときだけ（既存の呼び出し側がこの形を見ている）。
   const 足す = (name) => {
-    const bare = String(name).replace(/\(\)$/, '');
-    if (!bare) return;
-    if (!evidence.includes(bare) && !missing.includes(name)) missing.push(name);
+    const n = String(name ?? '').trim();
+    if (n && !out.includes(n)) out.push(n);
+  };
+  // 名前らしい形か。ふつうの英単語と見分けが付くものだけを通す
+  const 名前らしい = (w) => /[_0-9A-Z]/.test(w.replace(/^[a-z]+$/, ''));
+
+  const 前から取る = (前) => {
+    const bq = [...前.matchAll(/`([^`\n]{1,60})`/g)].map((x) => x[1]);
+    if (bq.length) return 足す(bq[bq.length - 1]);
+    const q = [...前.matchAll(/['"]([^'"\n]{1,60})['"]/g)].map((x) => x[1]);
+    if (q.length) return 足す(q[q.length - 1]);
+    const id = [...前.matchAll(/[A-Za-z_][A-Za-z0-9_]{2,}(?:\.[A-Za-z0-9_]+)*/g)]
+      .map((x) => x[0])
+      .filter(名前らしい);
+    if (id.length) 足す(id[id.length - 1]);
   };
 
-  for (const s of String(text).split(/(?<=[。.!?！？])\s*|\n+/)) {
+  for (const s of String(text).split(/(?<=[。！？])\s*|(?<=[.!?])\s+|\n+/)) {
     // ── 日本語：目的語は動詞の**前**にある ──
-    //   「… `X` の呼び出しを削除しました」→ 動詞より前の最後の `…` が X。
-    //   全部の `…` を見てはいけない。同じ文にファイル名や関数名が混ざっていて、
-    //   そのどれか1つが証拠にあるだけで嘘が通る（実機の 21:28 がそれ）。
-    const ja = /^([\s\S]*?)(を削除しました|を取り除きました|を消しました|を消去しました|を削除済み|を削りました)/.exec(s);
-    if (ja) {
-      const names = [...ja[1].matchAll(/`([^`\n]{1,60})`/g)].map((x) => x[1]);
-      if (names.length) 足す(names[names.length - 1]);
-    }
+    //   「いたしました」「が完了しました」も受ける（実測で両方出た）
+    const ja = /^([\s\S]*?)(?:削除|除去|消去|取り除き|削り|消し)(?:し|いたし|致し|され)?(?:まし|済み|が完了|を完了)/.exec(s);
+    if (ja) 前から取る(ja[1]);
 
     // ── 英語：目的語は動詞の**後ろ**にある ──
-    //   「I removed the call to `X`」「I have deleted `X`」。
-    //   日本語と同じ「前を見る」やり方だと**丸ごと素通りする**。
-    //   実機の20本のうち6本が英語で答えていて、そこは一度も見張れていなかった。
-    // 副詞を1語まで挟めるようにする。「I have **successfully** deleted `X`」で外れていた
-    const en = /\b(?:I (?:have |just |already |now )*(?:[a-z]+ly )?(?:removed|deleted|dropped|stripped)|took out)\b([^`\n]{0,80})`([^`\n]{1,60})`/i.exec(s);
+    const en = /\b(?:I (?:have |just |already |now )*(?:[a-z]+ly )?(?:removed|deleted|dropped|stripped)|took out)\b([^`'"\n]{0,80})[`'"]([^`'"\n]{1,60})[`'"]/i.exec(s);
     if (en) 足す(en[2]);
 
     // 受け身の言い方は、名前が動詞より前に来る。「`X` has been removed」
-    const passive = /`([^`\n]{1,60})`[^`\n]{0,60}\b(?:has|have|was|were|is|are)\s+(?:been\s+)?(?:removed|deleted|dropped|stripped)\b/i.exec(s);
+    const passive = /[`'"]([^`'"\n]{1,60})[`'"][^`'"\n]{0,60}\b(?:has|have|was|were|is|are)\s+(?:been\s+)?(?:[a-z]+ly\s+)?(?:removed|deleted|dropped|stripped)\b/i.exec(s);
     if (passive) 足す(passive[1]);
+  }
+  return out;
+}
+
+/**
+ * 「`X` を消した」と言っているのに、**この回で変えたファイルに X がまだ残っている**場合。
+ *
+ * ■ 「前に在った」と「今も在る」を分ける
+ *   `removalClaimsNotRemoved` は、道具の出力に名前があれば鳴らない。
+ *   read_file の出力が上限で切られたときに、本当に消したものまで嘘と判定したためで、
+ *   その判断自体は正しい。ただし**「前に在った」証拠としては正しくても、
+ *   「今も在る」ことの言い訳にはならない。**
+ *
+ *   実測（2026-09-23）: 「`sys.exit(1)` の呼び出しを削除しました」と報告し、
+ *   別の行を消しただけで sys.exit(1) はそのまま残っていた。
+ *   read_file の出力に名前があるので、既存の見張りは黙った。
+ *
+ * ■ ここは言い回しに依らない
+ *   編集後のファイルに残っているかどうかは、読めば分かる。
+ *   **消したと言ったものが目の前にある**のだから、言い方をいくつ並べても関係ない。
+ *
+ * ■ この回で変えたファイルだけを見る
+ *   触っていないファイルに同じ名前が残っているのは、ふつうのことである
+ *   （app.py から消したが test_app.py には在る）。咎める相手を間違えない。
+ */
+export function removalClaimsStillPresent(said, ctx) {
+  const 名前 = removalClaimNames(said);
+  if (!名前.length) return [];
+  const 変えた = [...changedThisTurn(ctx)];
+  if (!変えた.length) return [];
+
+  let 中身 = '';
+  for (const p of 変えた) {
+    try {
+      const st = fs.statSync(p);
+      if (!st.isFile() || st.size > 2 * 1024 * 1024) continue;
+      中身 += `\n${fs.readFileSync(p, 'utf8')}`;
+    } catch {
+      // 読めないものは確かめようがない。咎めない
+    }
+  }
+  if (!中身) return [];
+  return 名前.filter((n) => {
+    const bare = n.replace(/\(\)$/, '');
+    return bare && 中身.includes(bare);
+  });
+}
+
+export function removalClaimsNotRemoved(text, evidence) {
+  if (evidence == null) return [];
+  const missing = [];
+  for (const name of removalClaimNames(text)) {
+    const bare = name.replace(/\(\)$/, '');
+    if (bare && !evidence.includes(bare) && !missing.includes(name)) missing.push(name);
   }
   return missing;
 }
+
 
 /**
  * 「この作業場に無い」と分かっている名前のうち、報告が一言も触れていないもの。

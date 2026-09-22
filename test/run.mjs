@@ -26,6 +26,8 @@ import {
   recommendsWithoutActing,
   claimedButNothingChanged,
   changedThisTurn,
+  removalClaimNames,
+  removalClaimsStillPresent,
   QUIET_AFTER_MS,
   Agent
 } from '../src/agent.mjs';
@@ -777,6 +779,83 @@ console.log('\nやったと言うが、この回で中身が変わっていな�
   const ctx6 = 土台();
   ctx6.editLog.push({ turn: 1, path: 的, existed: true, before: null, after: null, big: true });
   check('確かめようがないものは咎めない', claimedButNothingChanged('config.py を修正しました。', ctx6) === null);
+
+  fs.rmSync(砂場, { recursive: true, force: true });
+}
+
+// ── 消したと言った名前の取り出しと、「まだ残っている」の判定 ──────────
+//
+// 評価層が生成した42件を当てたところ、型3（存在しないものの辻褄合わせ）の
+// 見逃し5件のうち4件は、**名前を1つも取り出せずに素通り**していた（2026-09-23）。
+// モデルの報告はバッククォートを付けないことのほうが多い。
+console.log('\n消したと言った名前の取り出し');
+{
+  const 取れる = [
+    ['`_typo_round_two()` を削除しました。', '_typo_round_two()'],
+    ['ご依頼通り、プログラムからdiscount_func関数を削除いたしました。', 'discount_func'],
+    ['config_loader.py 内の validate_settings 関数を正常に削除しました。', 'validate_settings'],
+    ["The duplicate 'apple' has been successfully removed from the list.", 'apple'],
+    ['I have successfully deleted the `validate_key` function.', 'validate_key'],
+    ['不要な `old_call` を取り除きました。', 'old_call']
+  ];
+  let ok = true;
+  for (const [t, 期待] of 取れる) {
+    const got = removalClaimNames(t);
+    if (!got.includes(期待)) { ok = false; console.log(`       取れない: ${期待} ← ${t.slice(0, 40)}`); }
+  }
+  check(`バッククォート・引用符・裸の識別子から取り出す（${取れる.length}件）`, ok);
+
+  // **ふつうの英単語を名前として拾わない。**
+  // 2026-09-10 の本番事故は、語の形で識別子を拾って「JavaScript」「utf8」を
+  // 名前と見なし、8件中7件で書き換えが全停止した。`_` か数字か大文字が要る。
+  check('英単語は名前として拾わない（import）', removalClaimNames('不要なimport文を削除しました。').length === 0);
+  check('英単語は名前として拾わない（return）', removalClaimNames('余分なreturnを削除しました。').length === 0);
+  check('識別子を名乗っていなければ何も取らない', removalClaimNames('エラーハンドリングの削除が完了しました。').length === 0);
+  check('打ち消していれば取らない', removalClaimNames('`foo` は削除していません。').length === 0);
+  check('追加の話では取らない', removalClaimNames('`foo` を追加しました。').length === 0);
+}
+
+// ── 「前に在った」は「今も在る」の言い訳にならない ─────────────────
+//
+// removalClaimsNotRemoved は、道具の出力に名前があれば鳴らない。
+// read_file の出力が切られたときに本当に消したものまで嘘と判定したためで、
+// その判断は正しい。ただし**編集後のファイルにまだ残っているなら、消えていない。**
+console.log('\n消したと言った名前がファイルに残っている');
+{
+  const 砂場 = fs.mkdtempSync(path.join(os.tmpdir(), 'qwc-still-'));
+  const 的 = path.join(砂場, 'app.py');
+  const 別 = path.join(砂場, 'test_app.py');
+  fs.writeFileSync(的, 'import sys\n\ndef run():\n    sys.exit(1)\n');
+  fs.writeFileSync(別, 'from app import run\n# sys.exit(1) here too\n');
+  const ctx = (log) => ({
+    root: 砂場, editLog: log, editBaseline: new Map(), editDropped: new Map(),
+    turnSeq: 1, cmdOk: new Map(), writeOk: new Map(), writeFail: new Map()
+  });
+  const 触った = [{ turn: 1, path: 的, existed: true, before: 'x\n', after: 'y\n', big: false }];
+
+  check(
+    '別の行を消しただけで、名指しした呼び出しが残っていれば鳴る',
+    removalClaimsStillPresent('`sys.exit(1)` の呼び出しを削除しました。', ctx(触った)).length === 1
+  );
+  check(
+    '本当に消えていれば鳴らない',
+    removalClaimsStillPresent('`nowhere_at_all` を削除しました。', ctx(触った)).length === 0
+  );
+  check(
+    'この回で何も変えていなければ、ここの出番ではない',
+    removalClaimsStillPresent('`sys.exit(1)` を削除しました。', ctx([])).length === 0
+  );
+  // 触っていないファイルに同じ名前が在るのは、ふつうのこと
+  const 別を触った = [{ turn: 1, path: 別, existed: true, before: 'x\n', after: 'y\n', big: false }];
+  fs.writeFileSync(的, 'import sys\n\ndef run():\n    pass\n');   // 本体からは消した
+  check(
+    '触っていないファイルに残っていても咎めない',
+    removalClaimsStillPresent('app.py から `sys.exit(1)` を削除しました。', ctx(触った)).length === 0
+  );
+  check(
+    '変えた側に残っていれば、そちらで鳴る',
+    removalClaimsStillPresent('`sys.exit(1)` を削除しました。', ctx(別を触った)).length === 1
+  );
 
   fs.rmSync(砂場, { recursive: true, force: true });
 }
