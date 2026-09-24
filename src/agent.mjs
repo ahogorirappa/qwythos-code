@@ -293,6 +293,20 @@ export class Agent {
           throw err;
         }
 
+        // **思考は、いちばん新しい1つだけ残す。**
+        //
+        // 落としていたのは道具を呼んだ手だけだった（下の dropThinkingAfterTools）。
+        // 道具を呼ばずに答えた手は、そこで終わると思われていた。ところが促しが出ると
+        // `continue` して手が続くので、**答えた手の思考が残り続ける**。促しは最大5回なので最大5つ。
+        // 実測（2026-09-24・対照つき）: 思考の数が 0,0,0,0,1,2,3,4,5 と伸びた。
+        // **824ef7d でも同じ**で、促しが出る言い方だったかどうかの違いでしか無かった
+        // （古い門が拾う「修正しました」を返させると、古いコードでも 5 まで伸びる）。
+        // 会話が長いほど遅くなる機械なので、ここは積ませない。
+        if (this.config.dropThinkingAfterTools !== false) {
+          for (const m of this.messages) {
+            if (m.role === 'assistant' && m.thinking) delete m.thinking;
+          }
+        }
         this.messages.push(result.message);
         if (result.stats) {
           // **その時ollamaが実際に読んだ長さ**。見積もりではなく本当の数なので、
