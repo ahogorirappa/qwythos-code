@@ -13,7 +13,7 @@ function hashText(text) {
 }
 import { buildSystemPrompt, COMPACT_PROMPT } from './prompt.mjs';
 import { classifyInput, SMALL_TALK_HINT } from './smalltalk.mjs';
-import { namesInRequest, missingNames, factsHint, treatsAsExisting, pathsInRequest, missingPaths } from './facts.mjs';
+import { namesInRequest, missingNames, factsHint, treatsAsExisting, pathsInRequest, missingPaths, requestIsQuestion } from './facts.mjs';
 import { REFINE_PROMPT, applyHarnessEdits, loadHarness } from './harness.mjs';
 import { PathError } from './paths.mjs';
 import { isSafeCommand } from './permissions.mjs';
@@ -217,6 +217,12 @@ export class Agent {
     // （実機で2日続けて起きた。詳しくは facts.mjs）。文章で忠告しても効かないので、
     // 探させるのではなく、事実を先に置いておく。
     // 雑談と見たときは調べない（ファイル名を出しただけの独り言で毎回 rg を走らせない）。
+    // **依頼が質問なら、「やっていない」系の催促は出さない。**
+    // 報告文から「主張しているか」を読む判定はモデルの語彙に乗るが、
+    // 依頼を書くのは利用者なので、モデルを差し替えても変わらない。
+    // 雑談と見たときも同じ扱い（そちらは shouldNudgeToAct が別に落とす）。
+    this.ctx.requestIsQuestion = requestIsQuestion(userInput);
+
     let facts = '';
     this.ctx.missingFromRequest = [];
     this.ctx.missingKnown = [];
@@ -376,7 +382,7 @@ export class Agent {
             this.shouldNudgeToAct() &&
             nudges < (this.config.maxNudges ?? 5) &&
             (this.ctx.mutations || 0) === mutationsAtStart &&
-            claimsWorkDone(said)
+            shouldCheckWork(said, this.ctx)
           ) {
             nudges++;
             info('やったと報告しましたが、まだ何も変えていないので、促しました。');
@@ -401,7 +407,7 @@ export class Agent {
             said &&
             this.shouldNudgeToAct() &&
             nudges < (this.config.maxNudges ?? 5) &&
-            claimsWorkDone(said)
+            shouldCheckWork(said, this.ctx)
           ) {
             const stuck = filesNeverWritten(this.ctx);
             if (stuck.length) {
@@ -2150,7 +2156,7 @@ function 実在するファイル名(text, ctx) {
 
 export function claimedButNothingChanged(said, ctx) {
   const text = String(said ?? '');
-  if (!claimsWorkDone(text)) return null;
+  if (!shouldCheckWork(text, ctx)) return null;
 
   const 変わった = changedThisTurn(ctx);
   if (変わった.size) return null;   // 何か変わっているなら、ここの出番ではない
@@ -2225,7 +2231,7 @@ export function claimedButNothingChanged(said, ctx) {
  *   ここで落ちる。**正しく手を止めた側を咎めないための条件。**
  */
 export function claimedCommandNeverRan(said, ctx) {
-  if (!claimsWorkDone(said)) return [];
+  if (!shouldCheckWork(said, ctx)) return [];
   const 通らず = commandsNeverRan(ctx);
   if (!通らず.length) return [];
   if (changedThisTurn(ctx).size) return [];
@@ -2282,6 +2288,52 @@ export function unmentionedMissing(said, missingKnown) {
  *   正しい報告である。ここを拾うと、調べて答えただけの返事を毎回催促することになる。
  *   同じ理由で「実行」も入れない（テストを走らせただけで鳴る）。
  */
+/**
+ * 報告が、やらなかったことを**打ち消しているか**。
+ *
+ * ■ 成功の言い方は無限、失敗の言い方は限られる
+ *   `claimsWorkDone` は「完了を名乗る言い方」を並べている。並べる限り、
+ *   **並べた人の想像力（＝育てに使ったモデルの語彙）が上限**になる。
+ *   4モデルで当てたところ、同じ見張りが 100%〜37.5% まで振れた（2026-09-24）。
+ *   代わりに「断ったか」を見る。断り方のほうが語彙が少なく、モデル間で揺れにくい。
+ *
+ * ■ ただし一覧であることは変わらない
+ *   3モデルでは持ちこたえたが、**4モデル目（ChatGPT）で一度崩れた**。
+ *   「できていません」「未完了」「失敗しました」「一致せず」が入っていなくて、
+ *   正直な失敗報告を「主張している」と読み、誤検知が 25% 出た。足して 0% に戻した。
+ *   **これは負けた数字を見てから足した直しである。**5つ目のモデルでまた崩れうる。
+ *
+ * ■ 文ごとに見る
+ *   「直しました。テストは実行していません。」の前半は本物の主張なので、
+ *   **打ち消していない文が1つでもあれば**主張とみなす。
+ */
+export function reportDisclaims(text) {
+  const 打ち消し =
+    /(していません|しませんでした|できませんでした|できません|できていません|ありませんでした|ありません|見つかりませんでした|見つからなかった|見つかりません|存在しません|必要ありません|未実施|未完了|未適用|まだです|失敗しまし|失敗した|反映されていません|変更できて|適用できて|一致せず|一致しません|\bdid not\b|\bdoes not\b|\bdo not\b|\bhave not\b|\bhas not\b|\bcannot\b|\bcan not\b|\bcould not\b|\bwas not able\b|\bunable to\b|\bnot found\b|\bdoes not exist\b|\bno (change|edit|fix)s? (is|are|was|were) needed\b|\bnothing (was|has been) (changed|done)\b)/i;
+  const 文 = String(text ?? '').trim().split(/(?<=[。！？])\s*|(?<=[.!?])\s+|\n+/).filter((x) => x.trim());
+  if (!文.length) return true;                  // 何も言っていないなら主張もしていない
+  return !文.some((x) => !打ち消し.test(x));
+}
+
+/**
+ * この回、「やったはずなのにやっていない」を見にいってよいか。
+ *
+ * **依頼が質問なら、そもそも見にいかない。** 調べて答えただけの回に
+ * 「何も変えていない」と催促するのは、道具として壊れている
+ * （4モデル・対照64件で 15.6% がこれだった。2026-09-24）。
+ *
+ * 見にいく場合も、報告が打ち消しているなら主張ではないので黙る。
+ */
+export function shouldCheckWork(said, ctx) {
+  if (ctx?.requestIsQuestion) return false;
+  // **「こう直すべきです」は主張ではない。**
+  // 打ち消しだけを見る門は、助言も「やったと言っている」と読む。
+  // 助手には専用の促し（recommendsWithoutActing）があるので、そちらに渡す。
+  // ここで拾うと、より的確な促しが後ろで出番を失う。
+  if (recommendsWithoutActing(said)) return false;
+  return !reportDisclaims(said);
+}
+
 export function claimsWorkDone(text) {
   // 動作を表す語の**語幹**。活用は下の (?:し|しまし|済み) 側で受ける。
   // 「確認」「実行」「調査」は入れない（手を動かさなくても成り立つため）。
