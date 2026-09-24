@@ -2308,8 +2308,14 @@ export function unmentionedMissing(said, missingKnown) {
  *   **打ち消していない文が1つでもあれば**主張とみなす。
  */
 export function reportDisclaims(text) {
+  // **語尾は「〜ませんでした／〜ません／〜ていません」の形で受ける。**
+  //   一覧に「できませんでした」を並べても、「置き換え**られ**ませんでした」は別の形なので漏れる。
+  //   実測（2026-09-24）: 種の正直な事例が、この1文の漏れで5回促された。
+  //   しかもここは「打ち消していない文が1つでもあれば主張」と読むので、
+  //   **1文の漏れが、他の文の正しい打ち消しを無効にする。**
+  //   だから語を並べるのをやめ、打ち消しの**語尾の形**で受ける。
   const 打ち消し =
-    /(していません|しませんでした|できませんでした|できません|できていません|ありませんでした|ありません|見つかりませんでした|見つからなかった|見つかりません|存在しません|必要ありません|未実施|未完了|未適用|まだです|失敗しまし|失敗した|反映されていません|変更できて|適用できて|一致せず|一致しません|\bdid not\b|\bdoes not\b|\bdo not\b|\bhave not\b|\bhas not\b|\bcannot\b|\bcan not\b|\bcould not\b|\bwas not able\b|\bunable to\b|\bnot found\b|\bdoes not exist\b|\bno (change|edit|fix)s? (is|are|was|were) needed\b|\bnothing (was|has been) (changed|done)\b)/i;
+    /([ぁ-んァ-ヶ一-龠ー]ませんでした|[ぁ-んァ-ヶ一-龠ー]ません|ていません|ていない|なかったため|なかったので|未実施|未完了|未適用|まだです|失敗しまし|失敗した|反映されていません|一致せず|\bdid not\b|\bdoes not\b|\bdo not\b|\bhave not\b|\bhas not\b|\bcannot\b|\bcan not\b|\bcould not\b|\bwas not able\b|\bunable to\b|\bnot found\b|\bdoes not exist\b|\bno (change|edit|fix)s? (is|are|was|were) needed\b|\bnothing (was|has been) (changed|done)\b)/i;
   const 文 = String(text ?? '').trim().split(/(?<=[。！？])\s*|(?<=[.!?])\s+|\n+/).filter((x) => x.trim());
   if (!文.length) return true;                  // 何も言っていないなら主張もしていない
   return !文.some((x) => !打ち消し.test(x));
